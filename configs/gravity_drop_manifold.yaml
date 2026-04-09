@@ -1,0 +1,178 @@
+# Gravity Drop — Gaussian-Manifold Fracture
+# Uses ManifoldSimulator: fracture state lives on Gaussian graph.
+# No volumetric phase-field → surface projection.
+
+simulation:
+  name: "gravity_drop_manifold"
+  description: "Bunny drop with Gaussian-manifold fracture field"
+  mode: "deformation"
+  use_manifold: true                 # <-- KEY: enables ManifoldSimulator
+  output_dir: "output"
+  save_frames: true
+  save_checkpoint: false
+
+mesh:
+  path: "assets/meshes/bunny.obj"
+  auto_generate_if_missing: true
+  test_mesh_type: "sphere"
+  test_mesh_radius: 0.4
+
+particles:
+  target_count: 300000
+  surface_ratio: 0.5
+  use_poisson_sampling: false
+  poisson_depth: 8
+  normalize_to_unit_cube: true
+
+mpm:
+  num_grids: 128
+  dt: 1.0e-4
+  gravity: [0.0, 0.0, -300.0]
+  clip_bound: 0.05
+  damping: 0.9995
+  particle_chunk: 8192
+
+material:
+  preset: null
+  constitutive_model: "corotated_phase_field"
+  center: [0.5, 0.5, 0.5]
+  size: [0.8, 0.8, 0.8]
+  density: 1200.0
+  youngs_modulus: 1.5e7
+  poissons_ratio: 0.25
+  Gc: 60000.0
+  l0: 0.025
+  degradation_exponent: 3.0
+
+# Phase field params (shared with manifold fracture)
+phase_field:
+  warmup_frames: 3
+  dC_max: 0.02
+  crack_tip_speed: 15.0
+  crack_width: 0.004
+  max_total_cracks: 120
+  crack_aniso_ratio: 200.0
+  branch_angle: 40.0
+  branch_min_length: 1
+  branch_probability: 0.95
+  max_branches_per_path: 10
+  nucleation_fraction: 0.15
+  max_nucleation_per_frame: 5
+  nucleation_min_spacing: 4
+  fragmentation_enabled: true
+  fragment_damage_threshold: 0.5
+  min_fragment_particles: 50
+
+# Manifold-specific fracture params
+manifold:
+  graph_k: 12                        # kNN neighbors for Gaussian graph
+  graph_sigma: 0.03                  # Gaussian kernel bandwidth
+  graph_rebuild_every: 5             # Rebuild graph every N frames
+  projector_k: 8                     # kNN for MPM→Gaussian projection
+  projector_sigma: 0.05              # Projection kernel bandwidth
+  aniso_ratio: 1.0                   # 1.0 = isotropic (no directional bias)
+  damage_source_scale: 0.35          # Physics-driven advance at crack front
+  damage_spread: 0.45                # Front propagation strength on graph
+  drive_quantile: 0.50               # Lower = broader drive region (more area can nucleate)
+  front_threshold: 0.05              # Require local crack/front support before growing
+  radial_bias: 2.50                  # Bias crack-front propagation away from the impact seed
+  tip_propagation_scale: 0.75        # Aggressive front advance along favored edges
+  opening_scale: 0.03                # Crack opening displacement scale
+  impact_seed_radius_factor: 0.08    # Seed only the local contact patch on impact
+  impact_seed_magnitude: 0.18        # Initial impact damage seed
+  impact_seed_H_multiplier: 0.0      # Avoid broad permanent pre-damage at impact
+  damage_feedback_delay_frames: 8    # Wait this many post-impact frames before degrading MPM stiffness
+  damage_feedback_ramp_frames: 6     # Smoothly ramp damage->stress feedback back in
+  interior_damage_scale: 0.20        # Interior particles receive weaker projected damage
+  drive_tension_weight: 1.00         # Weight of pure tensile energy in fracture drive
+  drive_shear_weight: 0.35           # Weight of deviatoric/shear stress in fracture drive
+  drive_principal_weight: 0.25       # Weight of principal tensile stress in fracture drive
+  drive_kinetic_weight: 0.15         # Weight of relative particle motion in fracture drive
+  splitting_enabled: false            # Gaussian splitting (Phase 3, experimental)
+  split_threshold: 0.8               # Damage threshold for Gaussian split
+  opacity_threshold: 0.6             # Damage threshold for opacity reduction
+  flatten_threshold: 0.3             # Damage threshold for covariance flattening
+  max_flatten: 0.5                   # Maximum scale reduction along crack normal
+  max_opacity_reduction: 0.8         # Maximum opacity reduction
+
+seismic:
+  enabled: true
+  amplitude: 1500.0
+  frequency: 80.0
+  direction: [1.0, 0.3, 0.0]
+  ramp_time: 0.005
+
+pre_notch:
+  enabled: false
+
+external_force:
+  enabled: false
+
+ground_plane:
+  enabled: true
+  point: [0.5, 0.5, 0.05]
+  normal: [0.0, 0.0, 1.0]
+  surface_type: "slip"
+  friction: 0.5
+
+loading:
+  type: "gravity_drop"
+  fixed_gravity_z: -2000.0            # Strong gravity for fast impact
+  drop_scale: 0.33
+  drop_center_z: 0.7
+  drop_rotation: [30.0, 20.0, 0.0]
+
+coordinate_mapping:
+  world_center: [0.5, 0.5, 0.5]
+  world_scale: 1.0
+
+# Still needed for legacy compat (ForwardEngine reads it)
+damage_projection:
+  method: "knn_weighted"
+  k_neighbors: 8
+  influence_radius: 0.05
+  damage_threshold: 0.01
+  use_faiss: true
+
+gaussian_splatting:
+  sh_degree: 3
+  pretrained_ply: null
+  pretrained_scale_multiplier: 1.0
+  crack_color: [0.6, 0.08, 0.08]
+  opacity_mode: "smooth"
+  color_mode: "overlay"
+  scale_mode: null
+  damage_threshold: 0.22
+  sharp_k: 50.0
+  edge_width: 0.02
+  crack_opacity_reduction: 0.88
+  crack_max_opening: 0.018
+  crack_gap_fraction: 0.60
+  crack_edge_darken: 1.10
+  crack_red_accent: 0.20
+
+rendering:
+  image_width: 1920
+  image_height: 1920
+  background_color: [1.0, 1.0, 1.0]
+  camera:
+    distance: 0.85
+    elevation: 25.0
+    azimuth: 30.0
+    fov: 50.0
+    target: [0.5, 0.5, 0.30]
+  total_frames: 200
+  fps: 30
+  physics_substeps: 15
+
+output:
+  video_path: "output/manifold_fracture.mp4"
+  frame_dir: "output/frames"
+  statistics_log: "output/statistics.csv"
+  checkpoint_dir: "output/checkpoints"
+  log_interval: 50
+  verbose: true
+
+device:
+  type: "cuda"
+  gpu_id: 0

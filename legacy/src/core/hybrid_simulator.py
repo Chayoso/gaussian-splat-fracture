@@ -13,13 +13,16 @@ import sys
 import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
+# Also ensure project root is in path for shared modules
+_project_root = os.path.join(os.path.dirname(__file__), '..', '..', '..')
+sys.path.insert(0, os.path.abspath(_project_root))
 
 from src.mpm_core.mpm_model import MPMModel
-from src.constitutive_models.phase_field import update_phase_field
-from src.constitutive_models.damage_mapper import VolumetricToSurfaceDamageMapper
+from legacy.src.constitutive_models.phase_field import update_phase_field
+from legacy.src.constitutive_models.damage_mapper import VolumetricToSurfaceDamageMapper
 from src.visualization.gaussian_updater import GaussianCrackVisualizer
 from src.core.coordinate_mapper import CoordinateMapper
-from src.core.fragment_manager import FragmentManager
+from legacy.src.core.fragment_manager import FragmentManager
 
 
 class HybridCrackSimulator:

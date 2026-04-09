@@ -17,9 +17,25 @@ class GaussianCrackVisualizer:
         damage_threshold: float = 0.3,
         device: str = "cuda",
         light_dir: tuple = (0.4, 0.3, 0.8),
+        crack_color: tuple = (0.6, 0.08, 0.08),
+        crack_opacity_reduction: float = 0.70,
+        crack_max_opening: float = 0.010,
+        crack_gap_fraction: float = 0.35,
+        crack_edge_darken: float = 0.75,
+        crack_red_accent: float = 0.10,
+        crack_tip_scale_boost: float = 0.20,
+        crack_tip_opacity_boost: float = 0.10,
     ):
         self.damage_threshold = damage_threshold
         self.device = device
+        self.crack_opacity_reduction = crack_opacity_reduction
+        self.crack_max_opening = crack_max_opening
+        self.crack_gap_fraction = crack_gap_fraction
+        self.crack_edge_darken = crack_edge_darken
+        self.crack_red_accent = crack_red_accent
+        self.crack_tip_scale_boost = crack_tip_scale_boost
+        self.crack_tip_opacity_boost = crack_tip_opacity_boost
+        self.crack_color = torch.tensor(crack_color, dtype=torch.float32, device=device)
 
         # Light direction for dynamic diffuse shading
         ld = torch.tensor(light_dir, dtype=torch.float32, device=device)
@@ -237,6 +253,10 @@ class GaussianCrackVisualizer:
         debris_mask: Tensor = None,
         F_per_gaussian: Tensor = None,
         camera_pos: Tensor = None,
+        crack_normals: Tensor = None,
+        crack_opening: Tensor = None,
+        crack_tips: Tensor = None,
+        crack_visited: Tensor = None,
     ):
         """Update Gaussian properties each frame.
 
@@ -247,6 +267,8 @@ class GaussianCrackVisualizer:
             preserve_original: cache original Gaussian properties on first call
             debris_mask:      (N_surf,) bool — small fragment Gaussians to hide
             F_per_gaussian:   (N_surf, 3, 3) deformation gradient per Gaussian
+            crack_normals:    (N_surf, 3) crack normal directions (from manifold fracture)
+            crack_opening:    (N_surf,) crack opening magnitudes (from manifold fracture)
         """
         # Store camera position for back-face normal flipping
         self._camera_pos = camera_pos
@@ -281,9 +303,125 @@ class GaussianCrackVisualizer:
             gaussians._scaling.data[debris_mask] -= 0.35
             gaussians._features_dc.data[debris_mask] *= 0.7
 
-        # Apply damage visualization
-        has_damage = (c_surface is not None
-                      and c_surface.max() > self.damage_threshold)
-        if has_damage:
-            # Damage visualization disabled: cracks shown via geometry (fragment separation)
-            pass
+        # Manifold fracture visualization (crack normals + opening)
+        if crack_normals is not None and crack_opening is not None:
+            self._apply_manifold_crack_visualization(
+                gaussians, c_surface, crack_normals, crack_opening,
+                crack_tips=crack_tips, crack_visited=crack_visited)
+        else:
+            # Legacy: scalar damage visualization
+            has_damage = (c_surface is not None
+                          and c_surface.max() > self.damage_threshold)
+            if has_damage:
+                self._apply_damage_visualization(gaussians, c_surface)
+
+    @torch.no_grad()
+    def _apply_manifold_crack_visualization(
+        self,
+        gaussians,
+        c_surface: Tensor,
+        crack_normals: Tensor,
+        crack_opening: Tensor,
+        crack_tips: Tensor = None,
+        crack_visited: Tensor = None,
+    ):
+        """Visualize cracks using manifold fracture state.
+
+        Uses crack normal to flatten Gaussians along the crack direction
+        and crack opening to create visible gap geometry.
+
+        Args:
+            gaussians: 3DGS GaussianModel
+            c_surface: (N,) damage values
+            crack_normals: (N, 3) crack normal directions
+            crack_opening: (N,) opening magnitudes
+        """
+        if c_surface is None:
+            return
+
+        N = c_surface.shape[0]
+        thresh = self.damage_threshold
+        crack_tips = crack_tips if crack_tips is not None else torch.zeros(
+            N, dtype=torch.bool, device=c_surface.device)
+        crack_visited = crack_visited if crack_visited is not None else torch.zeros(
+            N, dtype=torch.bool, device=c_surface.device)
+        crack_band = c_surface > thresh
+        crack_shell = crack_band | crack_visited | crack_tips
+
+        # --- 1. Covariance flattening along crack normal ---
+        flatten_mask = crack_shell
+        if flatten_mask.any() and crack_normals is not None:
+            t = ((c_surface[flatten_mask] - thresh)
+                 / (1.0 - thresh)).clamp(0.0, 1.0)
+            # Flatten factor: reduces scale along crack normal
+            tip_boost = crack_tips[flatten_mask].float() * self.crack_tip_scale_boost
+            flatten_factor = 1.0 - (0.60 + tip_boost) * (t.clamp(min=0.15) ** 2)
+            flatten_factor = flatten_factor.clamp(min=0.08)
+
+            # Get Gaussian local frame
+            q = gaussians._rotation.data[flatten_mask]
+            R = self._quat_to_rotmat_batch(q)  # (M, 3, 3)
+
+            # Project crack normal into local frame
+            n_local = torch.bmm(
+                R.transpose(1, 2),
+                crack_normals[flatten_mask].unsqueeze(2)
+            ).squeeze(2)  # (M, 3)
+
+            # Scale reduction proportional to alignment with crack normal
+            alignment = n_local.abs()  # (M, 3)
+            scale_reduction = torch.log(
+                flatten_factor.unsqueeze(1).clamp(min=0.05)) * alignment
+            gaussians._scaling.data[flatten_mask] += scale_reduction
+
+        # --- 2. Position offset along crack normal (opening) ---
+        open_mask = ((c_surface > 0.35) | crack_tips) & (crack_opening > 1e-4)
+        if open_mask.any() and crack_normals is not None:
+            # Offset Gaussians slightly along crack normal
+            # Creates a visible gap effect
+            opening_mag = crack_opening[open_mask].clamp(min=0.0, max=self.crack_max_opening)
+            tip_boost = 1.0 + crack_tips[open_mask].float() * 0.35
+            offset = crack_normals[open_mask] * opening_mag.unsqueeze(1) * tip_boost.unsqueeze(1)
+            # Alternate sign based on position hash for two-sided opening
+            pos_hash = gaussians._xyz.data[open_mask].sum(dim=1)
+            sign = torch.where(pos_hash.frac() > 0.5,
+                               torch.ones_like(pos_hash),
+                               -torch.ones_like(pos_hash))
+            gaussians._xyz.data[open_mask] += offset * sign.unsqueeze(1) * self.crack_gap_fraction
+
+        # --- 2.5. Crack-path darkening / tint ---
+        if crack_shell.any():
+            tint_strength = ((c_surface[crack_shell] - thresh).clamp(min=0.0) / max(1.0 - thresh, 1e-6))
+            tint_strength = torch.maximum(
+                tint_strength,
+                0.25 * crack_visited[crack_shell].float() + 0.45 * crack_tips[crack_shell].float(),
+            ).clamp(0.0, 1.0)
+            cur = gaussians._features_dc.data[crack_shell, 0, :]
+            darken = 1.0 - self.crack_edge_darken * tint_strength.unsqueeze(1)
+            tinted = cur * darken
+            color_bias = self.crack_color.unsqueeze(0) * (
+                self.crack_red_accent * tint_strength.unsqueeze(1)
+            )
+            gaussians._features_dc.data[crack_shell, 0, :] = tinted + color_bias
+
+        # --- 3. Opacity reduction at crack center ---
+        crack_center = (c_surface > 0.65) | crack_tips
+        if crack_center.any():
+            t_o = ((c_surface[crack_center] - 0.65) / 0.35).clamp(0.0, 1.0)
+            tip_boost = crack_tips[crack_center].float() * self.crack_tip_opacity_boost
+            opacity_mult = 1.0 - (self.crack_opacity_reduction + tip_boost) * (t_o.clamp(min=0.15) ** 2)
+            opacity_mult = opacity_mult.clamp(min=0.05, max=1.0)
+            cur_prob = torch.sigmoid(gaussians._opacity.data[crack_center])
+            new_prob = (cur_prob * opacity_mult.unsqueeze(1)).clamp(1e-6, 1 - 1e-6)
+            gaussians._opacity.data[crack_center] = torch.log(
+                new_prob / (1.0 - new_prob))
+
+    @staticmethod
+    def _quat_to_rotmat_batch(q: Tensor) -> Tensor:
+        """Convert wxyz quaternions to rotation matrices."""
+        w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+        return torch.stack([
+            1 - 2*(y*y + z*z), 2*(x*y - w*z),     2*(x*z + w*y),
+            2*(x*y + w*z),     1 - 2*(x*x + z*z), 2*(y*z - w*x),
+            2*(x*z - w*y),     2*(y*z + w*x),     1 - 2*(x*x + y*y),
+        ], dim=-1).reshape(-1, 3, 3)
