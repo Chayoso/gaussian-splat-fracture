@@ -35,6 +35,16 @@ class GaussianFractureField:
         radial_bias: float = 2.5,
         tip_propagation_scale: float = 0.75,
         front_substeps: int = 2,
+        tau_init: float = 0.30,
+        growth_gain: float = 1.00,
+        band_width: float = 1.50,
+        band_fill_gain: float = 0.30,
+        open_gain: float = 1.00,
+        material_family: str = "neutral_reference",
+        enable_front_propagation: bool = True,
+        material_drive_floor: Optional[float] = None,
+        diffuse_damage_gain: float = 0.16,
+        diffuse_neighborhood_steps: int = 2,
         graph: Optional[GaussianGraph] = None,
         crack_front: Optional[CrackFront] = None,
         device: str = "cuda",
@@ -52,6 +62,28 @@ class GaussianFractureField:
         self.radial_bias = radial_bias
         self.tip_propagation_scale = tip_propagation_scale
         self.front_substeps = max(int(front_substeps), 1)
+        self.tau_init = tau_init
+        self.growth_gain = growth_gain
+        self.band_width = band_width
+        self.band_fill_gain = band_fill_gain
+        self.open_gain = open_gain
+        self.material_family = str(material_family)
+        self.enable_front_propagation = bool(enable_front_propagation) and self.material_family != "diffuse_damage"
+        self.material_drive_floor = (
+            float(material_drive_floor)
+            if material_drive_floor is not None
+            else max(
+                0.02,
+                min(
+                    0.28,
+                    0.05 + 0.22 * (self.growth_gain - 1.0) + 0.30 * (0.30 - self.tau_init),
+                ),
+            )
+        )
+        if self.material_family == "diffuse_damage":
+            self.material_drive_floor = 0.0
+        self.diffuse_damage_gain = float(diffuse_damage_gain)
+        self.diffuse_neighborhood_steps = max(int(diffuse_neighborhood_steps), 1)
         self.device = torch.device(device)
 
         self.graph = graph or GaussianGraph(device=device)
@@ -89,6 +121,11 @@ class GaussianFractureField:
         norm = v.norm(dim=1, keepdim=True)
         return torch.where(norm > 1e-8, v / norm.clamp(min=1e-8), torch.zeros_like(v))
 
+    @staticmethod
+    def _apply_gain(values: Tensor, gain: float) -> Tensor:
+        gain = max(float(gain), 1e-4)
+        return 1.0 - torch.pow(1.0 - values.clamp(0.0, 1.0), gain)
+
     def _normalize_drive(self, values: Tensor, quantile: Optional[float] = None) -> Tensor:
         if values.numel() == 0:
             return values
@@ -118,6 +155,7 @@ class GaussianFractureField:
 
         init_score = self._normalize_drive(init_score.clamp(min=0.0), quantile=0.96)
         growth_drive = self._normalize_drive(growth_drive.clamp(min=0.0))
+        growth_drive = self._apply_gain(growth_drive, self.growth_gain)
         if growth_dir is None:
             growth_dir = torch.zeros(N, 3, device=positions.device)
         growth_dir = self._safe_normalize(growth_dir)
@@ -128,23 +166,26 @@ class GaussianFractureField:
 
         seeded = 0
         advanced = 0
-        if not self.crack_front.has_active_tips():
-            seeded = self._seed_front(positions, init_score, growth_drive, growth_dir)
+        if not self.enable_front_propagation:
+            self._update_diffuse_damage(init_score, growth_drive)
         else:
-            for _ in range(self.front_substeps):
-                if not self.crack_front.has_active_tips():
-                    break
-                advanced += self.crack_front.advance(
-                    self.graph,
-                    positions,
-                    growth_drive,
-                    growth_dir,
-                    impact_center=self.seed_center,
-                )
             if not self.crack_front.has_active_tips():
                 seeded = self._seed_front(positions, init_score, growth_drive, growth_dir)
-
-        self._update_damage_band(init_score, growth_drive)
+            else:
+                substeps = max(1, min(4, int(round(self.front_substeps * max(0.75, self.growth_gain)))))
+                for _ in range(substeps):
+                    if not self.crack_front.has_active_tips():
+                        break
+                    advanced += self.crack_front.advance(
+                        self.graph,
+                        positions,
+                        growth_drive,
+                        growth_dir,
+                        impact_center=self.seed_center,
+                    )
+                if not self.crack_front.has_active_tips():
+                    seeded = self._seed_front(positions, init_score, growth_drive, growth_dir)
+            self._update_damage_band(init_score, growth_drive)
         self._estimate_crack_normal(positions, growth_dir)
         self._compute_opening(F_gaussian)
 
@@ -173,6 +214,10 @@ class GaussianFractureField:
             + 0.35 * front_support
             + 0.20 * growth_drive * (front_support > self.front_threshold).float()
         ).clamp(0.0, 1.0)
+        candidate_score = self._apply_gain(
+            candidate_score,
+            0.60 + 0.60 * self.growth_gain,
+        )
         candidate_score = candidate_score * (front_support > 0.5 * self.front_threshold).float()
         return self.crack_front.seed_from_scores(
             candidate_score,
@@ -189,8 +234,15 @@ class GaussianFractureField:
 
         tip_f = tip_mask.float()
         visited_f = visited_mask.float()
-        nbr_tip = tip_mask[self.graph.knn_idx].float()
-        tip_ring = (self.graph.weights * nbr_tip).sum(dim=1).clamp(0.0, 1.0)
+        band_field = tip_f.clone()
+        band_hops = max(1, int(round(self.band_width)))
+        for _ in range(band_hops):
+            nbr_band = band_field[self.graph.knn_idx]
+            band_field = torch.maximum(
+                band_field,
+                (self.graph.weights * nbr_band).sum(dim=1).clamp(0.0, 1.0),
+            )
+        tip_ring = (band_field * (1.0 - tip_f)).clamp(0.0, 1.0)
 
         parent_mask = torch.zeros_like(tip_f)
         active_tip_idx = torch.where(tip_mask)[0]
@@ -200,22 +252,103 @@ class GaussianFractureField:
             if valid_parent.any():
                 parent_mask[parent_idx[valid_parent]] = 1.0
 
-        drive_local = growth_drive.clamp(0.0, 1.0)
+        drive_local = torch.maximum(
+            growth_drive.clamp(0.0, 1.0),
+            torch.full_like(growth_drive, self.material_drive_floor),
+        )
         init_local = init_score.clamp(0.0, 1.0)
 
-        tip_floor = (0.22 + 0.18 * drive_local) * tip_f
-        core_floor = (0.18 + 0.10 * drive_local) * parent_mask
+        tip_floor = (
+            0.16 + 0.08 * self.open_gain + 0.10 * drive_local
+        ).clamp(0.0, 0.38) * tip_f
+        core_floor = (
+            0.12 + 0.05 * self.open_gain + 0.08 * drive_local
+        ).clamp(0.0, 0.30) * parent_mask
         self.c = torch.maximum(self.c, tip_floor)
         self.c = torch.maximum(self.c, core_floor)
 
-        dc_tip = self.damage_source_scale * (0.45 + 0.55 * drive_local) * tip_f
-        dc_core = 0.65 * self.tip_propagation_scale * (0.25 + 0.75 * drive_local) * parent_mask
-        dc_band = self.damage_spread * (0.15 + 0.85 * drive_local) * tip_ring * (1.0 - tip_f)
-        dc_seed = 0.20 * self.damage_source_scale * init_local * tip_ring * (1.0 - visited_f)
+        growth_boost = 0.65 + 0.35 * self.growth_gain
+        brittle_boost = 0.85 + 0.25 * self.open_gain
+        fill_boost = 0.30 + 0.90 * self.band_fill_gain
+        dc_tip = (
+            self.damage_source_scale
+            * growth_boost
+            * brittle_boost
+            * (0.45 + 0.55 * drive_local)
+            * tip_f
+        )
+        dc_core = (
+            0.65
+            * self.tip_propagation_scale
+            * growth_boost
+            * brittle_boost
+            * (0.25 + 0.75 * drive_local)
+            * parent_mask
+        )
+        dc_band = (
+            self.damage_spread
+            * fill_boost
+            * (0.15 + 0.85 * drive_local)
+            * tip_ring
+            * (1.0 - tip_f)
+        )
+        dc_seed = (
+            0.20
+            * self.damage_source_scale
+            * (0.50 + 0.50 * self.band_fill_gain)
+            * init_local
+            * tip_ring
+            * (1.0 - visited_f)
+        )
+
+        if self.material_family == "sharp_brittle":
+            tip_floor = tip_floor * 1.22
+            core_floor = core_floor * 1.18
+            dc_tip = dc_tip * 1.18
+            dc_core = dc_core * 1.18
+            dc_band = dc_band * 0.56
+            dc_seed = dc_seed * 0.48
+        elif self.material_family == "brittle_moderate":
+            dc_tip = dc_tip * 1.08
+            dc_core = dc_core * 1.05
+            dc_band = dc_band * 0.82
+            dc_seed = dc_seed * 0.75
+        elif self.material_family == "rough_quasi_brittle":
+            tip_floor = tip_floor * 0.92
+            dc_tip = dc_tip * 0.96
+            dc_core = dc_core * 0.90
+            dc_band = dc_band * 1.28
+            dc_seed = dc_seed * 1.22
+        elif self.material_family == "neutral_reference":
+            dc_band = dc_band * 0.88
 
         dc = (dc_tip + dc_core + dc_band + dc_seed).clamp(0.0, self.dC_max)
         self.c = (self.c + dc).clamp(0.0, 1.0)
         self.H = torch.maximum(self.H, drive_local * torch.maximum(tip_f, tip_ring))
+
+    def _update_diffuse_damage(self, init_score: Tensor, growth_drive: Tensor) -> None:
+        base = (0.45 * init_score.clamp(0.0, 1.0) + 0.55 * growth_drive.clamp(0.0, 1.0)).clamp(0.0, 1.0)
+        base = self._apply_gain(base, max(0.45, 0.65 * self.growth_gain))
+
+        field = base
+        for _ in range(self.diffuse_neighborhood_steps):
+            nbr = field[self.graph.knn_idx]
+            field = torch.maximum(
+                field,
+                (self.graph.weights * nbr).sum(dim=1).clamp(0.0, 1.0),
+            )
+
+        neighbor_field = field[self.graph.knn_idx]
+        smooth = 0.55 * field + 0.45 * (self.graph.weights * neighbor_field).sum(dim=1)
+        dc = (
+            self.dC_max
+            * self.diffuse_damage_gain
+            * (0.20 + 0.80 * smooth)
+        ).clamp(0.0, 0.65 * self.dC_max)
+        cap = min(0.28, 0.20 + 0.18 * self.diffuse_damage_gain)
+        self.c = torch.maximum(self.c, 0.08 * smooth)
+        self.c = (self.c + dc).clamp(0.0, cap)
+        self.H = torch.maximum(self.H, smooth)
 
     def _estimate_crack_normal(
         self,
@@ -261,16 +394,35 @@ class GaussianFractureField:
             )
 
     def _compute_opening(self, F_gaussian: Optional[Tensor] = None) -> None:
+        if self.material_family == "diffuse_damage":
+            self.a = 0.05 * self.opening_scale * (self.c ** 2)
+            return
         if F_gaussian is not None and self.n is not None:
             Fn = torch.bmm(F_gaussian, self.n.unsqueeze(2)).squeeze(2)
             stretch = Fn.norm(dim=1)
             tensile_stretch = (stretch - 1.0).clamp(min=0.0)
-            self.a = self.opening_scale * (self.c ** 2) * (1.0 + 4.0 * tensile_stretch)
+            self.a = (
+                self.opening_scale
+                * self.open_gain
+                * (self.c ** 2)
+                * (1.0 + 4.0 * tensile_stretch)
+            )
         else:
-            self.a = self.opening_scale * (self.c ** 2)
+            self.a = self.opening_scale * self.open_gain * (self.c ** 2)
+
+        if self.material_family == "sharp_brittle":
+            self.a = self.a * 1.35
+        elif self.material_family == "brittle_moderate":
+            self.a = self.a * 1.12
+        elif self.material_family == "rough_quasi_brittle":
+            self.a = self.a * 0.88
+        elif self.material_family == "neutral_reference":
+            self.a = self.a * 0.90
 
         if self.crack_front.tip_mask is not None:
-            self.a = self.a * (1.0 + 0.25 * self.crack_front.tip_mask.float())
+            self.a = self.a * (
+                1.0 + (0.15 + 0.10 * self.open_gain) * self.crack_front.tip_mask.float()
+            )
 
     def seed_damage(
         self,

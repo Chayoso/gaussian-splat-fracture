@@ -35,6 +35,11 @@ class CrackFront:
         branch_score_ratio: float = 0.97,
         branch_drive_threshold: float = 0.70,
         max_branching_tips: int = 12,
+        tau_init: float = 0.30,
+        growth_gain: float = 1.00,
+        branching_bias: float = 0.20,
+        anisotropy_strength: float = 0.10,
+        material_family: str = "neutral_reference",
         device: str = "cuda",
     ):
         self.seed_quantile = seed_quantile
@@ -54,6 +59,11 @@ class CrackFront:
         self.branch_score_ratio = branch_score_ratio
         self.branch_drive_threshold = branch_drive_threshold
         self.max_branching_tips = max_branching_tips
+        self.tau_init = tau_init
+        self.growth_gain = growth_gain
+        self.branching_bias = branching_bias
+        self.anisotropy_strength = anisotropy_strength
+        self.material_family = str(material_family)
         self.device = torch.device(device)
 
         self.tip_mask: Optional[Tensor] = None
@@ -61,6 +71,57 @@ class CrackFront:
         self.parent_index: Optional[Tensor] = None
         self.tip_age: Optional[Tensor] = None
         self.growth_dir: Optional[Tensor] = None
+
+    def _family_settings(self) -> dict:
+        if self.material_family == "sharp_brittle":
+            return {
+                "front_enabled": True,
+                "branch_scale": 0.35,
+                "continuity_scale": 1.35,
+                "align_scale": 1.20,
+                "revisit_penalty": 0.95,
+                "successor_cap": 1,
+                "seed_spacing_scale": 1.25,
+            }
+        if self.material_family == "brittle_moderate":
+            return {
+                "front_enabled": True,
+                "branch_scale": 0.70,
+                "continuity_scale": 1.15,
+                "align_scale": 1.08,
+                "revisit_penalty": 0.85,
+                "successor_cap": 2,
+                "seed_spacing_scale": 1.05,
+            }
+        if self.material_family == "rough_quasi_brittle":
+            return {
+                "front_enabled": True,
+                "branch_scale": 1.35,
+                "continuity_scale": 0.82,
+                "align_scale": 0.92,
+                "revisit_penalty": 0.45,
+                "successor_cap": max(self.successor_topk, 3),
+                "seed_spacing_scale": 0.85,
+            }
+        if self.material_family == "diffuse_damage":
+            return {
+                "front_enabled": False,
+                "branch_scale": 0.0,
+                "continuity_scale": 0.0,
+                "align_scale": 0.0,
+                "revisit_penalty": 1.0,
+                "successor_cap": 0,
+                "seed_spacing_scale": 1.50,
+            }
+        return {
+            "front_enabled": True,
+            "branch_scale": 1.0,
+            "continuity_scale": 1.0,
+            "align_scale": 1.0,
+            "revisit_penalty": 0.75,
+            "successor_cap": max(1, min(self.successor_topk, 2)),
+            "seed_spacing_scale": 1.0,
+        }
 
     def initialize(self, N: int, device: Optional[torch.device] = None) -> None:
         device = device or self.device
@@ -81,6 +142,9 @@ class CrackFront:
         impact_center: Optional[Tensor] = None,
     ) -> int:
         """Create initial crack tips from sparse hotspot scores."""
+        family_cfg = self._family_settings()
+        if not family_cfg["front_enabled"]:
+            return 0
         if self.tip_mask is None or self.tip_mask.shape[0] != positions.shape[0]:
             self.initialize(positions.shape[0], positions.device)
         if self.has_active_tips():
@@ -92,7 +156,13 @@ class CrackFront:
 
         q = float(min(max(self.seed_quantile, 0.0), 0.999))
         thresh = torch.quantile(score.detach(), q)
+        thresh = torch.maximum(
+            thresh,
+            torch.tensor(self.tau_init, device=score.device, dtype=score.dtype),
+        )
         candidate_idx = torch.where(score >= thresh)[0]
+        if candidate_idx.numel() == 0 and score.max() < max(0.75 * self.tau_init, 0.12):
+            return 0
         if candidate_idx.numel() == 0:
             candidate_idx = score.topk(min(self.max_seed_points, score.numel())).indices
         elif candidate_idx.numel() < min(self.max_seed_points, score.numel()):
@@ -103,14 +173,16 @@ class CrackFront:
         candidate_idx = candidate_idx[order]
 
         selected = []
+        min_seed_spacing = self.min_seed_spacing * family_cfg["seed_spacing_scale"]
+        max_seed_points = min(self.max_seed_points, family_cfg["successor_cap"] + 1)
         for idx in candidate_idx.tolist():
-            if len(selected) >= self.max_seed_points:
+            if len(selected) >= max_seed_points:
                 break
             pos_i = positions[idx]
             if selected:
                 sel_pos = positions[torch.tensor(selected, device=positions.device)]
                 min_dist = torch.norm(sel_pos - pos_i.unsqueeze(0), dim=1).min().item()
-                if min_dist < self.min_seed_spacing:
+                if min_dist < min_seed_spacing:
                     continue
             selected.append(idx)
 
@@ -141,13 +213,22 @@ class CrackFront:
         impact_center: Optional[Tensor] = None,
     ) -> int:
         """Advance the active crack front by selecting a few successors."""
+        family_cfg = self._family_settings()
+        if not family_cfg["front_enabled"]:
+            return 0
         if not self.has_active_tips():
             return 0
 
         device = positions.device
         normals = getattr(graph, "_normals", None)
         tip_indices = torch.where(self.tip_mask)[0]
-        can_branch = tip_indices.numel() < self.max_branching_tips
+        branch_scale = family_cfg["branch_scale"]
+        successor_cap = max(0, family_cfg["successor_cap"])
+        can_branch = (
+            successor_cap > 1
+            and tip_indices.numel()
+            < max(1, int(round(self.max_branching_tips * max(branch_scale, 0.25))))
+        )
 
         next_tip_mask = torch.zeros_like(self.tip_mask)
         next_growth_dir = torch.zeros_like(self.growth_dir)
@@ -167,6 +248,7 @@ class CrackFront:
             edge = edge / edge.norm(dim=1, keepdim=True).clamp(min=1e-8)
 
             local_drive = growth_drive[nbr_idx].clamp(0.0, 1.0)
+            local_drive = 1.0 - torch.pow(1.0 - local_drive, self.growth_gain)
             score = self.drive_weight * local_drive
             local_w = nbr_weights[valid]
             if local_w.numel() > 0:
@@ -179,7 +261,12 @@ class CrackFront:
                 tip_dir = growth_dir_hint[i]
             if tip_dir.norm() > 1e-8:
                 tip_dir = tip_dir / tip_dir.norm().clamp(min=1e-8)
-                score = score + self.align_weight * (edge @ tip_dir).clamp(min=0.0)
+                align_gain = (
+                    self.align_weight
+                    * family_cfg["align_scale"]
+                    * (1.0 + 1.6 * self.anisotropy_strength)
+                )
+                score = score + align_gain * (edge @ tip_dir).clamp(min=0.0)
 
             hint_j = growth_dir_hint[nbr_idx]
             hint_j = hint_j / hint_j.norm(dim=1, keepdim=True).clamp(min=1e-8)
@@ -189,30 +276,37 @@ class CrackFront:
             if parent >= 0:
                 parent_dir = positions[i] - positions[parent]
                 parent_dir = parent_dir / parent_dir.norm().clamp(min=1e-8)
-                score = score + self.continuity_weight * (edge @ parent_dir).clamp(min=0.0)
+                score = score + (
+                    self.continuity_weight
+                    * family_cfg["continuity_scale"]
+                    * (edge @ parent_dir).clamp(min=0.0)
+                )
 
             if normals is not None and normals.shape[0] == positions.shape[0]:
                 n_i = normals[i].unsqueeze(0)
                 n_j = normals[nbr_idx]
                 tangent = (1.0 - (edge * n_i).sum(dim=1).abs())
                 tangent = tangent * (1.0 - (edge * n_j).sum(dim=1).abs())
-                score = score + self.tangent_weight * tangent.clamp(0.0, 1.0)
+                tangent_gain = self.tangent_weight * (1.0 + self.anisotropy_strength)
+                score = score + tangent_gain * tangent.clamp(0.0, 1.0)
 
             if impact_center is not None:
                 radial = positions[nbr_idx] - impact_center.unsqueeze(0)
                 radial = radial / radial.norm(dim=1, keepdim=True).clamp(min=1e-8)
-                score = score + self.radial_weight * (edge * radial).sum(dim=1).clamp(min=0.0)
+                radial_gain = self.radial_weight * max(0.35, 1.0 - 0.55 * self.anisotropy_strength)
+                score = score + radial_gain * (edge * radial).sum(dim=1).clamp(min=0.0)
 
                 escape_height = max(float((positions[i, 2] - impact_center[2]).item()), 0.0)
                 escape_gain = 1.0 / (1.0 + 6.0 * escape_height)
             else:
                 escape_gain = 1.0
 
-            score = score + (self.lift_weight * escape_gain) * edge[:, 2].clamp(min=0.0)
+            lift_gain = self.lift_weight * max(0.45, 1.0 - 0.35 * self.anisotropy_strength)
+            score = score + (lift_gain * escape_gain) * edge[:, 2].clamp(min=0.0)
 
             revisit_penalty = self.visited_mask[nbr_idx].float()
             allow_revisit = local_drive > self.revisit_drive_threshold
-            score = score - 0.75 * (revisit_penalty * (~allow_revisit).float())
+            score = score - family_cfg["revisit_penalty"] * (revisit_penalty * (~allow_revisit).float())
 
             score = score - 0.5 * self.tip_mask[nbr_idx].float()
 
@@ -228,13 +322,18 @@ class CrackFront:
             order = keep_score.argsort(descending=True)
             keep = keep[order]
             branch_topk = 1
-            if keep.numel() > 1 and self.successor_topk > 1 and can_branch:
+            if keep.numel() > 1 and successor_cap > 1 and can_branch:
                 second_drive = local_drive[keep[1]]
+                branch_ratio = max(self.branch_score_ratio - 0.18 * self.branching_bias * branch_scale, 0.72)
+                branch_drive_threshold = max(
+                    self.branch_drive_threshold - 0.40 * self.branching_bias * branch_scale,
+                    0.15,
+                )
                 if (
-                    keep_score[order[1]] >= self.branch_score_ratio * keep_score[order[0]]
-                    and second_drive >= self.branch_drive_threshold
+                    keep_score[order[1]] >= branch_ratio * keep_score[order[0]]
+                    and second_drive >= branch_drive_threshold
                 ):
-                    branch_topk = min(self.successor_topk, keep.numel())
+                    branch_topk = min(successor_cap, keep.numel())
             keep = keep[:branch_topk]
             chosen = nbr_idx[keep]
 

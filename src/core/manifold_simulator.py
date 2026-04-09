@@ -25,6 +25,7 @@ from src.mpm_core.mpm_model import MPMModel
 from src.core.coordinate_mapper import CoordinateMapper
 from src.fracture.graph_builder import GaussianGraph
 from src.fracture.physics_projector import PhysicsProjector
+from src.fracture.crack_front import CrackFront
 from src.fracture.tip_based_fracture_field import GaussianFractureField
 from src.fracture.gaussian_splitter import GaussianSplitter
 from src.fracture.graph_fragment_manager import GraphFragmentManager
@@ -91,6 +92,32 @@ class ManifoldSimulator:
             device=device_str,
         )
 
+        crack_front = CrackFront(
+            seed_quantile=fp.get('seed_quantile', 0.995),
+            max_seed_points=fp.get('max_seed_points', 2),
+            min_seed_spacing=fp.get('min_seed_spacing', 0.04),
+            successor_topk=fp.get('successor_topk', 2),
+            min_successor_score=fp.get('min_successor_score', 0.25),
+            drive_weight=fp.get('drive_weight', 0.40),
+            distance_weight=fp.get('distance_weight', 0.12),
+            align_weight=fp.get('align_weight', 0.24),
+            tangent_weight=fp.get('tangent_weight', 0.16),
+            continuity_weight=fp.get('continuity_weight', 0.10),
+            radial_weight=fp.get('radial_weight', 0.16),
+            lift_weight=fp.get('lift_weight', 0.40),
+            max_tip_age=fp.get('max_tip_age', 2),
+            revisit_drive_threshold=fp.get('revisit_drive_threshold', 0.8),
+            branch_score_ratio=fp.get('branch_score_ratio', 0.97),
+            branch_drive_threshold=fp.get('branch_drive_threshold', 0.70),
+            max_branching_tips=fp.get('max_branching_tips', 12),
+            tau_init=fp.get('tau_init', 0.30),
+            growth_gain=fp.get('growth_gain', 1.0),
+            branching_bias=fp.get('branching_bias', 0.20),
+            anisotropy_strength=fp.get('anisotropy_strength', 0.10),
+            material_family=fp.get('material_family', 'neutral_reference'),
+            device=device_str,
+        )
+
         self.fracture_field = GaussianFractureField(
             Gc=Gc,
             l0=l0,
@@ -104,7 +131,19 @@ class ManifoldSimulator:
             front_threshold=fp.get('front_threshold', 0.05),
             radial_bias=fp.get('radial_bias', 2.5),
             tip_propagation_scale=fp.get('tip_propagation_scale', 0.75),
+            front_substeps=fp.get('front_substeps', 2),
+            tau_init=fp.get('tau_init', 0.30),
+            growth_gain=fp.get('growth_gain', 1.0),
+            band_width=fp.get('band_width', 1.5),
+            band_fill_gain=fp.get('band_fill_gain', 0.30),
+            open_gain=fp.get('open_gain', 1.0),
+            material_family=fp.get('material_family', 'neutral_reference'),
+            enable_front_propagation=fp.get('enable_front_propagation', True),
+            material_drive_floor=fp.get('material_drive_floor', None),
+            diffuse_damage_gain=fp.get('diffuse_damage_gain', 0.16),
+            diffuse_neighborhood_steps=fp.get('diffuse_neighborhood_steps', 2),
             graph=self.graph,
+            crack_front=crack_front,
             device=device_str,
         )
 
@@ -122,6 +161,8 @@ class ManifoldSimulator:
         self.fragment_manager = GraphFragmentManager(
             damage_threshold=fp.get('fragment_damage_threshold', 0.5),
             min_fragment_size=fp.get('min_fragment_particles', 20),
+            edge_break_rate=fp.get('edge_break_rate', 1.0),
+            material_family=fp.get('material_family', 'neutral_reference'),
             device=device_str,
         ) if frag_enabled else None
         self.fragmentation_active = False
@@ -172,6 +213,15 @@ class ManifoldSimulator:
         print(f"  Substeps: {physics_substeps}")
         print(f"  Fracture: Gc={Gc}, l0={l0}")
         print(f"  Graph: k={self.graph.k}, sigma={self.graph.sigma}")
+        print(f"  Family: {fp.get('material_family', 'neutral_reference')}")
+        print(
+            f"  Material-aware: tau={fp.get('tau_init', 0.30):.2f}, "
+            f"growth={fp.get('growth_gain', 1.0):.2f}, "
+            f"band={fp.get('band_width', 1.5):.2f}, "
+            f"open={fp.get('open_gain', 1.0):.2f}, "
+            f"branch={fp.get('branching_bias', 0.20):.2f}, "
+            f"edge_break={fp.get('edge_break_rate', 1.0):.2f}"
+        )
         print(f"  Damage feedback: delay={self.damage_feedback_delay_frames}, "
               f"ramp={self.damage_feedback_ramp_frames}, "
               f"interior_scale={self.interior_damage_scale:.2f}")
@@ -629,6 +679,8 @@ class ManifoldSimulator:
         if self.fragment_manager is None:
             return
         if self.fracture_field.c is None:
+            return
+        if getattr(self.fragment_manager, 'material_family', '') == 'diffuse_damage':
             return
         if self.fracture_field.c.max() < 0.3:
             return

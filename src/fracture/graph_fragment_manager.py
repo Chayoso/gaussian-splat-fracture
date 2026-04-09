@@ -32,6 +32,8 @@ class GraphFragmentManager:
         self,
         damage_threshold: float = 0.5,
         min_fragment_size: int = 20,
+        edge_break_rate: float = 1.0,
+        material_family: str = "neutral_reference",
         device: str = "cuda",
     ):
         """
@@ -42,6 +44,8 @@ class GraphFragmentManager:
         """
         self.damage_threshold = damage_threshold
         self.min_fragment_size = min_fragment_size
+        self.edge_break_rate = edge_break_rate
+        self.material_family = str(material_family)
         self.device = torch.device(device)
 
         self.n_fragments: int = 0
@@ -64,6 +68,14 @@ class GraphFragmentManager:
         Returns:
             n_fragments: number of detected fragments
         """
+        if self.material_family == "diffuse_damage":
+            N = damage.shape[0]
+            self.fragment_ids = torch.zeros(N, dtype=torch.long, device=self.device)
+            self.fragment_sizes = [N]
+            self.fragment_indices = [torch.arange(N, device=self.device)]
+            self.n_fragments = 1
+            return 1
+
         N = damage.shape[0]
         if graph.knn_idx is None:
             self.fragment_ids = torch.zeros(N, dtype=torch.long, device=self.device)
@@ -72,9 +84,24 @@ class GraphFragmentManager:
 
         # Compute edge connectivity
         connectivity = graph.edge_damage_strength(damage)  # (N, K)
+        edge_break_rate = max(self.edge_break_rate, 1e-4)
+        damage_threshold = self.damage_threshold
+        if self.material_family == "sharp_brittle":
+            edge_break_rate *= 1.20
+            damage_threshold *= 0.84
+        elif self.material_family == "brittle_moderate":
+            edge_break_rate *= 1.08
+            damage_threshold *= 0.92
+        elif self.material_family == "rough_quasi_brittle":
+            edge_break_rate *= 0.96
+            damage_threshold *= 1.04
+        elif self.material_family == "neutral_reference":
+            edge_break_rate *= 0.92
+            damage_threshold *= 0.96
+        connectivity = connectivity.clamp(0.0, 1.0) ** edge_break_rate
 
         # Binary edge mask: edge is intact if connectivity > threshold
-        edge_alive = connectivity > (1.0 - self.damage_threshold)
+        edge_alive = connectivity > (1.0 - damage_threshold)
 
         # Union-Find on CPU (graph CC is inherently serial)
         knn_idx_cpu = graph.knn_idx.cpu()

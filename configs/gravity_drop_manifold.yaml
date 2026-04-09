@@ -70,13 +70,33 @@ manifold:
   graph_rebuild_every: 5             # Rebuild graph every N frames
   projector_k: 8                     # kNN for MPM→Gaussian projection
   projector_sigma: 0.05              # Projection kernel bandwidth
+  material_family: "neutral_reference"
+  enable_front_propagation: true
+  material_drive_floor: 0.025
+  diffuse_damage_gain: 0.16
+  diffuse_neighborhood_steps: 2
   aniso_ratio: 1.0                   # 1.0 = isotropic (no directional bias)
   damage_source_scale: 0.35          # Physics-driven advance at crack front
-  damage_spread: 0.45                # Front propagation strength on graph
-  drive_quantile: 0.50               # Lower = broader drive region (more area can nucleate)
+  damage_spread: 0.36                # Neutral baseline: narrower than rough quasi-brittle
+  drive_quantile: 0.58               # Neutral baseline: avoid overly broad activation
   front_threshold: 0.05              # Require local crack/front support before growing
   radial_bias: 2.50                  # Bias crack-front propagation away from the impact seed
   tip_propagation_scale: 0.75        # Aggressive front advance along favored edges
+  front_substeps: 2                  # Base crack-front substeps per frame
+  tau_init: 0.30                     # Neutral reference seed threshold
+  growth_gain: 0.92                  # Neutral reference front advance gain
+  band_width: 1.25                   # Neutral reference local crack band width
+  band_fill_gain: 0.24               # Neutral reference band fill
+  open_gain: 0.88                    # Neutral reference opening
+  edge_break_rate: 0.92              # Neutral reference fragmentation tendency
+  branching_bias: 0.16               # Neutral reference branching
+  anisotropy_strength: 0.10          # Higher = stronger alignment to growth direction
+  seed_quantile: 0.995               # Sparse initial seed selection
+  successor_topk: 2                  # Max successors per active crack tip
+  min_successor_score: 0.25          # Min score needed to advance the front
+  branch_score_ratio: 0.97           # Allow branching when 2nd score is close to 1st
+  branch_drive_threshold: 0.70       # Min drive for a branch candidate
+  max_branching_tips: 12             # Keep branching bounded for stability
   opening_scale: 0.03                # Crack opening displacement scale
   impact_seed_radius_factor: 0.08    # Seed only the local contact patch on impact
   impact_seed_magnitude: 0.18        # Initial impact damage seed
@@ -135,6 +155,7 @@ damage_projection:
   use_faiss: true
 
 gaussian_splatting:
+  material_family: "neutral_reference"
   sh_degree: 3
   pretrained_ply: null
   pretrained_scale_multiplier: 1.0
@@ -150,6 +171,15 @@ gaussian_splatting:
   crack_gap_fraction: 0.60
   crack_edge_darken: 1.10
   crack_red_accent: 0.20
+  crack_tip_scale_boost: 0.22
+  crack_tip_opacity_boost: 0.10
+  crack_band_weight: 0.80
+  crack_visited_weight: 0.45
+  crack_tip_weight: 0.95
+  crack_core_weight: 1.00
+  damage_scale_shrink: 0.50
+  damage_center_opacity_reduction: 0.70
+  diffuse_damage_strength: 0.12
 
 rendering:
   image_width: 1920

@@ -29,6 +29,7 @@ class MaterialDB:
         if db_path is None:
             db_path = str(Path(__file__).parent.parent.parent / "data" / "material_db.json")
         self.entries = self._load(db_path)
+        self._name_to_entry = {entry.name: entry for entry in self.entries}
         print(f"[MaterialDB] Loaded {len(self.entries)} materials from {db_path}")
 
     def _load(self, path: str) -> List[MaterialEntry]:
@@ -56,6 +57,13 @@ class MaterialDB:
         query_lower = query.lower()
         return [e for e in self.entries
                 if query_lower in e.name.lower() or query_lower in e.description.lower()]
+
+    def get_entry_by_name(self, name: str) -> MaterialEntry:
+        """Return the exact DB entry for a material name."""
+        try:
+            return self._name_to_entry[name]
+        except KeyError as exc:
+            raise KeyError(f"Unknown material entry: {name}") from exc
 
     def __len__(self):
         return len(self.entries)

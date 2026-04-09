@@ -25,6 +25,14 @@ class GaussianCrackVisualizer:
         crack_red_accent: float = 0.10,
         crack_tip_scale_boost: float = 0.20,
         crack_tip_opacity_boost: float = 0.10,
+        material_family: str = "neutral_reference",
+        crack_band_weight: float = 0.80,
+        crack_visited_weight: float = 0.45,
+        crack_tip_weight: float = 0.95,
+        crack_core_weight: float = 1.00,
+        damage_scale_shrink: float = 0.50,
+        damage_center_opacity_reduction: float = 0.70,
+        diffuse_damage_strength: float = 0.12,
     ):
         self.damage_threshold = damage_threshold
         self.device = device
@@ -35,6 +43,14 @@ class GaussianCrackVisualizer:
         self.crack_red_accent = crack_red_accent
         self.crack_tip_scale_boost = crack_tip_scale_boost
         self.crack_tip_opacity_boost = crack_tip_opacity_boost
+        self.material_family = str(material_family)
+        self.crack_band_weight = float(crack_band_weight)
+        self.crack_visited_weight = float(crack_visited_weight)
+        self.crack_tip_weight = float(crack_tip_weight)
+        self.crack_core_weight = float(crack_core_weight)
+        self.damage_scale_shrink = float(damage_scale_shrink)
+        self.damage_center_opacity_reduction = float(damage_center_opacity_reduction)
+        self.diffuse_damage_strength = float(diffuse_damage_strength)
         self.crack_color = torch.tensor(crack_color, dtype=torch.float32, device=device)
 
         # Light direction for dynamic diffuse shading
@@ -68,7 +84,7 @@ class GaussianCrackVisualizer:
             t = ((c_surface[crack_band] - thresh)
                  / (1.0 - thresh)).clamp(0.0, 1.0)
             # Moderate shrinkage (50% max) — keeps fragments solid
-            scale_mult = 1.0 - 0.5 * (t ** 3)
+            scale_mult = 1.0 - self.damage_scale_shrink * (t ** 3)
             gaussians._scaling.data[crack_band] += torch.log(
                 scale_mult.unsqueeze(1).clamp(min=0.05))
 
@@ -76,7 +92,7 @@ class GaussianCrackVisualizer:
         crack_center = c_surface > 0.85
         if crack_center.any():
             t_o = ((c_surface[crack_center] - 0.85) / 0.15).clamp(0.0, 1.0)
-            opacity_mult = 1.0 - 0.7 * (t_o ** 2)
+            opacity_mult = 1.0 - self.damage_center_opacity_reduction * (t_o ** 2)
             cur_prob = torch.sigmoid(gaussians._opacity.data[crack_center])
             new_prob = (cur_prob * opacity_mult.unsqueeze(1)).clamp(1e-6, 1 - 1e-6)
             gaussians._opacity.data[crack_center] = torch.log(
@@ -305,9 +321,12 @@ class GaussianCrackVisualizer:
 
         # Manifold fracture visualization (crack normals + opening)
         if crack_normals is not None and crack_opening is not None:
-            self._apply_manifold_crack_visualization(
-                gaussians, c_surface, crack_normals, crack_opening,
-                crack_tips=crack_tips, crack_visited=crack_visited)
+            if self.material_family == "diffuse_damage":
+                self._apply_damage_visualization(gaussians, c_surface)
+            else:
+                self._apply_manifold_crack_visualization(
+                    gaussians, c_surface, crack_normals, crack_opening,
+                    crack_tips=crack_tips, crack_visited=crack_visited)
         else:
             # Legacy: scalar damage visualization
             has_damage = (c_surface is not None
@@ -346,16 +365,23 @@ class GaussianCrackVisualizer:
         crack_visited = crack_visited if crack_visited is not None else torch.zeros(
             N, dtype=torch.bool, device=c_surface.device)
         crack_band = c_surface > thresh
-        crack_shell = crack_band | crack_visited | crack_tips
+        c_norm = ((c_surface - thresh) / max(1.0 - thresh, 1e-6)).clamp(0.0, 1.0)
+        tip_strength = crack_tips.float() * self.crack_tip_weight
+        visited_strength = crack_visited.float() * self.crack_visited_weight
+        core_strength = (c_surface > max(thresh, 0.55)).float() * self.crack_core_weight
+        band_strength = c_norm * self.crack_band_weight
+        shell_strength = torch.maximum(
+            torch.maximum(band_strength, visited_strength),
+            torch.maximum(tip_strength, core_strength),
+        )
+        crack_shell = shell_strength > 0.12
 
         # --- 1. Covariance flattening along crack normal ---
         flatten_mask = crack_shell
         if flatten_mask.any() and crack_normals is not None:
-            t = ((c_surface[flatten_mask] - thresh)
-                 / (1.0 - thresh)).clamp(0.0, 1.0)
-            # Flatten factor: reduces scale along crack normal
+            t = shell_strength[flatten_mask].clamp(0.0, 1.0)
             tip_boost = crack_tips[flatten_mask].float() * self.crack_tip_scale_boost
-            flatten_factor = 1.0 - (0.60 + tip_boost) * (t.clamp(min=0.15) ** 2)
+            flatten_factor = 1.0 - (0.48 + tip_boost) * (t.clamp(min=0.12) ** 2)
             flatten_factor = flatten_factor.clamp(min=0.08)
 
             # Get Gaussian local frame
@@ -380,7 +406,7 @@ class GaussianCrackVisualizer:
             # Offset Gaussians slightly along crack normal
             # Creates a visible gap effect
             opening_mag = crack_opening[open_mask].clamp(min=0.0, max=self.crack_max_opening)
-            tip_boost = 1.0 + crack_tips[open_mask].float() * 0.35
+            tip_boost = 1.0 + crack_tips[open_mask].float() * (0.30 + self.crack_tip_scale_boost)
             offset = crack_normals[open_mask] * opening_mag.unsqueeze(1) * tip_boost.unsqueeze(1)
             # Alternate sign based on position hash for two-sided opening
             pos_hash = gaussians._xyz.data[open_mask].sum(dim=1)
@@ -391,11 +417,7 @@ class GaussianCrackVisualizer:
 
         # --- 2.5. Crack-path darkening / tint ---
         if crack_shell.any():
-            tint_strength = ((c_surface[crack_shell] - thresh).clamp(min=0.0) / max(1.0 - thresh, 1e-6))
-            tint_strength = torch.maximum(
-                tint_strength,
-                0.25 * crack_visited[crack_shell].float() + 0.45 * crack_tips[crack_shell].float(),
-            ).clamp(0.0, 1.0)
+            tint_strength = shell_strength[crack_shell].clamp(0.0, 1.0)
             cur = gaussians._features_dc.data[crack_shell, 0, :]
             darken = 1.0 - self.crack_edge_darken * tint_strength.unsqueeze(1)
             tinted = cur * darken
@@ -407,7 +429,7 @@ class GaussianCrackVisualizer:
         # --- 3. Opacity reduction at crack center ---
         crack_center = (c_surface > 0.65) | crack_tips
         if crack_center.any():
-            t_o = ((c_surface[crack_center] - 0.65) / 0.35).clamp(0.0, 1.0)
+            t_o = shell_strength[crack_center].clamp(0.0, 1.0)
             tip_boost = crack_tips[crack_center].float() * self.crack_tip_opacity_boost
             opacity_mult = 1.0 - (self.crack_opacity_reduction + tip_boost) * (t_o.clamp(min=0.15) ** 2)
             opacity_mult = opacity_mult.clamp(min=0.05, max=1.0)

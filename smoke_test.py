@@ -32,6 +32,8 @@ from src.core.manifold_simulator import ManifoldSimulator
 from src.core.material_presets import resolve_material_preset, validate_l0
 from src.engine.loading_transforms import apply_loading_transforms
 from src.visualization.gaussian_updater import GaussianCrackVisualizer
+from src.ml.material_predictor import MaterialPredictor
+from src.ml.material_prior_adapter import MaterialPriorAdapter
 
 from omegaconf import OmegaConf
 
@@ -135,6 +137,9 @@ def main():
     parser.add_argument("--frames", type=int, default=40)
     parser.add_argument("--fast", action="store_true", help="50k particles, 64 grid")
     parser.add_argument("--out", default="output/smoke_test")
+    parser.add_argument("--clip", type=str, default=None, help="Material prompt for CLIP-driven priors")
+    parser.add_argument("--clip-model", type=str, default="ViT-B/32")
+    parser.add_argument("--db-path", type=str, default=None)
     args = parser.parse_args()
 
     out_dir = Path(args.out)
@@ -149,6 +154,50 @@ def main():
         OmegaConf.update(config, "particles.target_count", 50000)
         OmegaConf.update(config, "mpm.num_grids", 64)
         OmegaConf.update(config, "rendering.physics_substeps", 8)
+
+    material_prior = None
+    if args.clip:
+        predictor = MaterialPredictor(
+            mode="clip_knn",
+            db_path=args.db_path,
+            clip_model=args.clip_model,
+        )
+        adapter = MaterialPriorAdapter()
+        raw_params = predictor.predict(args.clip)
+        topk_entries = [
+            predictor.db.get_entry_by_name(name)
+            for name in raw_params["top_k_names"]
+        ]
+        material_prior = adapter.build_material_prior(
+            topk_entries,
+            raw_params["top_k_scores"],
+        )
+        scaled = adapter.scale_physics_to_mpm(
+            material_prior["physics"],
+            base_density=float(config.material.density),
+        )
+        runtime_overrides = {
+            "E": scaled["E"],
+            "Gc": scaled["Gc"],
+            "nu": scaled["nu"],
+            "density": scaled["density"],
+            **material_prior["runtime"],
+        }
+        config = apply_overrides_dict(config, runtime_overrides)
+        print(f"[SmokeTest:clip] Material: '{args.clip}'")
+        print(f"  Top-K: {raw_params['top_k_names']}")
+        print(f"  Weights: {[f'{w:.3f}' for w in material_prior['weights']]}")
+        print(
+            f"  MPM scaled: E={scaled['E']:.2e}, Gc={scaled['Gc']:.1f}, "
+            f"density={scaled['density']:.1f}"
+        )
+        print(
+            f"  Fracture prior: tau={material_prior['fracture']['tau_init']:.2f}, "
+            f"growth={material_prior['fracture']['growth_gain']:.2f}, "
+            f"band={material_prior['fracture']['band_width']:.2f}, "
+            f"open={material_prior['fracture']['open_gain']:.2f}"
+        )
+        print(f"  Family: {material_prior['family']}")
 
     config = resolve_material_preset(config)
     config = validate_l0(config)
@@ -199,6 +248,16 @@ def main():
         crack_gap_fraction=float(gs_cfg.get('crack_gap_fraction', 0.35)),
         crack_edge_darken=float(gs_cfg.get('crack_edge_darken', 0.75)),
         crack_red_accent=float(gs_cfg.get('crack_red_accent', 0.10)),
+        crack_tip_scale_boost=float(gs_cfg.get('crack_tip_scale_boost', 0.20)),
+        crack_tip_opacity_boost=float(gs_cfg.get('crack_tip_opacity_boost', 0.10)),
+        material_family=str(gs_cfg.get('material_family', 'neutral_reference')),
+        crack_band_weight=float(gs_cfg.get('crack_band_weight', 0.80)),
+        crack_visited_weight=float(gs_cfg.get('crack_visited_weight', 0.45)),
+        crack_tip_weight=float(gs_cfg.get('crack_tip_weight', 0.95)),
+        crack_core_weight=float(gs_cfg.get('crack_core_weight', 1.00)),
+        damage_scale_shrink=float(gs_cfg.get('damage_scale_shrink', 0.50)),
+        damage_center_opacity_reduction=float(gs_cfg.get('damage_center_opacity_reduction', 0.70)),
+        diffuse_damage_strength=float(gs_cfg.get('diffuse_damage_strength', 0.12)),
     )
     surface_mask = torch.from_numpy(surface_mask_np).bool().to(device)
 
@@ -278,6 +337,9 @@ def main():
     print(f"\n{'='*50}")
     print(f"Smoke test complete: {total_frames} frames in {elapsed:.1f}s")
     print(f"Output: {out_dir}")
+    if material_prior is not None:
+        print(f"  material_category = {material_prior['dominant_category']}")
+        print(f"  family = {material_prior['family']}")
     ff = simulator.fracture_field
     if ff.c is not None:
         c = ff.c

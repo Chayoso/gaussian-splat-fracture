@@ -21,16 +21,15 @@ Usage:
     result = pipeline.run(num_frames=100)
 """
 
-import torch
-from typing import List, Optional
-from pathlib import Path
-
 from src.engine.forward_engine import ForwardEngine
+from src.ml.material_prior_adapter import MaterialPriorAdapter
 
 
 # Physical → MPM parameter scaling (same as fracture_pipeline.py)
 MPM_GC_BASE = 60000.0
 MPM_E_BASE = 1.5e7
+PHYS_E_REF = 3.0e10
+PHYS_RHO_REF = 1200.0
 PHYS_GC_REF = 100.0    # physical Gc of reference (concrete, J/m²)
 
 # Material category → RGB tint
@@ -92,6 +91,7 @@ class ManifoldFracturePipeline:
 
         # CLIP predictor (lazy-loaded only when needed)
         self._predictor = None
+        self._prior_adapter = MaterialPriorAdapter()
         self._clip_model = clip_model
         self._db_path = db_path
         self._transformer_checkpoint = transformer_checkpoint
@@ -177,16 +177,22 @@ class ManifoldFracturePipeline:
         E = override_params.get("E") if override_params else None
         Gc = override_params.get("Gc") if override_params else None
         nu = override_params.get("nu") if override_params else None
+        density = override_params.get("density") if override_params else None
 
         params = {
             "E": E or self.engine.base_config.material.youngs_modulus,
             "Gc": Gc or self.engine.base_config.material.Gc,
             "nu": nu or self.engine.base_config.material.poissons_ratio,
+            "density": density or self.engine.base_config.material.density,
         }
-        print(f"\n[Pipeline:config] E={params['E']:.2e}, Gc={params['Gc']:.1f}, nu={params['nu']:.3f}")
+        print(
+            f"\n[Pipeline:config] E={params['E']:.2e}, "
+            f"Gc={params['Gc']:.1f}, nu={params['nu']:.3f}, "
+            f"density={params['density']:.1f}"
+        )
 
         frames = self.engine.simulate(
-            E=E, Gc=Gc, nu=nu,
+            E=E, Gc=Gc, nu=nu, density=density,
             num_frames=num_frames,
             save_frames=save_frames,
             return_frames=return_frames,
@@ -198,6 +204,18 @@ class ManifoldFracturePipeline:
             "frames": frames,
             "material_source": "config",
         }
+
+    def _build_material_prior(self, text: str):
+        raw_params = self._predictor.predict(text)
+        topk_entries = [
+            self._predictor.db.get_entry_by_name(name)
+            for name in raw_params["top_k_names"]
+        ]
+        material_prior = self._prior_adapter.build_material_prior(
+            topk_entries,
+            raw_params["top_k_scores"],
+        )
+        return raw_params, material_prior
 
     def _run_clip(
         self,
@@ -221,44 +239,74 @@ class ManifoldFracturePipeline:
         else:
             self._predictor.mode = "clip_knn"
 
-        # Predict material params
-        params = self._predictor.predict(text)
+        raw_params, material_prior = self._build_material_prior(text)
+        physics_prior = material_prior["physics"]
+        fracture_prior = material_prior["fracture"]
 
         print(f"\n[Pipeline:clip] Material: '{text}'")
-        print(f"  Physical: E={params['E']:.2e}, Gc={params['Gc']:.1f}, "
-              f"nu={params['nu']:.3f}, density={params['density']:.0f}")
-        print(f"  Top-K: {params['top_k_names']}")
+        print(
+            f"  Physical: E={physics_prior['E']:.2e}, "
+            f"Gc={physics_prior['Gc']:.1f}, "
+            f"nu={physics_prior['nu']:.3f}, density={physics_prior['density']:.0f}"
+        )
+        print(f"  Top-K: {raw_params['top_k_names']}")
+        print(f"  Weights: {[f'{w:.3f}' for w in material_prior['weights']]}")
 
-        # Scale to MPM space
-        params["E_physical"] = params["E"]
-        params["Gc_physical"] = params["Gc"]
-        params["E"] = MPM_E_BASE
-        params["Gc"] = MPM_GC_BASE * (params["Gc_physical"] / PHYS_GC_REF)
-        print(f"  MPM scaled: E={params['E']:.2e}, Gc={params['Gc']:.1f}")
+        params = {
+            "top_k_names": raw_params["top_k_names"],
+            "top_k_scores": raw_params["top_k_scores"],
+            "E_physical": physics_prior["E"],
+            "Gc_physical": physics_prior["Gc"],
+            "density_physical": physics_prior["density"],
+            "nu_physical": physics_prior["nu"],
+        }
+        params.update(
+            self._prior_adapter.scale_physics_to_mpm(
+                physics_prior,
+                base_E=MPM_E_BASE,
+                base_Gc=MPM_GC_BASE,
+                base_density=float(self.engine.base_config.material.density),
+                ref_E=PHYS_E_REF,
+                ref_Gc=PHYS_GC_REF,
+                ref_density=PHYS_RHO_REF,
+            )
+        )
+        print(
+            f"  MPM scaled: E={params['E']:.2e}, Gc={params['Gc']:.1f}, "
+            f"density={params['density']:.1f}"
+        )
+        print(
+            f"  Fracture prior: tau={fracture_prior['tau_init']:.2f}, "
+            f"growth={fracture_prior['growth_gain']:.2f}, "
+            f"band={fracture_prior['band_width']:.2f}, "
+            f"open={fracture_prior['open_gain']:.2f}, "
+            f"branch={fracture_prior['branching_bias']:.2f}"
+        )
+        print(f"  Family: {material_prior['family']}")
 
-        # Apply overrides
+        runtime_overrides = dict(material_prior["runtime"])
         if override_params:
             for key, val in override_params.items():
                 if key in params:
                     params[key] = val
+                else:
+                    runtime_overrides[key] = val
             print(f"  Overrides: {override_params}")
 
-        # Material texture from top-1 category
-        top_entry = self._predictor.db[
-            self._predictor.db.get_names().index(params["top_k_names"][0])]
-        mat_category = top_entry.category
+        mat_category = material_prior["dominant_category"]
         print(f"  Texture: {mat_category}")
 
-        # Run simulation
+        sim_kwargs = {**runtime_overrides, **kwargs}
         frames = self.engine.simulate(
             E=params["E"],
             Gc=params["Gc"],
             nu=params["nu"],
+            density=params["density"],
             num_frames=num_frames,
             save_frames=save_frames,
             return_frames=return_frames,
             material_texture=mat_category,
-            **kwargs,
+            **sim_kwargs,
         )
 
         return {
@@ -267,6 +315,8 @@ class ManifoldFracturePipeline:
             "material_source": "clip",
             "top_k": params.get("top_k_names", []),
             "material_category": mat_category,
+            "fracture_family": material_prior["family"],
+            "material_prior": material_prior,
         }
 
     def predict_only(self, text: str) -> dict:
@@ -274,4 +324,22 @@ class ManifoldFracturePipeline:
         if self.material_source != "clip":
             raise ValueError("predict_only requires material_source='clip'")
         self._init_clip_predictor()
-        return self._predictor.predict(text)
+        raw_params, material_prior = self._build_material_prior(text)
+        scaled = self._prior_adapter.scale_physics_to_mpm(
+            material_prior["physics"],
+            base_E=MPM_E_BASE,
+            base_Gc=MPM_GC_BASE,
+            base_density=float(self.engine.base_config.material.density),
+            ref_E=PHYS_E_REF,
+            ref_Gc=PHYS_GC_REF,
+            ref_density=PHYS_RHO_REF,
+        )
+        return {
+            **raw_params,
+            **scaled,
+            "material_prior": material_prior,
+            "E_physical": material_prior["physics"]["E"],
+            "Gc_physical": material_prior["physics"]["Gc"],
+            "density_physical": material_prior["physics"]["density"],
+            "nu_physical": material_prior["physics"]["nu"],
+        }

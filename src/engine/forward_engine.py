@@ -298,6 +298,16 @@ class ForwardEngine:
             crack_gap_fraction=float(config.gaussian_splatting.get('crack_gap_fraction', 0.35)),
             crack_edge_darken=float(config.gaussian_splatting.get('crack_edge_darken', 0.75)),
             crack_red_accent=float(config.gaussian_splatting.get('crack_red_accent', 0.10)),
+            crack_tip_scale_boost=float(config.gaussian_splatting.get('crack_tip_scale_boost', 0.20)),
+            crack_tip_opacity_boost=float(config.gaussian_splatting.get('crack_tip_opacity_boost', 0.10)),
+            material_family=str(config.gaussian_splatting.get('material_family', 'neutral_reference')),
+            crack_band_weight=float(config.gaussian_splatting.get('crack_band_weight', 0.80)),
+            crack_visited_weight=float(config.gaussian_splatting.get('crack_visited_weight', 0.45)),
+            crack_tip_weight=float(config.gaussian_splatting.get('crack_tip_weight', 0.95)),
+            crack_core_weight=float(config.gaussian_splatting.get('crack_core_weight', 1.00)),
+            damage_scale_shrink=float(config.gaussian_splatting.get('damage_scale_shrink', 0.50)),
+            damage_center_opacity_reduction=float(config.gaussian_splatting.get('damage_center_opacity_reduction', 0.70)),
+            diffuse_damage_strength=float(config.gaussian_splatting.get('diffuse_damage_strength', 0.12)),
         )
 
         # Seismic params
