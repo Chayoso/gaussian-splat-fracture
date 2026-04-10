@@ -82,26 +82,65 @@ class CrackFront:
                 "revisit_penalty": 0.95,
                 "successor_cap": 1,
                 "seed_spacing_scale": 1.25,
+                "lateral_branch_bonus": 0.00,
+                "lateral_branch_threshold": 1.00,
+                "branch_persist_steps": 0,
+                "branch_persist_lateral": 1.00,
+                "branch_extra_branches": 0,
+                "closure_weight": 0.06,
+                "closure_branch_threshold": 0.72,
+                "closure_branch_bonus": 0.08,
+                "closure_extra_branches": 0,
+                "closure_target_cap": 48,
+                "closure_min_dist_scale": 0.08,
+                "closure_max_dist_scale": 0.22,
+                "closure_height_scale": 0.10,
             }
         if self.material_family == "brittle_moderate":
             return {
                 "front_enabled": True,
                 "branch_scale": 0.70,
-                "continuity_scale": 1.15,
-                "align_scale": 1.08,
+                "continuity_scale": 1.08,
+                "align_scale": 1.00,
                 "revisit_penalty": 0.85,
-                "successor_cap": 2,
+                "successor_cap": 3,
                 "seed_spacing_scale": 1.05,
+                "lateral_branch_bonus": 0.12,
+                "lateral_branch_threshold": 0.32,
+                "branch_persist_steps": 0,
+                "branch_persist_lateral": 0.35,
+                "branch_extra_branches": 1,
+                "closure_weight": 0.18,
+                "closure_branch_threshold": 0.36,
+                "closure_branch_bonus": 0.16,
+                "closure_extra_branches": 1,
+                "closure_target_cap": 64,
+                "closure_min_dist_scale": 0.08,
+                "closure_max_dist_scale": 0.28,
+                "closure_height_scale": 0.14,
             }
         if self.material_family == "rough_quasi_brittle":
             return {
                 "front_enabled": True,
-                "branch_scale": 1.35,
-                "continuity_scale": 0.82,
-                "align_scale": 0.92,
-                "revisit_penalty": 0.45,
-                "successor_cap": max(self.successor_topk, 3),
+                "branch_scale": 1.85,
+                "continuity_scale": 0.70,
+                "align_scale": 0.80,
+                "revisit_penalty": 0.22,
+                "successor_cap": max(self.successor_topk, 5),
                 "seed_spacing_scale": 0.85,
+                "lateral_branch_bonus": 0.26,
+                "lateral_branch_threshold": 0.18,
+                "branch_persist_steps": 1,
+                "branch_persist_lateral": 0.22,
+                "branch_extra_branches": 2,
+                "closure_weight": 0.42,
+                "closure_branch_threshold": 0.18,
+                "closure_branch_bonus": 0.36,
+                "closure_extra_branches": 2,
+                "closure_target_cap": 96,
+                "closure_min_dist_scale": 0.10,
+                "closure_max_dist_scale": 0.40,
+                "closure_height_scale": 0.18,
             }
         if self.material_family == "diffuse_damage":
             return {
@@ -112,6 +151,19 @@ class CrackFront:
                 "revisit_penalty": 1.0,
                 "successor_cap": 0,
                 "seed_spacing_scale": 1.50,
+                "lateral_branch_bonus": 0.0,
+                "lateral_branch_threshold": 1.0,
+                "branch_persist_steps": 0,
+                "branch_persist_lateral": 1.0,
+                "branch_extra_branches": 0,
+                "closure_weight": 0.0,
+                "closure_branch_threshold": 1.0,
+                "closure_branch_bonus": 0.0,
+                "closure_extra_branches": 0,
+                "closure_target_cap": 0,
+                "closure_min_dist_scale": 0.10,
+                "closure_max_dist_scale": 0.20,
+                "closure_height_scale": 0.10,
             }
         return {
             "front_enabled": True,
@@ -121,7 +173,85 @@ class CrackFront:
             "revisit_penalty": 0.75,
             "successor_cap": max(1, min(self.successor_topk, 2)),
             "seed_spacing_scale": 1.0,
+            "lateral_branch_bonus": 0.10,
+            "lateral_branch_threshold": 0.28,
+            "branch_persist_steps": 0,
+            "branch_persist_lateral": 0.35,
+            "branch_extra_branches": 1,
+            "closure_weight": 0.12,
+            "closure_branch_threshold": 0.40,
+            "closure_branch_bonus": 0.12,
+            "closure_extra_branches": 1,
+            "closure_target_cap": 64,
+            "closure_min_dist_scale": 0.08,
+            "closure_max_dist_scale": 0.30,
+            "closure_height_scale": 0.14,
         }
+
+    def _compute_loop_closure_scores(
+        self,
+        tip_index: int,
+        neighbor_idx: Tensor,
+        edge_dir: Tensor,
+        positions: Tensor,
+        tip_dir: Tensor,
+        family_cfg: dict,
+        diag: float,
+        height_scale: float,
+    ) -> Tensor:
+        closure_weight = float(family_cfg.get("closure_weight", 0.0))
+        if closure_weight <= 0.0 or self.visited_mask is None:
+            return torch.zeros(edge_dir.shape[0], device=positions.device, dtype=positions.dtype)
+
+        target_mask = self.visited_mask.clone()
+        target_mask[tip_index] = False
+        parent = int(self.parent_index[tip_index].item()) if self.parent_index is not None else -1
+        if parent >= 0:
+            target_mask[parent] = False
+
+        target_idx = torch.where(target_mask)[0]
+        if target_idx.numel() == 0:
+            return torch.zeros(edge_dir.shape[0], device=positions.device, dtype=positions.dtype)
+
+        to_targets = positions[target_idx] - positions[tip_index].unsqueeze(0)
+        dist_targets = to_targets.norm(dim=1)
+        min_dist = max(0.02, family_cfg["closure_min_dist_scale"] * max(diag, 1e-6))
+        max_dist = max(min_dist * 1.5, family_cfg["closure_max_dist_scale"] * max(diag, 1e-6))
+        height_gate = max(0.02, family_cfg["closure_height_scale"] * max(height_scale, 1e-6))
+        valid_targets = (
+            (dist_targets >= min_dist)
+            & (dist_targets <= max_dist)
+            & (to_targets[:, 2].abs() <= height_gate)
+        )
+        if tip_dir.norm() > 1e-8:
+            tip_dir = tip_dir / tip_dir.norm().clamp(min=1e-8)
+            target_dir_all = to_targets / dist_targets.unsqueeze(1).clamp(min=1e-8)
+            # Favor lateral / returning targets over purely forward continuation.
+            valid_targets &= ((target_dir_all @ tip_dir).abs() <= 0.96)
+        if not bool(valid_targets.any()):
+            return torch.zeros(edge_dir.shape[0], device=positions.device, dtype=positions.dtype)
+
+        target_idx = target_idx[valid_targets]
+        dist_targets = dist_targets[valid_targets]
+        to_targets = to_targets[valid_targets]
+        if target_idx.numel() > int(family_cfg["closure_target_cap"]):
+            order = dist_targets.argsort()
+            target_idx = target_idx[order[: int(family_cfg["closure_target_cap"])]]
+            dist_targets = dist_targets[order[: int(family_cfg["closure_target_cap"])]]
+            to_targets = to_targets[order[: int(family_cfg["closure_target_cap"])]]
+
+        target_dir = to_targets / dist_targets.unsqueeze(1).clamp(min=1e-8)
+        neighbor_pos = positions[neighbor_idx]
+        dist_next = torch.cdist(neighbor_pos, positions[target_idx])
+        progress = ((dist_targets.unsqueeze(0) - dist_next) / dist_targets.unsqueeze(0).clamp(min=1e-8)).clamp(0.0, 1.0)
+        align = (edge_dir @ target_dir.T).clamp(min=0.0, max=1.0)
+
+        if tip_dir.norm() > 1e-8:
+            target_lateral = (1.0 - (target_dir @ tip_dir).abs()).clamp(0.0, 1.0)
+        else:
+            target_lateral = torch.ones(target_dir.shape[0], device=positions.device, dtype=positions.dtype)
+        closure_pair = progress * (0.55 + 0.45 * align) * (0.45 + 0.55 * target_lateral.unsqueeze(0))
+        return closure_pair.max(dim=1).values.clamp(0.0, 1.0)
 
     def initialize(self, N: int, device: Optional[torch.device] = None) -> None:
         device = device or self.device
@@ -222,6 +352,9 @@ class CrackFront:
         device = positions.device
         normals = getattr(graph, "_normals", None)
         tip_indices = torch.where(self.tip_mask)[0]
+        bbox_extent = positions.max(dim=0).values - positions.min(dim=0).values
+        diag = float(bbox_extent.norm().item())
+        height_scale = max(float(bbox_extent[2].item()), 1e-6)
         branch_scale = family_cfg["branch_scale"]
         successor_cap = max(0, family_cfg["successor_cap"])
         can_branch = (
@@ -309,6 +442,21 @@ class CrackFront:
             score = score - family_cfg["revisit_penalty"] * (revisit_penalty * (~allow_revisit).float())
 
             score = score - 0.5 * self.tip_mask[nbr_idx].float()
+            if tip_dir.norm() > 1e-8:
+                lateral_score = (1.0 - (edge @ tip_dir).abs()).clamp(0.0, 1.0)
+            else:
+                lateral_score = torch.zeros(edge.shape[0], device=device, dtype=positions.dtype)
+            score = score + family_cfg["lateral_branch_bonus"] * lateral_score * local_drive
+            closure_score = self._compute_loop_closure_scores(
+                tip_index=i,
+                neighbor_idx=nbr_idx,
+                edge_dir=edge,
+                positions=positions,
+                tip_dir=tip_dir if tip_dir.norm() > 1e-8 else torch.zeros(3, device=device),
+                family_cfg=family_cfg,
+                diag=diag,
+                height_scale=height_scale,
+            )
 
             keep = torch.where(score > self.min_successor_score)[0]
             if keep.numel() == 0:
@@ -324,10 +472,10 @@ class CrackFront:
             branch_topk = 1
             if keep.numel() > 1 and successor_cap > 1 and can_branch:
                 second_drive = local_drive[keep[1]]
-                branch_ratio = max(self.branch_score_ratio - 0.18 * self.branching_bias * branch_scale, 0.72)
+                branch_ratio = max(self.branch_score_ratio - 0.30 * self.branching_bias * branch_scale, 0.54)
                 branch_drive_threshold = max(
-                    self.branch_drive_threshold - 0.40 * self.branching_bias * branch_scale,
-                    0.15,
+                    self.branch_drive_threshold - 0.58 * self.branching_bias * branch_scale,
+                    0.08,
                 )
                 if (
                     keep_score[order[1]] >= branch_ratio * keep_score[order[0]]
@@ -335,6 +483,43 @@ class CrackFront:
                 ):
                     branch_topk = min(successor_cap, keep.numel())
             keep = keep[:branch_topk]
+            extra_budget = int(family_cfg["branch_extra_branches"]) + int(family_cfg["closure_extra_branches"])
+            if keep.numel() > 0 and keep.numel() < successor_cap and can_branch and extra_budget > 0:
+                extra_pool = keep.new_tensor([], dtype=keep.dtype)
+                branch_candidates = torch.where(
+                    (lateral_score >= family_cfg["lateral_branch_threshold"])
+                    & (local_drive >= max(0.10, 0.65 * branch_drive_threshold))
+                    & (score >= 0.72 * self.min_successor_score)
+                )[0]
+                closure_candidates = torch.where(
+                    (closure_score >= family_cfg["closure_branch_threshold"])
+                    & (score >= 0.78 * self.min_successor_score)
+                )[0]
+                candidate_mask = torch.zeros(score.shape[0], dtype=torch.bool, device=device)
+                if branch_candidates.numel() > 0:
+                    candidate_mask[branch_candidates] = True
+                if closure_candidates.numel() > 0:
+                    candidate_mask[closure_candidates] = True
+                candidate_idx = torch.where(candidate_mask)[0]
+                if candidate_idx.numel() > 0:
+                    extra_aug = (
+                        score[candidate_idx]
+                        + family_cfg["closure_branch_bonus"] * closure_score[candidate_idx]
+                        + 0.75 * family_cfg["lateral_branch_bonus"] * lateral_score[candidate_idx]
+                    )
+                    extra_order = extra_aug.argsort(descending=True)
+                    extra_pool = candidate_idx[extra_order]
+                added = 0
+                selected = keep
+                for cand in extra_pool.tolist():
+                    cand_t = keep.new_tensor([cand], dtype=keep.dtype)
+                    if bool((selected == cand_t.item()).any()):
+                        continue
+                    selected = torch.cat([selected, cand_t], dim=0)
+                    added += 1
+                    if added >= extra_budget or selected.numel() >= successor_cap:
+                        break
+                keep = selected
             chosen = nbr_idx[keep]
 
             for local_k, j_t in enumerate(chosen.tolist()):
@@ -350,6 +535,16 @@ class CrackFront:
                     mix = grow_vec
                 next_growth_dir[j] = mix / mix.norm().clamp(min=1e-8)
                 new_count += 1
+
+            if (
+                chosen.numel() > 1
+                and int(self.tip_age[i].item()) < int(family_cfg["branch_persist_steps"])
+            ):
+                chosen_lateral = lateral_score[keep].max().item() if keep.numel() > 0 else 0.0
+                if chosen_lateral >= float(family_cfg["branch_persist_lateral"]):
+                    next_tip_mask[i] = True
+                    next_growth_dir[i] = tip_dir if tip_dir.norm() > 1e-8 else torch.zeros(3, device=device)
+                    next_tip_age[i] = self.tip_age[i] + 1
 
         self.tip_mask = next_tip_mask
         self.growth_dir = next_growth_dir

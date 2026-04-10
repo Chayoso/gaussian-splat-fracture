@@ -468,13 +468,17 @@ class GraphFragmentManager:
             authoritative_cut_mask=authoritative_cut_mask,
             min_group_size=effective_min_fragment_size,
         )
+        candidate_group_ids = {
+            component_group_map.get(old_label, old_label)
+            for old_label in boundary_candidate_labels
+        }
         group_closure_scores = self._compute_group_closure_scores(
             labels=labels,
             positions=positions,
             graph=graph,
             corridor_edge_mask=corridor_edge_mask,
             component_group_map=component_group_map,
-            group_ids=set(grouped_boundary_labels),
+            group_ids=candidate_group_ids,
         )
         _, _, closure_debug_threshold = self._closure_params()
         primary_promoted_labels = set()
@@ -489,11 +493,21 @@ class GraphFragmentManager:
         for old_label in unique_labels.tolist():
             group_id = component_group_map.get(old_label, old_label)
             members_by_group.setdefault(group_id, []).append(old_label)
+        explicit_patches = self._extract_explicit_closure_patches(
+            labels=labels,
+            positions=positions,
+            graph=graph,
+            corridor_edge_mask=corridor_edge_mask,
+            grouped_boundary_labels=candidate_group_ids,
+            grouped_boundary_scores=grouped_boundary_scores,
+            group_closure_scores=group_closure_scores,
+            members_by_group=members_by_group,
+        )
         closure_candidate_mask = torch.zeros(N, dtype=torch.bool, device=self.device)
         closure_boundary_mask = torch.zeros_like(corridor_edge_mask)
         closure_candidate_sizes = []
         closure_candidate_groups = {
-            group_id for group_id in grouped_boundary_labels
+            group_id for group_id in candidate_group_ids
             if float(group_closure_scores.get(group_id, 0.0)) >= closure_debug_threshold
         }
         for group_id in sorted(closure_candidate_groups):
@@ -512,11 +526,19 @@ class GraphFragmentManager:
                 & (in_group.unsqueeze(1) ^ in_group[graph.knn_idx])
             )
             closure_candidate_sizes.append(group_size)
+        if explicit_patches:
+            closure_candidate_mask.zero_()
+            closure_boundary_mask.zero_()
+            closure_candidate_sizes = []
+            for patch in explicit_patches:
+                closure_candidate_mask |= patch["mask"]
+                closure_boundary_mask |= patch["boundary_mask"]
+                closure_candidate_sizes.append(int(patch["size"]))
         self.last_closure_candidate_count = len(closure_candidate_sizes)
         self.last_closure_candidate_nodes = int(closure_candidate_mask.sum().item())
         self.last_closure_score_max = (
-            max(float(group_closure_scores.get(group_id, 0.0)) for group_id in grouped_boundary_labels)
-            if grouped_boundary_labels else 0.0
+            max(float(group_closure_scores.get(group_id, 0.0)) for group_id in candidate_group_ids)
+            if candidate_group_ids else 0.0
         )
         self.last_closure_candidate_sizes = sorted(closure_candidate_sizes, reverse=True)
         self.last_closure_candidate_mask = closure_candidate_mask.clone()
@@ -597,10 +619,20 @@ class GraphFragmentManager:
         promoted_labels.update(grouped_support_lost_labels)
         self.last_fallback_promoted_components = len(grouped_support_lost_labels)
         self.last_support_lost_components = len(grouped_support_lost_labels)
-        self.last_release_candidate_count = len(primary_promoted_labels) + len(grouped_support_lost_labels)
+        self.last_release_candidate_count = (
+            len(primary_promoted_labels)
+            + len(grouped_support_lost_labels)
+            + len(explicit_patches)
+        )
         self.last_support_loss_score_max = (
             max(grouped_release_scores.values()) if grouped_release_scores else 0.0
         )
+        explicit_support_mask = torch.zeros_like(support_lost_mask)
+        for patch in explicit_patches:
+            if bool(patch.get("support_lost", False)):
+                explicit_support_mask |= patch["mask"]
+        support_lost_mask = support_lost_mask | explicit_support_mask
+        self.last_support_lost_components += int(sum(1 for patch in explicit_patches if bool(patch.get("support_lost", False))))
         self.last_support_lost_mask = support_lost_mask.clone()
         if self.has_split_once and self.detached_node_memory is not None:
             detached_mask = self.detached_node_memory > 0.25
@@ -615,7 +647,8 @@ class GraphFragmentManager:
                     overlap_ratio = overlap / max(size, 1)
                     if overlap_ratio >= self.component_hysteresis:
                         promoted_labels.add(component_group_map.get(old_label, old_label))
-        self.last_promoted_components = len(promoted_labels)
+        self.last_primary_promoted_components += len(explicit_patches)
+        self.last_promoted_components = len(promoted_labels) + len(explicit_patches)
 
         # Sort by size (largest first)
         sorted_pairs = sorted(zip(unique_labels.tolist(), label_sizes),
@@ -644,6 +677,23 @@ class GraphFragmentManager:
                     assigned_groups[group_id] = len(kept_pairs) - 1
                 new_labels[labels == old_label] = assigned_groups[group_id]
 
+        explicit_meta = {}
+        next_explicit_label = int(new_labels.max().item()) + 1 if new_labels.numel() > 0 else 1
+        occupied_explicit = torch.zeros(N, dtype=torch.bool, device=self.device)
+        for patch in sorted(explicit_patches, key=lambda item: -int(item["size"])):
+            patch_mask = patch["mask"] & (~occupied_explicit)
+            patch_size = int(patch_mask.sum().item())
+            if patch_size < max(self.persistent_min_fragment_size, 1):
+                continue
+            new_labels[patch_mask] = next_explicit_label
+            explicit_meta[next_explicit_label] = {
+                "release_score": float(patch.get("release_score", 0.0)),
+                "support_score": 0.0 if bool(patch.get("support_lost", False)) else 0.25,
+                "support_lost": bool(patch.get("support_lost", False)),
+            }
+            occupied_explicit |= patch_mask
+            next_explicit_label += 1
+
         self.fragment_ids = new_labels
         unique_new_labels = self.fragment_ids.unique(sorted=True)
         self.fragment_sizes = []
@@ -658,10 +708,16 @@ class GraphFragmentManager:
                 continue
             self.fragment_sizes.append(size)
             self.fragment_indices.append(torch.where(mask)[0])
-            old_label = kept_pairs[new_label][0] if new_label < len(kept_pairs) else None
-            self.fragment_release_scores.append(float(grouped_release_scores.get(old_label, 0.0)))
-            self.fragment_support_scores.append(float(grouped_support_scores.get(old_label, 1.0)))
-            self.fragment_support_lost.append(bool(old_label in grouped_support_lost_labels))
+            if new_label in explicit_meta:
+                meta = explicit_meta[new_label]
+                self.fragment_release_scores.append(float(meta["release_score"]))
+                self.fragment_support_scores.append(float(meta["support_score"]))
+                self.fragment_support_lost.append(bool(meta["support_lost"]))
+            else:
+                old_label = kept_pairs[new_label][0] if new_label < len(kept_pairs) else None
+                self.fragment_release_scores.append(float(grouped_release_scores.get(old_label, 0.0)))
+                self.fragment_support_scores.append(float(grouped_support_scores.get(old_label, 1.0)))
+                self.fragment_support_lost.append(bool(old_label in grouped_support_lost_labels))
 
         self.n_fragments = len(self.fragment_indices) if self.fragment_indices else 1
         if self.n_fragments > 1:
@@ -830,6 +886,15 @@ class GraphFragmentManager:
             return 16, 0.16, 0.52
         return 16, 0.18, 0.58
 
+    def _explicit_closure_params(self) -> Tuple[float, int, float, float]:
+        if self.material_family == "sharp_brittle":
+            return 0.68, max(28, self.min_fragment_size), 1.04, 0.040
+        if self.material_family == "brittle_moderate":
+            return 0.72, max(40, self.min_fragment_size), 1.08, 0.050
+        if self.material_family == "rough_quasi_brittle":
+            return 0.70, max(72, 2 * self.min_fragment_size), 1.12, 0.060
+        return 0.72, max(48, self.min_fragment_size), 1.08, 0.050
+
     def _compute_group_closure_scores(
         self,
         labels: Tensor,
@@ -921,6 +986,210 @@ class GraphFragmentManager:
             scores[group_id] = float(max(0.0, min(1.0, closure_score)))
 
         return scores
+
+    def _build_explicit_patch_from_group(
+        self,
+        labels: Tensor,
+        positions: Tensor,
+        graph: GaussianGraph,
+        corridor_edge_mask: Tensor,
+        members: List[int],
+        min_patch_size: int,
+        inflate_scale: float,
+        slab_scale: float,
+    ) -> Optional[dict]:
+        if graph.knn_idx is None or positions is None or not members:
+            return None
+
+        seed_mask = torch.zeros(labels.shape[0], dtype=torch.bool, device=labels.device)
+        for old_label in members:
+            seed_mask |= (labels == old_label)
+        seed_size = int(seed_mask.sum().item())
+        if seed_size < max(self.min_boundary_edges, 8):
+            return None
+
+        boundary_mask = corridor_edge_mask & (seed_mask.unsqueeze(1) ^ seed_mask[graph.knn_idx])
+        edge_rows, edge_cols = torch.where(boundary_mask)
+        if edge_rows.numel() < max(self.min_boundary_edges, 10):
+            return None
+
+        nbr_idx = graph.knn_idx[edge_rows, edge_cols]
+        boundary_mids = 0.5 * (positions[edge_rows] + positions[nbr_idx])
+        boundary_nodes = torch.unique(torch.cat([edge_rows, nbr_idx], dim=0))
+        if boundary_mids.shape[0] < 8:
+            return None
+
+        center = boundary_mids.mean(dim=0)
+        centered = boundary_mids - center.unsqueeze(0)
+        cov = centered.T @ centered / float(max(centered.shape[0] - 1, 1))
+        try:
+            _, eigvecs = torch.linalg.eigh(cov)
+        except RuntimeError:
+            return None
+        basis = eigvecs[:, -2:]
+        plane_normal = eigvecs[:, 0]
+        uv_boundary = centered @ basis
+        radii = uv_boundary.norm(dim=1)
+        mean_radius = float(radii.mean().item())
+        if mean_radius < 1e-5:
+            return None
+
+        angle_bins = max(self._closure_params()[0] * 2, 24)
+        angles = torch.atan2(uv_boundary[:, 1], uv_boundary[:, 0])
+        bin_pos = ((angles + torch.pi) / (2.0 * torch.pi) * angle_bins).floor().long()
+        bin_pos = bin_pos.clamp(0, angle_bins - 1)
+
+        radius_bins = torch.zeros(angle_bins, dtype=positions.dtype, device=positions.device)
+        occupied = torch.zeros(angle_bins, dtype=torch.bool, device=positions.device)
+        for b in range(angle_bins):
+            mask_b = bin_pos == b
+            if bool(mask_b.any()):
+                radius_bins[b] = radii[mask_b].max()
+                occupied[b] = True
+        if int(occupied.sum().item()) < max(angle_bins // 3, 8):
+            return None
+
+        filled_bins = radius_bins.clone()
+        occ_idx = torch.where(occupied)[0]
+        for b in range(angle_bins):
+            if occupied[b]:
+                continue
+            circular_dist = torch.minimum(
+                (occ_idx - b).abs(),
+                angle_bins - (occ_idx - b).abs(),
+            )
+            nearest = occ_idx[int(torch.argmin(circular_dist).item())]
+            filled_bins[b] = radius_bins[nearest]
+        for _ in range(2):
+            filled_bins = torch.maximum(
+                filled_bins,
+                0.5 * (torch.roll(filled_bins, 1) + torch.roll(filled_bins, -1)),
+            )
+        filled_bins = inflate_scale * filled_bins
+
+        seed_plane_dist = ((positions[seed_mask] - center.unsqueeze(0)) @ plane_normal).abs()
+        slab = max(
+            float(torch.quantile(seed_plane_dist, 0.90).item()) * 1.8,
+            slab_scale,
+        )
+        uv_all = (positions - center.unsqueeze(0)) @ basis
+        node_radii = uv_all.norm(dim=1)
+        node_angles = torch.atan2(uv_all[:, 1], uv_all[:, 0])
+        node_bins = ((node_angles + torch.pi) / (2.0 * torch.pi) * angle_bins).floor().long()
+        node_bins = node_bins.clamp(0, angle_bins - 1)
+        radius_limit = filled_bins[node_bins]
+        plane_dist = ((positions - center.unsqueeze(0)) @ plane_normal).abs()
+        inside_proj = (
+            (node_radii <= radius_limit.clamp(min=1e-6))
+            & (plane_dist <= slab)
+        )
+        candidate_mask = inside_proj | seed_mask
+        candidate_mask[boundary_nodes] = True
+
+        patch_mask = seed_mask.clone()
+        allowed_edge = (~corridor_edge_mask) & candidate_mask.unsqueeze(1) & candidate_mask[graph.knn_idx]
+        for _ in range(32):
+            row_in = patch_mask.unsqueeze(1).expand_as(graph.knn_idx)
+            col_in = patch_mask[graph.knn_idx]
+            touch = allowed_edge & (row_in | col_in)
+            if not bool(touch.any()):
+                break
+            expanded = patch_mask.clone()
+            expanded |= torch.any(touch, dim=1)
+            expanded[graph.knn_idx[touch]] = True
+            delta = expanded & (~patch_mask)
+            patch_mask = expanded
+            if not bool(delta.any()):
+                break
+
+        patch_size = int(patch_mask.sum().item())
+        if patch_size < min_patch_size or patch_size <= seed_size:
+            return None
+
+        cross_boundary = patch_mask.unsqueeze(1) ^ patch_mask[graph.knn_idx]
+        boundary_edges = int(cross_boundary.sum().item())
+        if boundary_edges < max(self.min_boundary_edges, 12):
+            return None
+        patch_boundary_mask = corridor_edge_mask & cross_boundary
+        patch_cut_ratio = float(patch_boundary_mask[cross_boundary].float().mean().item()) if bool(cross_boundary.any()) else 0.0
+        if patch_cut_ratio < max(0.32, 0.85 * self.fallback_cut_ratio):
+            return None
+
+        patch_center = positions[patch_mask].mean(dim=0)
+        seed_center = positions[seed_mask].mean(dim=0)
+        return {
+            "mask": patch_mask,
+            "boundary_mask": patch_boundary_mask,
+            "size": patch_size,
+            "seed_size": seed_size,
+            "cut_ratio": patch_cut_ratio,
+            "center": patch_center,
+            "seed_center": seed_center,
+            "plane_normal": plane_normal,
+        }
+
+    def _extract_explicit_closure_patches(
+        self,
+        labels: Tensor,
+        positions: Optional[Tensor],
+        graph: GaussianGraph,
+        corridor_edge_mask: Tensor,
+        grouped_boundary_labels: set,
+        grouped_boundary_scores: dict,
+        group_closure_scores: dict,
+        members_by_group: dict,
+    ) -> List[dict]:
+        if positions is None or graph.knn_idx is None or not grouped_boundary_labels:
+            return []
+
+        closure_threshold, min_patch_size, inflate_scale, slab_scale = self._explicit_closure_params()
+        patches: List[dict] = []
+        used_mask = torch.zeros(labels.shape[0], dtype=torch.bool, device=labels.device)
+        ordered_groups = sorted(
+            grouped_boundary_labels,
+            key=lambda gid: (
+                float(group_closure_scores.get(gid, 0.0)),
+                float(grouped_boundary_scores.get(gid, 0.0)),
+            ),
+            reverse=True,
+        )
+        for group_id in ordered_groups:
+            closure_score = float(group_closure_scores.get(group_id, 0.0))
+            boundary_score = float(grouped_boundary_scores.get(group_id, 0.0))
+            if closure_score < closure_threshold:
+                continue
+            if boundary_score < max(self.fallback_cut_ratio, 0.30):
+                continue
+            members = members_by_group.get(group_id, [])
+            patch = self._build_explicit_patch_from_group(
+                labels=labels,
+                positions=positions,
+                graph=graph,
+                corridor_edge_mask=corridor_edge_mask,
+                members=members,
+                min_patch_size=min_patch_size,
+                inflate_scale=inflate_scale,
+                slab_scale=slab_scale,
+            )
+            if patch is None:
+                continue
+            patch_mask = patch["mask"] & (~used_mask)
+            patch_size = int(patch_mask.sum().item())
+            if patch_size < min_patch_size:
+                continue
+            patch["mask"] = patch_mask
+            patch["group_id"] = group_id
+            patch["closure_score"] = closure_score
+            patch["boundary_score"] = boundary_score
+            patch["release_score"] = float(min(1.0, max(boundary_score, 0.52 + 0.42 * closure_score)))
+            patch["support_lost"] = bool(
+                self.material_family == "rough_quasi_brittle"
+                or closure_score >= 0.88
+            )
+            used_mask |= patch_mask
+            patches.append(patch)
+
+        return patches
 
     def _cluster_boundary_candidates(
         self,
