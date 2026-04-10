@@ -75,6 +75,57 @@ manifold:
   material_drive_floor: 0.025
   diffuse_damage_gain: 0.16
   diffuse_neighborhood_steps: 2
+  fragment_detect_every: 2
+  fragment_damage_threshold: 0.50
+  min_fragment_particles: 40
+  fragment_opening_weight: 0.36
+  fragment_active_tip_weight: 0.18
+  fragment_recent_front_weight: 0.12
+  fragment_pair_break_weight: 0.10
+  fragment_edge_memory_decay: 0.975
+  fragment_edge_memory_weight: 0.76
+  fragment_cut_diffusion_alpha: 0.18
+  fragment_cut_diffusion_iters: 1
+  fragment_cut_cos_gate_tangent: 0.62
+  fragment_cut_cos_gate_normal: 0.52
+  fragment_primary_cut_ratio: 0.70
+  fragment_fallback_cut_ratio: 0.50
+  fragment_min_boundary_edges: 18
+  fragment_detached_node_decay: 0.95
+  fragment_persistent_min_size: 8
+  fragment_component_hysteresis: 0.34
+  fragment_post_split_threshold_scale: 0.90
+  fragment_impulse_strength: 2.40
+  fragment_upward_bias: 0.36
+  fragment_visual_offset_scale: 0.010
+  fragment_visual_ramp_frames: 6
+  fragment_impulse_boost_frames: 4
+  fragment_event_boost: 1.0
+  fragment_render_gravity: 0.0026
+  fragment_render_damping: 0.985
+  fragment_render_lateral_damping: 0.992
+  fragment_render_gap_scale: 1.55
+  fragment_render_velocity_scale: 0.22
+  fragment_render_min_size: 6
+  fragment_render_overlap_threshold: 0.24
+  shard_enable: false
+  shard_count_scale: 0.0
+  fragment_offset_gain: 1.0
+  debris_motion_gain: 0.0
+  cut_surface_enable: false
+  cut_vote_strength: 0.0
+  tau_cross: 0.60
+  tau_tangent: 0.45
+  cut_core_damage_threshold: 0.18
+  cut_core_opening_threshold: 0.16
+  cut_hard_break_threshold: 0.42
+  authoritative_cut_decay: 0.96
+  authoritative_cut_threshold: 0.20
+  support_loss_enable: true
+  support_anchor_quantile: 0.10
+  support_release_threshold: 0.56
+  support_promote_min_size: 6
+  support_overlap_threshold: 0.10
   aniso_ratio: 1.0                   # 1.0 = isotropic (no directional bias)
   damage_source_scale: 0.35          # Physics-driven advance at crack front
   damage_spread: 0.36                # Neutral baseline: narrower than rough quasi-brittle
@@ -104,6 +155,13 @@ manifold:
   damage_feedback_delay_frames: 8    # Wait this many post-impact frames before degrading MPM stiffness
   damage_feedback_ramp_frames: 6     # Smoothly ramp damage->stress feedback back in
   interior_damage_scale: 0.20        # Interior particles receive weaker projected damage
+  volumetric_cut_damage_scale: 0.58  # Extra volumetric weakening along authoritative crack corridors
+  volumetric_auth_damage_floor: 0.72 # Minimum damage assigned to authoritative cut surfaces
+  volumetric_detached_damage_floor: 0.90 # Minimum damage assigned to support-lost / detached fragments
+  fragment_physical_gap_scale: 0.0000    # Physical per-substep gap drift for released fragments
+  fragment_physical_release_velocity: 0.0000 # Physical velocity bias for released fragments
+  fragment_physical_downward_bias: 0.32     # Bias released chunks to fall instead of hover
+  fragment_physical_release_frames: 20      # Duration of the physical release drift after split
   drive_tension_weight: 1.00         # Weight of pure tensile energy in fracture drive
   drive_shear_weight: 0.35           # Weight of deviatoric/shear stress in fracture drive
   drive_principal_weight: 0.25       # Weight of principal tensile stress in fracture drive
@@ -177,6 +235,12 @@ gaussian_splatting:
   crack_visited_weight: 0.45
   crack_tip_weight: 0.95
   crack_core_weight: 1.00
+  split_gap_gain: 1.0
+  fragment_shell_gain: 1.0
+  fragment_contrast_gain: 1.0
+  debris_darkening: 0.20
+  shard_scale_gain: 1.0
+  shard_opacity_gain: 1.0
   damage_scale_shrink: 0.50
   damage_center_opacity_reduction: 0.70
   diffuse_damage_strength: 0.12

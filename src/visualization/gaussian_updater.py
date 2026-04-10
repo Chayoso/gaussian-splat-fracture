@@ -30,6 +30,12 @@ class GaussianCrackVisualizer:
         crack_visited_weight: float = 0.45,
         crack_tip_weight: float = 0.95,
         crack_core_weight: float = 1.00,
+        split_gap_gain: float = 1.0,
+        fragment_shell_gain: float = 1.0,
+        fragment_contrast_gain: float = 1.0,
+        debris_darkening: float = 0.20,
+        shard_scale_gain: float = 1.0,
+        shard_opacity_gain: float = 1.0,
         damage_scale_shrink: float = 0.50,
         damage_center_opacity_reduction: float = 0.70,
         diffuse_damage_strength: float = 0.12,
@@ -48,6 +54,12 @@ class GaussianCrackVisualizer:
         self.crack_visited_weight = float(crack_visited_weight)
         self.crack_tip_weight = float(crack_tip_weight)
         self.crack_core_weight = float(crack_core_weight)
+        self.split_gap_gain = float(split_gap_gain)
+        self.fragment_shell_gain = float(fragment_shell_gain)
+        self.fragment_contrast_gain = float(fragment_contrast_gain)
+        self.debris_darkening = float(debris_darkening)
+        self.shard_scale_gain = float(shard_scale_gain)
+        self.shard_opacity_gain = float(shard_opacity_gain)
         self.damage_scale_shrink = float(damage_scale_shrink)
         self.damage_center_opacity_reduction = float(damage_center_opacity_reduction)
         self.diffuse_damage_strength = float(diffuse_damage_strength)
@@ -62,6 +74,7 @@ class GaussianCrackVisualizer:
         self._original_opacity = None
         self._original_scaling = None
         self._original_rotation = None
+        self._base_count = None
         self._initial_normals = None  # stored on first call
 
         print(f"[GaussianCrackVisualizer] Initialized (AT2 damage mode)")
@@ -205,6 +218,86 @@ class GaussianCrackVisualizer:
             w1*z2 + x1*y2 - y1*x2 + z1*w2,
         ], dim=-1)
 
+    def _restore_base_state(self, gaussians, x_world: Tensor, preserve_original: bool) -> None:
+        """Restore the base Gaussian set before applying per-frame render effects."""
+        if preserve_original and self._original_dc is None:
+            self._original_dc = gaussians._features_dc.data.clone()
+            self._original_rest = gaussians._features_rest.data.clone()
+            self._original_opacity = gaussians._opacity.data.clone()
+            self._original_scaling = gaussians._scaling.data.clone()
+            self._original_rotation = gaussians._rotation.data.clone()
+            self._base_count = int(x_world.shape[0])
+
+        if self._base_count is None:
+            self._base_count = int(x_world.shape[0])
+
+        base_n = int(self._base_count)
+        if gaussians._xyz.data.shape[0] != base_n:
+            gaussians._xyz.data = gaussians._xyz.data[:base_n].clone()
+            gaussians._features_dc.data = gaussians._features_dc.data[:base_n].clone()
+            gaussians._features_rest.data = gaussians._features_rest.data[:base_n].clone()
+            gaussians._opacity.data = gaussians._opacity.data[:base_n].clone()
+            gaussians._scaling.data = gaussians._scaling.data[:base_n].clone()
+            gaussians._rotation.data = gaussians._rotation.data[:base_n].clone()
+
+        gaussians._xyz.data = x_world
+        gaussians._features_dc.data.copy_(self._original_dc)
+        gaussians._features_rest.data.copy_(self._original_rest)
+        gaussians._opacity.data.copy_(self._original_opacity)
+        gaussians._scaling.data.copy_(self._original_scaling)
+        gaussians._rotation.data.copy_(self._original_rotation)
+
+    @torch.no_grad()
+    def _apply_fragment_shell_styling(
+        self,
+        gaussians,
+        c_surface: Tensor,
+        fragment_ids: Tensor = None,
+        shard_mask: Tensor = None,
+    ) -> None:
+        if c_surface is None:
+            return
+        if fragment_ids is None and shard_mask is None:
+            return
+
+        detached_mask = torch.zeros_like(c_surface, dtype=torch.bool)
+        if fragment_ids is not None:
+            detached_mask |= fragment_ids > 0
+        if shard_mask is not None:
+            detached_mask |= shard_mask
+        if not bool(detached_mask.any()):
+            return
+
+        thresh = self.damage_threshold
+        c_norm = ((c_surface - thresh) / max(1.0 - thresh, 1e-6)).clamp(0.0, 1.0)
+        shell_strength = (0.35 + 0.65 * c_norm[detached_mask]) * self.fragment_shell_gain
+        shell_strength = shell_strength.clamp(0.0, 1.0)
+
+        darken = 1.0 - self.debris_darkening * shell_strength.unsqueeze(1)
+        gaussians._features_dc.data[detached_mask, 0, :] *= darken
+        gaussians._features_dc.data[detached_mask, 0, 0] += (
+            0.06 * self.fragment_contrast_gain * shell_strength
+        )
+        gaussians._scaling.data[detached_mask] += torch.log(
+            (1.0 + 0.06 * self.fragment_shell_gain * shell_strength)
+            .unsqueeze(1)
+            .clamp(min=0.90)
+        )
+
+        if shard_mask is not None and bool(shard_mask.any()):
+            gaussians._scaling.data[shard_mask] += torch.log(
+                torch.full(
+                    (int(shard_mask.sum().item()), 1),
+                    0.88 / max(self.shard_scale_gain, 1e-3),
+                    device=gaussians._scaling.device,
+                )
+            )
+            cur_prob = torch.sigmoid(gaussians._opacity.data[shard_mask])
+            new_prob = (
+                cur_prob * min(1.0, 0.92 * self.shard_opacity_gain)
+            ).clamp(1e-6, 1.0 - 1e-6)
+            gaussians._opacity.data[shard_mask] = torch.log(new_prob / (1.0 - new_prob))
+
     def set_initial_normals(self, normals: Tensor):
         """Store initial surface normals for dynamic lighting.
 
@@ -273,6 +366,8 @@ class GaussianCrackVisualizer:
         crack_opening: Tensor = None,
         crack_tips: Tensor = None,
         crack_visited: Tensor = None,
+        fragment_ids: Tensor = None,
+        shard_mask: Tensor = None,
     ):
         """Update Gaussian properties each frame.
 
@@ -289,23 +384,7 @@ class GaussianCrackVisualizer:
         # Store camera position for back-face normal flipping
         self._camera_pos = camera_pos
 
-        # Cache original properties once
-        if preserve_original and self._original_dc is None:
-            self._original_dc = gaussians._features_dc.data.clone()
-            self._original_rest = gaussians._features_rest.data.clone()
-            self._original_opacity = gaussians._opacity.data.clone()
-            self._original_scaling = gaussians._scaling.data.clone()
-            self._original_rotation = gaussians._rotation.data.clone()
-
-        # Update positions from MPM physics
-        gaussians._xyz.data = x_world
-
-        # Restore originals before applying effects
-        gaussians._features_dc.data.copy_(self._original_dc)
-        gaussians._features_rest.data.copy_(self._original_rest)
-        gaussians._opacity.data.copy_(self._original_opacity)
-        gaussians._scaling.data.copy_(self._original_scaling)
-        gaussians._rotation.data.copy_(self._original_rotation)
+        self._restore_base_state(gaussians, x_world, preserve_original)
 
         # Apply deformation gradient to scale and rotation
         if F_per_gaussian is not None:
@@ -316,8 +395,8 @@ class GaussianCrackVisualizer:
 
         # Debris: mild shrinkage + darkening (keep visible)
         if debris_mask is not None and debris_mask.any():
-            gaussians._scaling.data[debris_mask] -= 0.35
-            gaussians._features_dc.data[debris_mask] *= 0.7
+            gaussians._scaling.data[debris_mask] -= 0.25 * self.fragment_shell_gain
+            gaussians._features_dc.data[debris_mask] *= max(0.35, 1.0 - self.debris_darkening)
 
         # Manifold fracture visualization (crack normals + opening)
         if crack_normals is not None and crack_opening is not None:
@@ -333,6 +412,13 @@ class GaussianCrackVisualizer:
                           and c_surface.max() > self.damage_threshold)
             if has_damage:
                 self._apply_damage_visualization(gaussians, c_surface)
+
+        self._apply_fragment_shell_styling(
+            gaussians,
+            c_surface,
+            fragment_ids=fragment_ids,
+            shard_mask=shard_mask,
+        )
 
     @torch.no_grad()
     def _apply_manifold_crack_visualization(
@@ -413,16 +499,27 @@ class GaussianCrackVisualizer:
             sign = torch.where(pos_hash.frac() > 0.5,
                                torch.ones_like(pos_hash),
                                -torch.ones_like(pos_hash))
-            gaussians._xyz.data[open_mask] += offset * sign.unsqueeze(1) * self.crack_gap_fraction
+            gaussians._xyz.data[open_mask] += (
+                offset
+                * sign.unsqueeze(1)
+                * self.crack_gap_fraction
+                * self.split_gap_gain
+            )
 
         # --- 2.5. Crack-path darkening / tint ---
         if crack_shell.any():
             tint_strength = shell_strength[crack_shell].clamp(0.0, 1.0)
             cur = gaussians._features_dc.data[crack_shell, 0, :]
-            darken = 1.0 - self.crack_edge_darken * tint_strength.unsqueeze(1)
+            darken = 1.0 - (
+                self.crack_edge_darken
+                * self.fragment_contrast_gain
+                * tint_strength.unsqueeze(1)
+            )
             tinted = cur * darken
             color_bias = self.crack_color.unsqueeze(0) * (
-                self.crack_red_accent * tint_strength.unsqueeze(1)
+                self.crack_red_accent
+                * self.fragment_contrast_gain
+                * tint_strength.unsqueeze(1)
             )
             gaussians._features_dc.data[crack_shell, 0, :] = tinted + color_bias
 
