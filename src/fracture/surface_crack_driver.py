@@ -143,16 +143,16 @@ class SurfaceCrackDriver:
         tangent[:, 1] = radial[:, 0]
 
         if style == "radial_shatter":
-            ray_count = 12.0
+            ray_count = 14.0
             phase = 0.45
             ray = (0.5 + 0.5 * torch.cos(ray_count * theta + phase)).clamp(0.0, 1.0)
-            ray = ray.pow(2.6)
-            near = torch.exp(-0.5 * (planar_r / (0.13 * diag)).pow(2.0))
-            far_gain = (0.20 + 0.80 * r_norm).clamp(0.0, 1.0)
-            ray_drive = (ray * far_gain + 0.28 * near).clamp(0.0, 1.0)
-            init_score = torch.maximum(init_score, 0.64 * near * (0.35 + 0.65 * ray))
-            growth_drive = torch.maximum(growth_drive, 0.86 * ray_drive)
-            growth_dir = self._safe_normalize(1.55 * radial + 0.22 * upward)
+            ray = ray.pow(2.3)
+            near = torch.exp(-0.5 * (planar_r / (0.15 * diag)).pow(2.0))
+            far_gain = (0.16 + 0.84 * r_norm).clamp(0.0, 1.0)
+            ray_drive = (ray * far_gain + 0.34 * near).clamp(0.0, 1.0)
+            init_score = torch.maximum(init_score, 0.74 * near * (0.30 + 0.70 * ray))
+            growth_drive = torch.maximum(growth_drive, 0.94 * ray_drive)
+            growth_dir = self._safe_normalize(1.70 * radial + 0.18 * upward)
 
         elif style == "spiderweb_branching":
             spoke = (0.5 + 0.5 * torch.cos(9.0 * theta + 0.25)).clamp(0.0, 1.0).pow(2.0)
