@@ -39,6 +39,13 @@ class GaussianCrackVisualizer:
         damage_scale_shrink: float = 0.50,
         damage_center_opacity_reduction: float = 0.70,
         diffuse_damage_strength: float = 0.12,
+        interior_surface_enable: bool = True,
+        interior_surface_threshold: float = 0.34,
+        interior_surface_max_fraction: float = 0.012,
+        interior_surface_scale: float = 0.82,
+        interior_surface_opacity: float = 0.72,
+        interior_surface_darken: float = 0.38,
+        interior_surface_gap_gain: float = 0.72,
     ):
         self.damage_threshold = damage_threshold
         self.device = device
@@ -63,6 +70,13 @@ class GaussianCrackVisualizer:
         self.damage_scale_shrink = float(damage_scale_shrink)
         self.damage_center_opacity_reduction = float(damage_center_opacity_reduction)
         self.diffuse_damage_strength = float(diffuse_damage_strength)
+        self.interior_surface_enable = bool(interior_surface_enable)
+        self.interior_surface_threshold = float(interior_surface_threshold)
+        self.interior_surface_max_fraction = float(interior_surface_max_fraction)
+        self.interior_surface_scale = float(interior_surface_scale)
+        self.interior_surface_opacity = float(interior_surface_opacity)
+        self.interior_surface_darken = float(interior_surface_darken)
+        self.interior_surface_gap_gain = float(interior_surface_gap_gain)
         self.crack_color = torch.tensor(crack_color, dtype=torch.float32, device=device)
 
         # Light direction for dynamic diffuse shading
@@ -76,6 +90,8 @@ class GaussianCrackVisualizer:
         self._original_rotation = None
         self._base_count = None
         self._initial_normals = None  # stored on first call
+        self._last_interior_parent_idx = None
+        self._last_interior_count = 0
 
         print(f"[GaussianCrackVisualizer] Initialized (AT2 damage mode)")
         print(f"  - Damage threshold: {damage_threshold}")
@@ -218,6 +234,28 @@ class GaussianCrackVisualizer:
             w1*z2 + x1*y2 - y1*x2 + z1*w2,
         ], dim=-1)
 
+    @staticmethod
+    def _safe_normalize(v: Tensor) -> Tensor:
+        return v / v.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
+    @staticmethod
+    def _append_param_data(param, extra: Tensor) -> None:
+        param.data = torch.cat([param.data, extra], dim=0)
+
+    def _frame_quat_from_normals(self, normals: Tensor) -> Tensor:
+        """Build Gaussian rotations whose local z axis follows the face normal."""
+        normals = self._safe_normalize(normals)
+        up = torch.tensor([0.0, 0.0, 1.0], dtype=normals.dtype, device=normals.device)
+        alt = torch.tensor([0.0, 1.0, 0.0], dtype=normals.dtype, device=normals.device)
+        ref = up.unsqueeze(0).expand_as(normals).clone()
+        near_parallel = (normals * ref).sum(dim=1).abs() > 0.92
+        if bool(near_parallel.any()):
+            ref[near_parallel] = alt
+        tangent0 = self._safe_normalize(torch.cross(ref, normals, dim=1))
+        tangent1 = self._safe_normalize(torch.cross(normals, tangent0, dim=1))
+        R = torch.stack([tangent0, tangent1, normals], dim=2)
+        return self._rotmat_to_quat_batch(R)
+
     def _restore_base_state(self, gaussians, x_world: Tensor, preserve_original: bool) -> None:
         """Restore the base Gaussian set before applying per-frame render effects."""
         if preserve_original and self._original_dc is None:
@@ -246,6 +284,10 @@ class GaussianCrackVisualizer:
         gaussians._opacity.data.copy_(self._original_opacity)
         gaussians._scaling.data.copy_(self._original_scaling)
         gaussians._rotation.data.copy_(self._original_rotation)
+        self._last_interior_parent_idx = None
+        self._last_interior_count = 0
+        gaussians._interior_parent_idx = None
+        gaussians._interior_normals = None
 
     @torch.no_grad()
     def _apply_fragment_shell_styling(
@@ -420,6 +462,16 @@ class GaussianCrackVisualizer:
             shard_mask=shard_mask,
         )
 
+        self._append_interior_crack_faces(
+            gaussians,
+            c_surface,
+            crack_normals=crack_normals,
+            crack_opening=crack_opening,
+            crack_tips=crack_tips,
+            crack_visited=crack_visited,
+            camera_pos=camera_pos,
+        )
+
     @torch.no_grad()
     def _apply_manifold_crack_visualization(
         self,
@@ -534,6 +586,149 @@ class GaussianCrackVisualizer:
             new_prob = (cur_prob * opacity_mult.unsqueeze(1)).clamp(1e-6, 1 - 1e-6)
             gaussians._opacity.data[crack_center] = torch.log(
                 new_prob / (1.0 - new_prob))
+
+    @torch.no_grad()
+    def _append_interior_crack_faces(
+        self,
+        gaussians,
+        c_surface: Tensor,
+        crack_normals: Tensor = None,
+        crack_opening: Tensor = None,
+        crack_tips: Tensor = None,
+        crack_visited: Tensor = None,
+        camera_pos: Tensor = None,
+    ) -> None:
+        """Append render-only Gaussians for newly exposed crack interiors.
+
+        The base manifold only samples the exterior surface. Once a crack opens,
+        those exterior samples can separate, but the newly visible cut wall has
+        no geometry unless we add a lightweight render layer. These Gaussians
+        are recreated every frame after the base state is restored.
+        """
+        self._last_interior_parent_idx = None
+        self._last_interior_count = 0
+        if not self.interior_surface_enable:
+            return
+        if c_surface is None or crack_normals is None or crack_opening is None:
+            return
+        if self.material_family == "diffuse_damage":
+            return
+
+        n_base = int(c_surface.shape[0])
+        if n_base <= 0 or gaussians._xyz.data.shape[0] < n_base:
+            return
+
+        crack_tips = crack_tips if crack_tips is not None else torch.zeros(
+            n_base, dtype=torch.bool, device=c_surface.device)
+        crack_visited = crack_visited if crack_visited is not None else torch.zeros(
+            n_base, dtype=torch.bool, device=c_surface.device)
+
+        c = c_surface[:n_base].clamp(0.0, 1.0)
+        opening = crack_opening[:n_base].clamp(min=0.0)
+        normals = self._safe_normalize(crack_normals[:n_base])
+        threshold = max(self.damage_threshold, self.interior_surface_threshold)
+        opening_scale = torch.quantile(opening.detach(), 0.85).clamp(min=1e-8)
+        opening_norm = (opening / opening_scale).clamp(0.0, 1.0)
+        shell_score = (
+            0.58 * ((c - threshold) / max(1.0 - threshold, 1e-6)).clamp(0.0, 1.0)
+            + 0.30 * opening_norm
+            + 0.08 * crack_visited.float()
+            + 0.04 * crack_tips.float()
+        ).clamp(0.0, 1.0)
+        face_mask = (
+            (c > threshold)
+            & (opening > 1e-5)
+            & (crack_visited | crack_tips | (c > max(0.55, threshold)))
+        )
+        if not bool(face_mask.any()):
+            return
+
+        candidate_idx = torch.where(face_mask)[0]
+        max_count = int(round(n_base * max(self.interior_surface_max_fraction, 0.0)))
+        max_count = max(0, min(candidate_idx.numel(), max_count))
+        if max_count <= 0:
+            return
+        if candidate_idx.numel() > max_count:
+            scores = shell_score[candidate_idx]
+            top = torch.topk(scores, k=max_count, largest=True).indices
+            parent_idx = candidate_idx[top]
+        else:
+            parent_idx = candidate_idx
+        parent_idx = parent_idx.unique(sorted=True)
+        if parent_idx.numel() == 0:
+            return
+
+        parent_xyz = gaussians._xyz.data[:n_base][parent_idx]
+        parent_n = normals[parent_idx]
+        parent_open = opening[parent_idx].clamp(
+            min=0.20 * self.crack_max_opening,
+            max=max(self.crack_max_opening * 1.25, 1e-6),
+        )
+        gap = parent_open.unsqueeze(1) * self.interior_surface_gap_gain
+
+        face_normals = torch.cat([parent_n, -parent_n], dim=0)
+        new_xyz = torch.cat([
+            parent_xyz + parent_n * gap,
+            parent_xyz - parent_n * gap,
+        ], dim=0)
+
+        parent_twice = torch.cat([parent_idx, parent_idx], dim=0)
+        parent_score = torch.cat([shell_score[parent_idx], shell_score[parent_idx]], dim=0)
+
+        new_features_dc = gaussians._features_dc.data[:n_base][parent_twice].clone()
+        new_features_rest = gaussians._features_rest.data[:n_base][parent_twice].clone()
+        new_opacity = gaussians._opacity.data[:n_base][parent_twice].clone()
+
+        # Internal cut walls are darker and rougher than the external surface.
+        if camera_pos is not None:
+            view_dir = self._safe_normalize(camera_pos.unsqueeze(0) - new_xyz)
+            light_normals = face_normals.clone()
+            back_facing = (light_normals * view_dir).sum(dim=1) < 0
+            light_normals[back_facing] = -light_normals[back_facing]
+        else:
+            light_normals = face_normals
+        ndotl = (light_normals * self.light_dir).sum(dim=1).clamp(0.0, 1.0)
+        gray = 0.18 + 0.34 * ndotl
+        SH_C0 = 0.28209479177387814
+        gray_dc = ((gray - 0.5) / SH_C0).unsqueeze(1).expand(-1, 3)
+        parent_dc = new_features_dc[:, 0, :]
+        tint = self.crack_color.unsqueeze(0) * (0.08 + 0.10 * parent_score.unsqueeze(1))
+        blend = self.interior_surface_darken
+        new_features_dc[:, 0, :] = (
+            (1.0 - blend) * parent_dc
+            + blend * gray_dc
+            + tint
+        )
+
+        parent_scale = torch.exp(gaussians._scaling.data[:n_base][parent_twice])
+        tangent_scale = parent_scale.mean(dim=1).clamp(min=1e-5) * self.interior_surface_scale
+        normal_scale = parent_scale.min(dim=1).values.clamp(min=1e-5) * 0.22
+        new_scaling = torch.log(torch.stack([
+            tangent_scale,
+            tangent_scale,
+            normal_scale,
+        ], dim=1).clamp(min=1e-6))
+        new_rotation = self._frame_quat_from_normals(face_normals)
+
+        prob = torch.sigmoid(new_opacity)
+        opacity_mult = (
+            self.interior_surface_opacity
+            * (0.45 + 0.55 * parent_score).unsqueeze(1)
+        ).clamp(0.05, 1.0)
+        new_prob = (prob * opacity_mult).clamp(1e-6, 1.0 - 1e-6)
+        new_opacity = torch.log(new_prob / (1.0 - new_prob))
+
+        self._append_param_data(gaussians._xyz, new_xyz)
+        self._append_param_data(gaussians._features_dc, new_features_dc)
+        self._append_param_data(gaussians._features_rest, new_features_rest)
+        self._append_param_data(gaussians._opacity, new_opacity)
+        self._append_param_data(gaussians._scaling, new_scaling)
+        self._append_param_data(gaussians._rotation, new_rotation)
+
+        self._last_interior_parent_idx = parent_twice
+        self._last_interior_count = int(new_xyz.shape[0])
+        gaussians._interior_parent_idx = parent_twice
+        gaussians._interior_normals = face_normals
 
     @staticmethod
     def _quat_to_rotmat_batch(q: Tensor) -> Tensor:

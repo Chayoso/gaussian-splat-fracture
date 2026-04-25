@@ -193,6 +193,9 @@ class ManifoldSimulator:
             support_release_threshold=fp.get('support_release_threshold', 0.56),
             support_promote_min_size=fp.get('support_promote_min_size', 6),
             support_overlap_threshold=fp.get('support_overlap_threshold', 0.10),
+            open_crack_release_enable=fp.get('open_crack_release_enable', True),
+            open_crack_release_threshold=fp.get('open_crack_release_threshold', 0.0),
+            open_crack_release_max_patches=fp.get('open_crack_release_max_patches', 2),
             material_family=fp.get('material_family', 'neutral_reference'),
             device=device_str,
         ) if frag_enabled else None
@@ -253,6 +256,16 @@ class ManifoldSimulator:
             fp.get('volumetric_auth_damage_floor', 0.72))
         self.volumetric_detached_damage_floor = float(
             fp.get('volumetric_detached_damage_floor', 0.90))
+        self.crack_volume_feedback_gain = float(
+            fp.get('crack_volume_feedback_gain', 0.42))
+        self.crack_volume_opening_gain = float(
+            fp.get('crack_volume_opening_gain', 0.38))
+        self.crack_volume_visited_floor = float(
+            fp.get('crack_volume_visited_floor', 0.50))
+        self.crack_volume_tip_floor = float(
+            fp.get('crack_volume_tip_floor', 0.66))
+        self.crack_volume_interior_scale = float(
+            fp.get('crack_volume_interior_scale', 0.85))
         self.fragment_physical_gap_scale = float(
             fp.get('fragment_physical_gap_scale', 0.0))
         self.fragment_physical_release_velocity = float(
@@ -321,6 +334,11 @@ class ManifoldSimulator:
             f"  Volumetric cut feedback: scale={self.volumetric_cut_damage_scale:.2f}, "
             f"auth_floor={self.volumetric_auth_damage_floor:.2f}, "
             f"detach_floor={self.volumetric_detached_damage_floor:.2f}"
+        )
+        print(
+            f"  Crack-volume coupling: gain={self.crack_volume_feedback_gain:.2f}, "
+            f"opening={self.crack_volume_opening_gain:.2f}, "
+            f"interior={self.crack_volume_interior_scale:.2f}"
         )
         print(f"  Splitting: {'ON' if self.splitting_enabled else 'OFF'}")
         print(
@@ -774,6 +792,56 @@ class ManifoldSimulator:
                     c_surf[:n_assign][mapped[valid]] * self.interior_damage_scale
                 )
 
+        # Couple visible surface crack state back into the volumetric stress
+        # solve. This makes crack-front history and opening weaken a through-
+        # thickness corridor instead of leaving the MPM body glued together.
+        crack_feedback = torch.zeros_like(c_surf[:n_assign])
+        crack_front = getattr(self.fracture_field, "crack_front", None)
+        visited_mask = None
+        tip_mask = None
+        if crack_front is not None:
+            visited_mask = getattr(crack_front, "visited_mask", None)
+            tip_mask = getattr(crack_front, "tip_mask", None)
+
+        if visited_mask is not None:
+            visited_mask = visited_mask[:n_assign]
+            crack_feedback = torch.maximum(
+                crack_feedback,
+                visited_mask.float() * self.crack_volume_visited_floor,
+            )
+        if tip_mask is not None:
+            tip_mask = tip_mask[:n_assign]
+            crack_feedback = torch.maximum(
+                crack_feedback,
+                tip_mask.float() * self.crack_volume_tip_floor,
+            )
+        if self.fracture_field.a is not None:
+            opening = self.fracture_field.a[:n_assign].clamp(min=0.0)
+            if bool(opening.max() > 0.0):
+                opening_scale = torch.quantile(opening.detach(), 0.85).clamp(min=1e-6)
+                opening_norm = (opening / opening_scale).clamp(0.0, 1.0)
+                crack_feedback = torch.maximum(
+                    crack_feedback,
+                    (c_surf[:n_assign] + self.crack_volume_opening_gain * opening_norm)
+                    .clamp(0.0, 1.0),
+                )
+        elif bool(c_surf[:n_assign].max() > 0.0):
+            crack_feedback = torch.maximum(crack_feedback, c_surf[:n_assign])
+
+        if bool(crack_feedback.max() > 0.0):
+            crack_feedback = (
+                crack_feedback
+                * self.crack_volume_feedback_gain
+                * feedback_scale
+            ).clamp(0.0, 1.0)
+            c_vol = torch.maximum(
+                c_vol,
+                self._project_surface_scalar_to_particles(
+                    crack_feedback,
+                    interior_scale=self.crack_volume_interior_scale,
+                ),
+            )
+
         # Promote structural crack corridors into a volumetric stiffness loss.
         if self.fragment_manager is not None:
             structural_floor = torch.zeros_like(c_surf[:n_assign])
@@ -804,6 +872,15 @@ class ManifoldSimulator:
                 structural_floor = torch.maximum(
                     structural_floor,
                     support_mask.float() * self.volumetric_detached_damage_floor,
+                )
+
+            closure_mask = getattr(self.fragment_manager, "last_closure_candidate_mask", None)
+            if closure_mask is not None:
+                closure_mask = closure_mask[:n_assign]
+                structural_mask |= closure_mask
+                structural_floor = torch.maximum(
+                    structural_floor,
+                    closure_mask.float() * (0.86 * self.volumetric_detached_damage_floor),
                 )
 
             frag_ids = getattr(self.fragment_manager, "fragment_ids", None)
@@ -1090,7 +1167,11 @@ class ManifoldSimulator:
                 torch.arange(N, device=self.fracture_field.c.device)
             ]
             return
-        if self.fracture_field.c.max() < 0.3:
+        opening_max = (
+            float(self.fracture_field.a.max().item())
+            if self.fracture_field.a is not None else 0.0
+        )
+        if self.fracture_field.c.max() < 0.3 and opening_max < 1e-4:
             return
 
         crack_front = getattr(self.fracture_field, "crack_front", None)
@@ -1522,8 +1603,13 @@ class ManifoldSimulator:
             "shard_persistence": 0.0,
         }
 
+        render_positions = self.gaussians._xyz.data.detach()
+        base_render_count = int(c_visual.shape[0]) if c_visual is not None else int(x_final.shape[0])
+        if render_positions.shape[0] != base_render_count:
+            render_positions = render_positions[:base_render_count]
+
         self._last_render_state = self.splitter.compose_render_state(
-            self.gaussians._xyz.data.detach(),
+            render_positions,
             c_visual,
             opening=(
                 self.fracture_field.a if not self._ply_direct else (
@@ -1535,6 +1621,9 @@ class ManifoldSimulator:
             crack_tips=crack_tips,
             crack_visited=crack_visited,
             debris_mask=debris_mask,
+        )
+        self._last_render_state["interior_surface_count"] = int(
+            getattr(self.visualizer, "_last_interior_count", 0)
         )
     # ================================================================
     # Impact handling
@@ -1822,6 +1911,7 @@ class ManifoldSimulator:
             "physical_fragment_drop": physical_fragment_drop,
             "split_event_age": split_event_age,
             "visible_shard_count": int(render_state.get("visible_shard_count", 0)),
+            "interior_surface_count": int(render_state.get("interior_surface_count", 0)),
             "split_gap_visibility": float(render_state.get("split_gap_visibility", 0.0)),
             "fragment_shell_contrast": float(render_state.get("fragment_shell_contrast", 0.0)),
             "shard_persistence": float(render_state.get("shard_persistence", 0.0)),

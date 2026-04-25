@@ -18,8 +18,8 @@ mesh:
   test_mesh_radius: 0.4
 
 particles:
-  target_count: 300000
-  surface_ratio: 0.5
+  target_count: 50000
+  surface_ratio: 1.0
   use_poisson_sampling: false
   poisson_depth: 8
   normalize_to_unit_cube: true
@@ -126,6 +126,9 @@ manifold:
   support_release_threshold: 0.56
   support_promote_min_size: 6
   support_overlap_threshold: 0.10
+  open_crack_release_enable: true     # Allow local support-loss fragments without a fully closed crack ring
+  open_crack_release_threshold: 0.0   # 0 = material-family default
+  open_crack_release_max_patches: 2
   aniso_ratio: 1.0                   # 1.0 = isotropic (no directional bias)
   damage_source_scale: 0.35          # Physics-driven advance at crack front
   damage_spread: 0.36                # Neutral baseline: narrower than rough quasi-brittle
@@ -158,6 +161,11 @@ manifold:
   volumetric_cut_damage_scale: 0.58  # Extra volumetric weakening along authoritative crack corridors
   volumetric_auth_damage_floor: 0.72 # Minimum damage assigned to authoritative cut surfaces
   volumetric_detached_damage_floor: 0.90 # Minimum damage assigned to support-lost / detached fragments
+  crack_volume_feedback_gain: 0.42   # Surface crack history -> volumetric stress weakening
+  crack_volume_opening_gain: 0.38    # Opening contribution to through-thickness weakening
+  crack_volume_visited_floor: 0.50   # Minimum weakening along visited crack-front nodes
+  crack_volume_tip_floor: 0.66       # Minimum weakening around active crack tips
+  crack_volume_interior_scale: 0.85  # Interior projection strength for crack corridors
   fragment_physical_gap_scale: 0.0000    # Physical per-substep gap drift for released fragments
   fragment_physical_release_velocity: 0.0000 # Physical velocity bias for released fragments
   fragment_physical_downward_bias: 0.32     # Bias released chunks to fall instead of hover
@@ -244,6 +252,13 @@ gaussian_splatting:
   damage_scale_shrink: 0.50
   damage_center_opacity_reduction: 0.70
   diffuse_damage_strength: 0.12
+  interior_surface_enable: true       # Render newly exposed crack interiors
+  interior_surface_threshold: 0.34
+  interior_surface_max_fraction: 0.012
+  interior_surface_scale: 0.82
+  interior_surface_opacity: 0.72
+  interior_surface_darken: 0.38
+  interior_surface_gap_gain: 0.72
 
 rendering:
   image_width: 1920

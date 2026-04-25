@@ -64,6 +64,9 @@ class GraphFragmentManager:
         support_release_threshold: float = 0.56,
         support_promote_min_size: int = 6,
         support_overlap_threshold: float = 0.10,
+        open_crack_release_enable: bool = True,
+        open_crack_release_threshold: float = 0.0,
+        open_crack_release_max_patches: int = 2,
         material_family: str = "neutral_reference",
         device: str = "cuda",
     ):
@@ -107,6 +110,9 @@ class GraphFragmentManager:
         self.support_release_threshold = float(support_release_threshold)
         self.support_promote_min_size = int(support_promote_min_size)
         self.support_overlap_threshold = float(support_overlap_threshold)
+        self.open_crack_release_enable = bool(open_crack_release_enable)
+        self.open_crack_release_threshold = float(open_crack_release_threshold)
+        self.open_crack_release_max_patches = max(int(open_crack_release_max_patches), 0)
         self.material_family = str(material_family)
         self.device = torch.device(device)
 
@@ -502,6 +508,21 @@ class GraphFragmentManager:
             grouped_boundary_scores=grouped_boundary_scores,
             group_closure_scores=group_closure_scores,
             members_by_group=members_by_group,
+        )
+        explicit_patches.extend(
+            self._extract_open_crack_release_patches(
+                positions=positions,
+                graph=graph,
+                corridor_edge_mask=corridor_edge_mask,
+                damage=damage,
+                opening=opening,
+                active_tip_mask=active_tip_mask,
+                recent_front_mask=recent_front_mask,
+                used_mask=(
+                    torch.stack([patch["mask"] for patch in explicit_patches]).any(dim=0)
+                    if explicit_patches else None
+                ),
+            )
         )
         closure_candidate_mask = torch.zeros(N, dtype=torch.bool, device=self.device)
         closure_boundary_mask = torch.zeros_like(corridor_edge_mask)
@@ -1190,6 +1211,297 @@ class GraphFragmentManager:
             patches.append(patch)
 
         return patches
+
+    def _open_release_params(self) -> dict:
+        if self.material_family == "sharp_brittle":
+            return {
+                "seed_threshold": 0.52,
+                "release_threshold": 0.54,
+                "candidate_score": 0.10,
+                "radius_scale": 0.040,
+                "seed_radius_scale": 0.014,
+                "min_edges": max(96, 6 * self.min_boundary_edges),
+                "min_contact_edges": max(24, 2 * self.min_boundary_edges),
+                "min_size": max(8, self.support_promote_min_size),
+                "max_size_ratio": 0.026,
+                "max_patches": min(self.open_crack_release_max_patches, 2),
+            }
+        if self.material_family == "brittle_moderate":
+            return {
+                "seed_threshold": 0.50,
+                "release_threshold": 0.56,
+                "candidate_score": 0.09,
+                "radius_scale": 0.047,
+                "seed_radius_scale": 0.018,
+                "min_edges": max(112, 6 * self.min_boundary_edges),
+                "min_contact_edges": max(28, 2 * self.min_boundary_edges),
+                "min_size": max(14, self.support_promote_min_size),
+                "max_size_ratio": 0.035,
+                "max_patches": min(self.open_crack_release_max_patches, 2),
+            }
+        if self.material_family == "rough_quasi_brittle":
+            return {
+                "seed_threshold": 0.45,
+                "release_threshold": 0.50,
+                "candidate_score": 0.075,
+                "radius_scale": 0.060,
+                "seed_radius_scale": 0.024,
+                "min_edges": max(128, 5 * self.min_boundary_edges),
+                "min_contact_edges": max(32, 2 * self.min_boundary_edges),
+                "min_size": max(24, self.support_promote_min_size),
+                "max_size_ratio": 0.050,
+                "max_patches": self.open_crack_release_max_patches,
+            }
+        return {
+            "seed_threshold": 0.58,
+            "release_threshold": 0.64,
+            "candidate_score": 0.12,
+            "radius_scale": 0.034,
+            "seed_radius_scale": 0.012,
+            "min_edges": max(160, 8 * self.min_boundary_edges),
+            "min_contact_edges": max(40, 2 * self.min_boundary_edges),
+            "min_size": max(18, self.support_promote_min_size),
+            "max_size_ratio": 0.020,
+            "max_patches": 0,
+        }
+
+    def _extract_open_crack_release_patches(
+        self,
+        positions: Optional[Tensor],
+        graph: GaussianGraph,
+        corridor_edge_mask: Tensor,
+        damage: Tensor,
+        opening: Optional[Tensor],
+        active_tip_mask: Optional[Tensor],
+        recent_front_mask: Optional[Tensor],
+        used_mask: Optional[Tensor] = None,
+    ) -> List[dict]:
+        """Promote local crack-neighborhood collapse without requiring a closed ring.
+
+        This is a surface-graph substitute for stiffness-loss collapse. A long,
+        high-confidence crack corridor can release a small local patch even when
+        the crack path has not topologically closed into a loop.
+        """
+        if (
+            not self.open_crack_release_enable
+            or self.material_family == "diffuse_damage"
+            or positions is None
+            or graph.knn_idx is None
+            or corridor_edge_mask is None
+        ):
+            return []
+
+        params = self._open_release_params()
+        max_patches = int(params["max_patches"])
+        if max_patches <= 0:
+            return []
+
+        edge_rows, edge_cols = torch.where(corridor_edge_mask)
+        if edge_rows.numel() < int(params["min_edges"]):
+            return []
+
+        nbr_idx = graph.knn_idx[edge_rows, edge_cols]
+        N = positions.shape[0]
+        dtype = damage.dtype
+        device = positions.device
+        edge_count = torch.zeros(N, dtype=dtype, device=device)
+        ones = torch.ones(edge_rows.shape[0], dtype=dtype, device=device)
+        edge_count.index_add_(0, edge_rows, ones)
+        edge_count.index_add_(0, nbr_idx, ones)
+        edge_density = (edge_count / edge_count.max().clamp(min=1.0)).clamp(0.0, 1.0)
+        cut_node_mask = edge_count > 0
+
+        if opening is not None:
+            opening_scale = torch.quantile(opening.detach(), 0.90).clamp(min=1e-8)
+            opening_norm = (opening / opening_scale).clamp(0.0, 1.0)
+        else:
+            opening_norm = torch.zeros_like(damage)
+
+        front_score = torch.zeros_like(damage)
+        if recent_front_mask is not None:
+            front_score = torch.maximum(front_score, recent_front_mask.float())
+        if active_tip_mask is not None:
+            front_score = torch.maximum(front_score, active_tip_mask.float())
+
+        release_field = (
+            0.48 * edge_density
+            + 0.26 * damage.clamp(0.0, 1.0)
+            + 0.18 * opening_norm
+            + 0.08 * front_score
+        ).clamp(0.0, 1.0)
+
+        if used_mask is None:
+            used = torch.zeros(N, dtype=torch.bool, device=device)
+        else:
+            used = used_mask.clone()
+
+        seed_threshold = (
+            self.open_crack_release_threshold
+            if self.open_crack_release_threshold > 0.0
+            else float(params["seed_threshold"])
+        )
+        seed_candidates = cut_node_mask & (~used) & (release_field >= seed_threshold)
+        if not bool(seed_candidates.any()):
+            relaxed = seed_threshold * 0.86
+            if float(release_field[cut_node_mask].max().item()) < relaxed:
+                return []
+            top_count = min(32, int(cut_node_mask.sum().item()))
+            seed_idx = torch.where(cut_node_mask & (~used))[0]
+            if seed_idx.numel() == 0:
+                return []
+            top_local = release_field[seed_idx].topk(min(top_count, seed_idx.numel())).indices
+            seed_candidates = torch.zeros(N, dtype=torch.bool, device=device)
+            seed_candidates[seed_idx[top_local]] = True
+
+        ordered_seed_idx = torch.where(seed_candidates)[0]
+        seed_order = release_field[ordered_seed_idx].argsort(descending=True)
+        max_seed_trials = max(16, max_patches * 4)
+        ordered_seed_idx = ordered_seed_idx[seed_order[:max_seed_trials]]
+
+        bbox_extent = positions.max(dim=0).values - positions.min(dim=0).values
+        diag = float(bbox_extent.norm().item())
+        radius = max(0.012, float(params["radius_scale"]) * max(diag, 1e-6))
+        seed_radius = max(0.006, float(params["seed_radius_scale"]) * max(diag, 1e-6))
+        max_patch_size = max(
+            int(params["min_size"]),
+            int(round(float(params["max_size_ratio"]) * N)),
+        )
+
+        patches: List[dict] = []
+        for seed in ordered_seed_idx.tolist():
+            if len(patches) >= max_patches:
+                break
+            if bool(used[seed]):
+                continue
+            patch = self._build_open_crack_release_patch(
+                seed_index=int(seed),
+                positions=positions,
+                graph=graph,
+                corridor_edge_mask=corridor_edge_mask,
+                release_field=release_field,
+                cut_node_mask=cut_node_mask,
+                used_mask=used,
+                radius=radius,
+                seed_radius=seed_radius,
+                min_patch_size=int(params["min_size"]),
+                max_patch_size=max_patch_size,
+                min_contact_edges=int(params["min_contact_edges"]),
+                release_threshold=float(params["release_threshold"]),
+            )
+            if patch is None:
+                continue
+            used |= patch["mask"]
+            patches.append(patch)
+
+        return patches
+
+    def _build_open_crack_release_patch(
+        self,
+        seed_index: int,
+        positions: Tensor,
+        graph: GaussianGraph,
+        corridor_edge_mask: Tensor,
+        release_field: Tensor,
+        cut_node_mask: Tensor,
+        used_mask: Tensor,
+        radius: float,
+        seed_radius: float,
+        min_patch_size: int,
+        max_patch_size: int,
+        min_contact_edges: int,
+        release_threshold: float,
+    ) -> Optional[dict]:
+        seed_pos = positions[seed_index]
+        dist = torch.norm(positions - seed_pos.unsqueeze(0), dim=1)
+        candidate_mask = (
+            (dist <= radius)
+            & (~used_mask)
+            & ((release_field >= 0.10) | cut_node_mask)
+        )
+        seed_mask = (
+            (dist <= seed_radius)
+            & cut_node_mask
+            & (~used_mask)
+            & (release_field >= max(0.10, 0.72 * release_threshold))
+        )
+        seed_mask[seed_index] = True
+        seed_size = int(seed_mask.sum().item())
+        if seed_size <= 0:
+            return None
+
+        patch_mask = seed_mask.clone()
+        allowed_edge = (
+            (~corridor_edge_mask)
+            & candidate_mask.unsqueeze(1)
+            & candidate_mask[graph.knn_idx]
+        )
+        for _ in range(5):
+            row_in = patch_mask.unsqueeze(1).expand_as(graph.knn_idx)
+            col_in = patch_mask[graph.knn_idx]
+            touch = allowed_edge & (row_in | col_in)
+            if not bool(touch.any()):
+                break
+            expanded = patch_mask.clone()
+            expanded |= torch.any(touch, dim=1)
+            expanded[graph.knn_idx[touch]] = True
+            expanded &= candidate_mask
+            if int(expanded.sum().item()) > max_patch_size:
+                patch_idx = torch.where(expanded)[0]
+                patch_dist = dist[patch_idx]
+                keep = patch_idx[patch_dist.argsort()[:max_patch_size]]
+                expanded.zero_()
+                expanded[keep] = True
+                expanded[seed_index] = True
+                patch_mask = expanded
+                break
+            delta = expanded & (~patch_mask)
+            patch_mask = expanded
+            if not bool(delta.any()):
+                break
+
+        patch_size = int(patch_mask.sum().item())
+        if patch_size < min_patch_size:
+            return None
+
+        patch_side = patch_mask.unsqueeze(1)
+        neighbor_side = patch_mask[graph.knn_idx]
+        cross_boundary = patch_side ^ neighbor_side
+        patch_boundary_mask = corridor_edge_mask & cross_boundary
+        contact_mask = corridor_edge_mask & (patch_side | neighbor_side)
+        boundary_edges = int(patch_boundary_mask.sum().item())
+        contact_edges = int(contact_mask.sum().item())
+        if max(boundary_edges, contact_edges) < min_contact_edges:
+            return None
+
+        patch_score = float(release_field[patch_mask].mean().item())
+        peak_score = float(release_field[patch_mask].max().item())
+        contact_score = min(1.0, contact_edges / max(float(min_contact_edges * 3), 1.0))
+        boundary_score = min(1.0, boundary_edges / max(float(min_contact_edges * 2), 1.0))
+        release_score = (
+            0.46 * peak_score
+            + 0.26 * patch_score
+            + 0.18 * contact_score
+            + 0.10 * boundary_score
+        )
+        if release_score < release_threshold:
+            return None
+
+        boundary_mask = patch_boundary_mask if boundary_edges > 0 else contact_mask
+        return {
+            "mask": patch_mask,
+            "boundary_mask": boundary_mask,
+            "size": patch_size,
+            "seed_size": seed_size,
+            "cut_ratio": contact_score,
+            "center": positions[patch_mask].mean(dim=0),
+            "seed_center": seed_pos,
+            "plane_normal": torch.zeros(3, dtype=positions.dtype, device=positions.device),
+            "closure_score": 0.0,
+            "boundary_score": boundary_score,
+            "release_score": float(min(1.0, release_score)),
+            "support_lost": True,
+            "open_release": True,
+        }
 
     def _cluster_boundary_candidates(
         self,
@@ -1885,7 +2197,14 @@ class GraphFragmentManager:
         ).clamp(0.0, 1.0)
         core_score = torch.maximum(core_i, core_j)
         side_score = torch.zeros_like(core_score)
+        side_weight = 0.0
         if self.material_family == "sharp_brittle":
+            side_weight = 1.0
+        elif self.material_family == "brittle_moderate":
+            side_weight = 0.55
+        elif self.material_family == "rough_quasi_brittle":
+            side_weight = 0.35
+        if side_weight > 0.0:
             center_i = local_center.unsqueeze(1).expand_as(edge_unit)
             center_j = local_center[graph.knn_idx]
             chosen_center = torch.where(use_i.unsqueeze(2), center_i, center_j)
@@ -1897,7 +2216,12 @@ class GraphFragmentManager:
             side_margin = 0.12 * edge_len
             opposite_side = (signed_i * signed_j) < -(side_margin ** 2)
             side_sep = ((signed_i - signed_j).abs() / edge_len).clamp(0.0, 1.0)
-            side_score = opposite_side.float() * side_sep * core_score.clamp(0.0, 1.0)
+            side_score = (
+                side_weight
+                * opposite_side.float()
+                * side_sep
+                * core_score.clamp(0.0, 1.0)
+            )
         cut_vote = (
             self.cut_vote_strength
             * core_score
@@ -1905,7 +2229,7 @@ class GraphFragmentManager:
             * tangent_gate
             * cut_pair.float()
         ).clamp(0.0, 1.0)
-        if self.material_family == "sharp_brittle":
+        if side_weight > 0.0:
             side_boost = (
                 0.46
                 * self.cut_vote_strength
@@ -1943,6 +2267,13 @@ class GraphFragmentManager:
                 & (tangent_align < 0.92 * self.tau_tangent)
                 & (core_score > 0.40)
             )
+            hard_cut = hard_cut | (
+                cut_pair
+                & (side_score > 0.08)
+                & (cross_align > max(self.tau_cross - 0.03, 0.38))
+                & (tangent_align < min(1.02 * self.tau_tangent, 0.48))
+                & (core_score > 0.30)
+            )
         elif self.material_family == "rough_quasi_brittle":
             hard_cut = hard_cut | (
                 cut_pair
@@ -1950,15 +2281,24 @@ class GraphFragmentManager:
                 & (tangent_align < 1.02 * self.tau_tangent)
                 & (core_score > 0.34)
             )
+            hard_cut = hard_cut | (
+                cut_pair
+                & (side_score > 0.06)
+                & (cross_align > max(self.tau_cross - 0.06, 0.30))
+                & (core_score > 0.26)
+            )
 
         if self.material_family == "sharp_brittle":
             cut_edge_mask = cut_edge_mask | (side_score > 0.06)
+        elif self.material_family == "brittle_moderate":
+            cut_edge_mask = cut_edge_mask | (side_score > 0.08)
         elif self.material_family == "rough_quasi_brittle":
             cut_edge_mask = cut_edge_mask | (
                 cut_pair
                 & (cross_align > max(self.tau_cross - 0.06, 0.28))
                 & (core_score > 0.18)
             )
+            cut_edge_mask = cut_edge_mask | (side_score > 0.10)
         cut_edge_mask = cut_edge_mask | hard_cut
         return cut_vote, hard_cut, cut_core_mask, cut_edge_mask
 
@@ -1975,6 +2315,34 @@ class GraphFragmentManager:
             labels: (N,) numpy array of component labels
         """
         import numpy as np
+        try:
+            from scipy.sparse import coo_matrix
+            from scipy.sparse.csgraph import connected_components
+
+            knn_np = knn_idx.numpy()
+            alive_np = edge_alive.numpy()
+            if knn_np.size == 0:
+                return np.arange(N, dtype=np.int64)
+            rows = np.repeat(np.arange(N, dtype=np.int64), knn_np.shape[1])
+            cols = knn_np.reshape(-1).astype(np.int64, copy=False)
+            alive = alive_np.reshape(-1).astype(bool, copy=False)
+            if not np.any(alive):
+                return np.arange(N, dtype=np.int64)
+            data = np.ones(int(alive.sum()), dtype=np.uint8)
+            adjacency = coo_matrix(
+                (data, (rows[alive], cols[alive])),
+                shape=(N, N),
+                dtype=np.uint8,
+            )
+            adjacency = adjacency.maximum(adjacency.T)
+            _, labels = connected_components(
+                adjacency.tocsr(),
+                directed=False,
+                return_labels=True,
+            )
+            return labels.astype(np.int64, copy=False)
+        except Exception:
+            pass
 
         parent = np.arange(N, dtype=np.int64)
         rank = np.zeros(N, dtype=np.int64)

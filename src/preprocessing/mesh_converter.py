@@ -50,7 +50,7 @@ class MeshToPointCloudConverter:
             raise FileNotFoundError(f"Mesh file not found: {mesh_path}")
 
         self.target_count = target_particle_count
-        self.surface_ratio = surface_sample_ratio
+        self.surface_ratio = float(np.clip(surface_sample_ratio, 0.0, 1.0))
         self.use_poisson = use_poisson
         self.poisson_depth = poisson_depth
         self.normalize = normalize_to_unit_cube
@@ -60,7 +60,7 @@ class MeshToPointCloudConverter:
         print(f"[MeshConverter] Initialized")
         print(f"  - Mesh: {self.mesh_path.name}")
         print(f"  - Target particles: {target_particle_count}")
-        print(f"  - Surface ratio: {surface_sample_ratio:.1%}")
+        print(f"  - Surface ratio: {self.surface_ratio:.1%}")
 
     def load_mesh(self) -> o3d.geometry.TriangleMesh:
         """
@@ -124,6 +124,9 @@ class MeshToPointCloudConverter:
             normals: (n_samples, 3) surface normals
         """
         print(f"[MeshConverter] Sampling {n_samples} surface particles...")
+        if n_samples <= 0:
+            empty = np.empty((0, 3), dtype=np.float32)
+            return empty, empty.copy(), empty.copy()
 
         # Uniform surface sampling
         pcd = mesh.sample_points_uniformly(number_of_points=n_samples)
@@ -167,6 +170,9 @@ class MeshToPointCloudConverter:
             colors: (n_samples, 3) RGB colors (default gray)
         """
         print(f"[MeshConverter] Sampling {n_samples} volumetric particles...")
+        if n_samples <= 0:
+            empty = np.empty((0, 3), dtype=np.float32)
+            return empty, empty.copy()
 
         if self.use_poisson:
             pcd = self._poisson_volume_sample(mesh, n_samples)
@@ -193,6 +199,11 @@ class MeshToPointCloudConverter:
 
         Uses raycasting to determine if points are inside mesh
         """
+        if n_samples <= 0:
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(np.empty((0, 3), dtype=np.float32))
+            return pcd
+
         # Create raycasting scene
         mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
         scene = o3d.t.geometry.RaycastingScene()
@@ -250,6 +261,11 @@ class MeshToPointCloudConverter:
 
         Creates watertight mesh then samples interior voxels
         """
+        if n_samples <= 0:
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(np.empty((0, 3), dtype=np.float32))
+            return pcd
+
         print(f"  - Using Poisson reconstruction (depth={self.poisson_depth})")
 
         # Get dense surface point cloud
@@ -337,7 +353,8 @@ class MeshToPointCloudConverter:
         mesh = self.load_mesh()
 
         # Calculate particle counts
-        n_surface = int(self.target_count * self.surface_ratio)
+        n_surface = int(round(self.target_count * self.surface_ratio))
+        n_surface = min(max(n_surface, 0), self.target_count)
         n_volume = self.target_count - n_surface
 
         print(f"\nParticle allocation:")
@@ -352,6 +369,10 @@ class MeshToPointCloudConverter:
 
         # Sample volume interior
         vol_pts, vol_colors = self.sample_volumetric_particles(mesh, n_volume)
+        volume_sampling_empty = n_volume <= 0
+        if volume_sampling_empty:
+            vol_pts = np.zeros((1, 3), dtype=surf_pts.dtype)
+            vol_colors = np.zeros((1, 3), dtype=surf_colors.dtype)
         # Volume normals: radial direction from centroid (outward)
         # When cracks expose interior, these normals provide proper shading
         centroid = vol_pts.mean(axis=0)
@@ -365,6 +386,10 @@ class MeshToPointCloudConverter:
         light_dir /= np.linalg.norm(light_dir)
         ndotl = np.clip((vol_normals * light_dir).sum(axis=1), 0.0, 1.0)
         vol_colors = np.stack([0.25 + 0.6 * ndotl] * 3, axis=1)
+        if volume_sampling_empty:
+            vol_pts = np.empty((0, 3), dtype=surf_pts.dtype)
+            vol_colors = np.empty((0, 3), dtype=surf_colors.dtype)
+            vol_normals = np.empty((0, 3), dtype=surf_normals.dtype)
 
         # Combine for MPM (all particles)
         all_points = np.vstack([surf_pts, vol_pts])
@@ -385,7 +410,7 @@ class MeshToPointCloudConverter:
         )
 
         # Surface mask: first n_surface particles are True
-        surface_mask = np.zeros(self.target_count, dtype=bool)
+        surface_mask = np.zeros(all_points.shape[0], dtype=bool)
         surface_mask[:n_surface] = True
 
         print(f"\nConversion complete!")

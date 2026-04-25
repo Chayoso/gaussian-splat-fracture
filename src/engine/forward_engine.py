@@ -314,6 +314,13 @@ class ForwardEngine:
             damage_scale_shrink=float(config.gaussian_splatting.get('damage_scale_shrink', 0.50)),
             damage_center_opacity_reduction=float(config.gaussian_splatting.get('damage_center_opacity_reduction', 0.70)),
             diffuse_damage_strength=float(config.gaussian_splatting.get('diffuse_damage_strength', 0.12)),
+            interior_surface_enable=bool(config.gaussian_splatting.get('interior_surface_enable', True)),
+            interior_surface_threshold=float(config.gaussian_splatting.get('interior_surface_threshold', 0.34)),
+            interior_surface_max_fraction=float(config.gaussian_splatting.get('interior_surface_max_fraction', 0.012)),
+            interior_surface_scale=float(config.gaussian_splatting.get('interior_surface_scale', 0.82)),
+            interior_surface_opacity=float(config.gaussian_splatting.get('interior_surface_opacity', 0.72)),
+            interior_surface_darken=float(config.gaussian_splatting.get('interior_surface_darken', 0.38)),
+            interior_surface_gap_gain=float(config.gaussian_splatting.get('interior_surface_gap_gain', 0.72)),
         )
 
         # Seismic params
@@ -451,6 +458,19 @@ class ForwardEngine:
 
         total_frames = config.rendering.total_frames
         frames_out = []
+        render_last_only = bool(config.rendering.get('render_last_only', False))
+        render_every = max(int(config.rendering.get('render_every', 1) or 1), 1)
+        render_frames_cfg = config.rendering.get('render_frames', None)
+        render_frame_set = None
+        if render_frames_cfg is not None:
+            render_frame_set = {int(f) for f in list(render_frames_cfg)}
+
+        def should_render_frame(frame_idx: int) -> bool:
+            if render_frame_set is not None:
+                return frame_idx in render_frame_set
+            if render_last_only:
+                return frame_idx == total_frames - 1
+            return (frame_idx % render_every == 0) or (frame_idx == total_frames - 1)
 
         # Apply impact/notch if configured
         if config.external_force.enabled:
@@ -523,7 +543,16 @@ class ForwardEngine:
                     ckpt_path = str(ckpt_dir / f"checkpoint_{frame:04d}.pt")
                     simulator.save_state(ckpt_path)
 
-            # Render
+            do_render = should_render_frame(frame)
+
+            if not do_render:
+                if frame % 20 == 0 or frame == total_frames - 1:
+                    elapsed = time.time() - start_time
+                    print(f"Frame {frame:04d}/{total_frames}: "
+                          f"elapsed={elapsed:.1f}s render=skipped", flush=True)
+                continue
+
+            # Render only on selected output frames.
             rendering = render(camera, simulator.gaussians, pipe, bg_color)
             image = rendering["render"]
             depth_map = rendering["depth"]
@@ -592,10 +621,10 @@ class ForwardEngine:
             if frame % 20 == 0 or frame == total_frames - 1:
                 elapsed = time.time() - start_time
                 print(f"Frame {frame:04d}/{total_frames}: "
-                      f"elapsed={elapsed:.1f}s", flush=True)
+                      f"elapsed={elapsed:.1f}s render=done", flush=True)
 
         # Video
-        if save_frames:
+        if save_frames and bool(config.output.get('make_video', True)):
             create_video(frame_dir, config.output.video_path,
                          config.rendering.fps)
 

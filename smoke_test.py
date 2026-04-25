@@ -6,7 +6,9 @@ Outputs PNG frames showing damage field evolution on surface Gaussians.
 
 Usage:
     python smoke_test.py
-    python smoke_test.py --frames 120 --fast
+    python smoke_test.py --surface-only --clip "glass bottle" --frames 80
+    python smoke_test.py --frames 120 --particles 50000
+    python smoke_test.py --frames 120 --particles 150000
 """
 
 import sys, os, argparse, time
@@ -30,12 +32,95 @@ from src.preprocessing.mesh_converter import MeshToPointCloudConverter
 from src.core.coordinate_mapper import CoordinateMapper
 from src.core.manifold_simulator import ManifoldSimulator
 from src.core.material_presets import resolve_material_preset, validate_l0
+from src.fracture.graph_builder import GaussianGraph
+from src.fracture.graph_fragment_manager import GraphFragmentManager
+from src.fracture.tip_based_fracture_field import GaussianFractureField
+from src.fracture.crack_front import CrackFront
+from src.fracture.surface_crack_driver import SurfaceCrackDriver
 from src.engine.loading_transforms import apply_loading_transforms
 from src.visualization.gaussian_updater import GaussianCrackVisualizer
 from src.ml.material_predictor import MaterialPredictor
-from src.ml.material_prior_adapter import MaterialPriorAdapter
+from src.ml.material_prior_adapter import FAMILY_RUNTIME_PRESETS, MaterialPriorAdapter
 
 from omegaconf import OmegaConf
+
+
+SURFACE_COLLAPSE_OVERRIDES = {
+    "manifold.material_family": "rough_quasi_brittle",
+    "manifold.enable_front_propagation": True,
+    "manifold.material_drive_floor": 0.11,
+    "manifold.damage_source_scale": 0.72,
+    "manifold.damage_spread": 0.62,
+    "manifold.drive_quantile": 0.45,
+    "manifold.front_threshold": 0.02,
+    "manifold.tip_propagation_scale": 1.30,
+    "manifold.front_substeps": 4,
+    "manifold.tau_init": 0.16,
+    "manifold.growth_gain": 1.45,
+    "manifold.band_width": 2.35,
+    "manifold.band_fill_gain": 0.80,
+    "manifold.open_gain": 1.35,
+    "manifold.branching_bias": 0.85,
+    "manifold.successor_topk": 5,
+    "manifold.min_successor_score": 0.12,
+    "manifold.branch_drive_threshold": 0.22,
+    "manifold.branch_score_ratio": 0.70,
+    "manifold.max_branching_tips": 48,
+    "manifold.fragment_detect_every": 4,
+    "manifold.fragment_damage_threshold": 0.28,
+    "manifold.min_fragment_particles": 12,
+    "manifold.fragment_opening_weight": 0.68,
+    "manifold.fragment_active_tip_weight": 0.34,
+    "manifold.fragment_recent_front_weight": 0.32,
+    "manifold.fragment_pair_break_weight": 0.24,
+    "manifold.fragment_edge_memory_decay": 0.994,
+    "manifold.fragment_edge_memory_weight": 0.98,
+    "manifold.fragment_cut_diffusion_alpha": 0.58,
+    "manifold.fragment_cut_diffusion_iters": 1,
+    "manifold.fragment_cut_cos_gate_tangent": 0.36,
+    "manifold.fragment_cut_cos_gate_normal": 0.30,
+    "manifold.fragment_primary_cut_ratio": 0.38,
+    "manifold.fragment_fallback_cut_ratio": 0.22,
+    "manifold.fragment_min_boundary_edges": 8,
+    "manifold.fragment_persistent_min_size": 4,
+    "manifold.fragment_component_hysteresis": 0.18,
+    "manifold.fragment_post_split_threshold_scale": 0.70,
+    "manifold.cut_surface_enable": True,
+    "manifold.cut_vote_strength": 1.15,
+    "manifold.tau_cross": 0.38,
+    "manifold.tau_tangent": 0.58,
+    "manifold.cut_core_damage_threshold": 0.075,
+    "manifold.cut_core_opening_threshold": 0.045,
+    "manifold.cut_hard_break_threshold": 0.16,
+    "manifold.authoritative_cut_decay": 0.992,
+    "manifold.authoritative_cut_threshold": 0.085,
+    "manifold.support_loss_enable": True,
+    "manifold.support_anchor_quantile": 0.18,
+    "manifold.support_release_threshold": 0.36,
+    "manifold.support_promote_min_size": 4,
+    "manifold.support_overlap_threshold": 0.035,
+    "manifold.open_crack_release_enable": True,
+    "manifold.open_crack_release_threshold": 0.32,
+    "manifold.open_crack_release_max_patches": 6,
+    "manifold.collapse_fast_path": True,
+    "manifold.collapse_vector_path": True,
+    "manifold.collapse_fast_start_frame": 4,
+    "manifold.collapse_fast_threshold": 0.30,
+    "manifold.collapse_fast_min_threshold": 0.055,
+    "manifold.collapse_fast_threshold_decay": 0.004,
+    "manifold.collapse_fast_patch_radius": 0.065,
+    "manifold.collapse_fast_patch_core_radius": 0.024,
+    "manifold.collapse_fast_min_size": 18,
+    "manifold.collapse_fast_max_size_ratio": 0.040,
+    "manifold.collapse_fast_patches_per_frame": 10,
+    "manifold.collapse_fragment_gap": 0.020,
+    "manifold.collapse_fragment_speed": 0.010,
+    "manifold.collapse_fragment_gravity": 0.000045,
+    "manifold.collapse_fragment_fall_cap": 0.42,
+    "manifold.collapse_fragment_max_offset": 0.24,
+    "manifold.collapse_fragment_spin_gain": 0.22,
+    "gaussian_splatting.material_family": "rough_quasi_brittle",
+}
 
 
 class DummyGaussians:
@@ -268,10 +353,17 @@ def plot_cut_debug_frame(
     title_extra="",
 ):
     """3-view plot of cut-core nodes and cut-edge midpoints."""
-    if cut_core_mask is None or cut_edge_mask is None or graph is None or graph.knn_idx is None:
+    if cut_edge_mask is None or graph is None or graph.knn_idx is None:
         return
 
-    cut_core = cut_core_mask.bool()
+    if cut_core_mask is None:
+        cut_core = torch.zeros(
+            positions.shape[0],
+            dtype=torch.bool,
+            device=positions.device,
+        )
+    else:
+        cut_core = cut_core_mask.bool()
     edge_mask = cut_edge_mask.bool()
     if not bool(cut_core.any()) and not bool(edge_mask.any()):
         return
@@ -444,15 +536,790 @@ def summarize_edge_damage(edge_damage):
     }
 
 
+def make_crack_front(fracture_params, device):
+    return CrackFront(
+        seed_quantile=fracture_params.get('seed_quantile', 0.995),
+        max_seed_points=fracture_params.get('max_seed_points', 2),
+        min_seed_spacing=fracture_params.get('min_seed_spacing', 0.04),
+        successor_topk=fracture_params.get('successor_topk', 2),
+        min_successor_score=fracture_params.get('min_successor_score', 0.25),
+        drive_weight=fracture_params.get('drive_weight', 0.40),
+        distance_weight=fracture_params.get('distance_weight', 0.12),
+        align_weight=fracture_params.get('align_weight', 0.24),
+        tangent_weight=fracture_params.get('tangent_weight', 0.16),
+        continuity_weight=fracture_params.get('continuity_weight', 0.10),
+        radial_weight=fracture_params.get('radial_weight', 0.16),
+        lift_weight=fracture_params.get('lift_weight', 0.40),
+        max_tip_age=fracture_params.get('max_tip_age', 2),
+        revisit_drive_threshold=fracture_params.get('revisit_drive_threshold', 0.8),
+        branch_score_ratio=fracture_params.get('branch_score_ratio', 0.97),
+        branch_drive_threshold=fracture_params.get('branch_drive_threshold', 0.70),
+        max_branching_tips=fracture_params.get('max_branching_tips', 12),
+        tau_init=fracture_params.get('tau_init', 0.30),
+        growth_gain=fracture_params.get('growth_gain', 1.0),
+        branching_bias=fracture_params.get('branching_bias', 0.20),
+        anisotropy_strength=fracture_params.get('anisotropy_strength', 0.10),
+        material_family=fracture_params.get('material_family', 'neutral_reference'),
+        device=str(device),
+    )
+
+
+def make_surface_fracture_field(fracture_params, graph, device):
+    return GaussianFractureField(
+        Gc=fracture_params.get('Gc', 60000.0),
+        l0=fracture_params.get('l0', 0.025),
+        dC_max=fracture_params.get('dC_max', 0.015),
+        warmup_frames=fracture_params.get('warmup_frames', 5),
+        aniso_ratio=fracture_params.get('aniso_ratio', 3.0),
+        opening_scale=fracture_params.get('opening_scale', 0.02),
+        damage_source_scale=fracture_params.get('damage_source_scale', 0.35),
+        damage_spread=fracture_params.get('damage_spread', 0.18),
+        drive_quantile=fracture_params.get('drive_quantile', 0.90),
+        front_threshold=fracture_params.get('front_threshold', 0.05),
+        radial_bias=fracture_params.get('radial_bias', 2.5),
+        tip_propagation_scale=fracture_params.get('tip_propagation_scale', 0.75),
+        front_substeps=fracture_params.get('front_substeps', 2),
+        tau_init=fracture_params.get('tau_init', 0.30),
+        growth_gain=fracture_params.get('growth_gain', 1.0),
+        band_width=fracture_params.get('band_width', 1.5),
+        band_fill_gain=fracture_params.get('band_fill_gain', 0.30),
+        open_gain=fracture_params.get('open_gain', 1.0),
+        material_family=fracture_params.get('material_family', 'neutral_reference'),
+        enable_front_propagation=fracture_params.get('enable_front_propagation', True),
+        material_drive_floor=fracture_params.get('material_drive_floor', None),
+        diffuse_damage_gain=fracture_params.get('diffuse_damage_gain', 0.16),
+        diffuse_neighborhood_steps=fracture_params.get('diffuse_neighborhood_steps', 2),
+        graph=graph,
+        crack_front=make_crack_front(fracture_params, device),
+        device=str(device),
+    )
+
+
+def make_fragment_manager(fracture_params, device):
+    if not fracture_params.get('fragmentation_enabled', False):
+        return None
+    return GraphFragmentManager(
+        damage_threshold=fracture_params.get('fragment_damage_threshold', 0.5),
+        min_fragment_size=fracture_params.get('min_fragment_particles', 20),
+        edge_break_rate=fracture_params.get('edge_break_rate', 1.0),
+        opening_weight=fracture_params.get('fragment_opening_weight', 0.35),
+        active_tip_weight=fracture_params.get('fragment_active_tip_weight', 0.18),
+        recent_front_weight=fracture_params.get('fragment_recent_front_weight', 0.12),
+        pair_break_weight=fracture_params.get('fragment_pair_break_weight', 0.10),
+        edge_memory_decay=fracture_params.get('fragment_edge_memory_decay', 0.97),
+        edge_memory_weight=fracture_params.get('fragment_edge_memory_weight', 0.72),
+        cut_diffusion_alpha=fracture_params.get('fragment_cut_diffusion_alpha', 0.0),
+        cut_diffusion_iters=fracture_params.get('fragment_cut_diffusion_iters', 0),
+        cut_cos_gate_tangent=fracture_params.get('fragment_cut_cos_gate_tangent', 0.5),
+        cut_cos_gate_normal=fracture_params.get('fragment_cut_cos_gate_normal', 0.4),
+        primary_cut_ratio=fracture_params.get('fragment_primary_cut_ratio', 0.75),
+        fallback_cut_ratio=fracture_params.get('fragment_fallback_cut_ratio', 0.55),
+        min_boundary_edges=fracture_params.get('fragment_min_boundary_edges', 12),
+        detached_node_decay=fracture_params.get('fragment_detached_node_decay', 0.95),
+        persistent_min_fragment_size=fracture_params.get('fragment_persistent_min_size', 8),
+        component_hysteresis=fracture_params.get('fragment_component_hysteresis', 0.35),
+        post_split_threshold_scale=fracture_params.get('fragment_post_split_threshold_scale', 0.92),
+        cut_surface_enable=fracture_params.get('cut_surface_enable', False),
+        cut_vote_strength=fracture_params.get('cut_vote_strength', 0.0),
+        tau_cross=fracture_params.get('tau_cross', 0.60),
+        tau_tangent=fracture_params.get('tau_tangent', 0.45),
+        cut_core_damage_threshold=fracture_params.get('cut_core_damage_threshold', 0.18),
+        cut_core_opening_threshold=fracture_params.get('cut_core_opening_threshold', 0.16),
+        cut_hard_break_threshold=fracture_params.get('cut_hard_break_threshold', 0.42),
+        authoritative_cut_decay=fracture_params.get('authoritative_cut_decay', 0.96),
+        authoritative_cut_threshold=fracture_params.get('authoritative_cut_threshold', 0.20),
+        support_loss_enable=fracture_params.get('support_loss_enable', True),
+        support_anchor_quantile=fracture_params.get('support_anchor_quantile', 0.10),
+        support_release_threshold=fracture_params.get('support_release_threshold', 0.56),
+        support_promote_min_size=fracture_params.get('support_promote_min_size', 6),
+        support_overlap_threshold=fracture_params.get('support_overlap_threshold', 0.10),
+        open_crack_release_enable=fracture_params.get('open_crack_release_enable', True),
+        open_crack_release_threshold=fracture_params.get('open_crack_release_threshold', 0.0),
+        open_crack_release_max_patches=fracture_params.get('open_crack_release_max_patches', 2),
+        material_family=fracture_params.get('material_family', 'neutral_reference'),
+        device=str(device),
+    )
+
+
+def make_fast_collapse_state(num_nodes, device):
+    return {
+        "labels": torch.zeros(num_nodes, dtype=torch.long, device=device),
+        "next_id": 1,
+        "released_nodes": 0,
+        "last_release_max": 0.0,
+        "motion": {},
+    }
+
+
+def update_fast_collapse_labels_from_fields(
+    positions,
+    damage,
+    opening,
+    visited,
+    tips,
+    state,
+    fracture_params,
+    frame,
+):
+    labels = state["labels"]
+    start_frame = int(fracture_params.get('collapse_fast_start_frame', 4))
+    if frame < start_frame:
+        return labels, int(labels.max().item()) + 1, 0
+
+    c = damage.clamp(0.0, 1.0)
+    opening_scale = torch.quantile(opening.detach(), 0.90).clamp(min=1e-8)
+    opening_norm = (opening / opening_scale).clamp(0.0, 1.0)
+    elapsed = max(frame - start_frame, 0)
+    threshold = max(
+        float(fracture_params.get('collapse_fast_min_threshold', 0.055)),
+        float(fracture_params.get('collapse_fast_threshold', 0.30))
+        - elapsed * float(fracture_params.get('collapse_fast_threshold_decay', 0.004)),
+    )
+    release = (
+        0.48 * c
+        + 0.24 * opening_norm
+        + 0.20 * visited.float()
+        + 0.08 * tips.float()
+    ).clamp(0.0, 1.0)
+    state["last_release_max"] = float(release.max().item())
+
+    unassigned = labels == 0
+    candidate_idx = torch.where(unassigned & (release >= threshold))[0]
+    if candidate_idx.numel() == 0:
+        return labels, int(labels.max().item()) + 1, 0
+
+    per_frame = max(int(fracture_params.get('collapse_fast_patches_per_frame', 8)), 1)
+    order = release[candidate_idx].argsort(descending=True)
+    seed_idx = candidate_idx[order[: min(candidate_idx.numel(), per_frame * 2)]]
+
+    bbox_extent = positions.max(dim=0).values - positions.min(dim=0).values
+    diag = float(bbox_extent.norm().item())
+    radius = max(0.008, float(fracture_params.get('collapse_fast_patch_radius', 0.060)) * diag)
+    core_radius = max(0.004, float(fracture_params.get('collapse_fast_patch_core_radius', 0.020)) * diag)
+    min_size = max(int(fracture_params.get('collapse_fast_min_size', 16)), 1)
+    max_size = max(
+        min_size,
+        int(round(float(fracture_params.get('collapse_fast_max_size_ratio', 0.035)) * positions.shape[0])),
+    )
+
+    created = 0
+    for seed in seed_idx.tolist():
+        if created >= per_frame:
+            break
+        if labels[seed] != 0:
+            continue
+        seed_pos = positions[seed]
+        dist = torch.norm(positions - seed_pos.unsqueeze(0), dim=1)
+        patch = (
+            (labels == 0)
+            & (dist <= radius)
+            & ((release >= 0.38 * threshold) | (dist <= core_radius))
+        )
+        patch_size = int(patch.sum().item())
+        if patch_size < min_size:
+            continue
+        if patch_size > max_size:
+            patch_idx = torch.where(patch)[0]
+            keep = patch_idx[dist[patch_idx].argsort()[:max_size]]
+            patch.zero_()
+            patch[keep] = True
+            patch[seed] = True
+
+        labels[patch] = int(state["next_id"])
+        state["next_id"] += 1
+        created += 1
+
+    state["released_nodes"] = int((labels > 0).sum().item())
+    return labels, int(labels.max().item()) + 1, created
+
+
+def apply_fragment_motion_offsets(
+    positions,
+    labels,
+    state,
+    frame,
+    fracture_params,
+):
+    if labels is None or not bool((labels > 0).any()):
+        return positions
+
+    motion = state.setdefault("motion", {})
+    out = positions.clone()
+    base_com = positions[labels == 0].mean(dim=0) if bool((labels == 0).any()) else positions.mean(dim=0)
+    gravity = float(fracture_params.get('collapse_fragment_gravity', 0.0018))
+    fall_cap = float(fracture_params.get('collapse_fragment_fall_cap', 0.42))
+    speed = float(fracture_params.get('collapse_fragment_speed', 0.010))
+    gap = float(fracture_params.get('collapse_fragment_gap', 0.018))
+    max_offset = float(fracture_params.get('collapse_fragment_max_offset', 0.24))
+    spin_gain = float(fracture_params.get('collapse_fragment_spin_gain', 0.18))
+
+    for frag_id in labels.unique(sorted=True).tolist():
+        if frag_id <= 0:
+            continue
+        mask = labels == frag_id
+        if not bool(mask.any()):
+            continue
+        if frag_id not in motion:
+            com = positions[mask].mean(dim=0)
+            direction = com - base_com
+            if direction.norm() <= 1e-8:
+                direction = torch.tensor(
+                    [
+                        torch.sin(torch.tensor(float(frag_id), device=positions.device)),
+                        torch.cos(torch.tensor(float(frag_id) * 1.7, device=positions.device)),
+                        torch.tensor(0.25, device=positions.device),
+                    ],
+                    dtype=positions.dtype,
+                    device=positions.device,
+                )
+            direction = direction / direction.norm().clamp(min=1e-8)
+            jitter = torch.tensor(
+                [
+                    0.35 * torch.sin(torch.tensor(float(frag_id) * 12.989, device=positions.device)),
+                    0.35 * torch.sin(torch.tensor(float(frag_id) * 78.233, device=positions.device)),
+                    0.18 * torch.cos(torch.tensor(float(frag_id) * 37.719, device=positions.device)),
+                ],
+                dtype=positions.dtype,
+                device=positions.device,
+            )
+            direction = direction + jitter
+            direction[2] += 0.12
+            direction = direction / direction.norm().clamp(min=1e-8)
+            motion[frag_id] = {
+                "birth": int(frame),
+                "direction": direction,
+                "phase": float(frag_id) * 0.37,
+            }
+
+        frag_state = motion[frag_id]
+        age = max(frame - int(frag_state["birth"]), 0)
+        ramp = min(age / 12.0, 1.0)
+        direction = frag_state["direction"]
+        travel = min(max_offset, gap + speed * age)
+        offset = ramp * travel * direction
+        offset = offset.clone()
+        offset[2] -= min(fall_cap, gravity * float(age * age))
+
+        local = positions[mask]
+        com = local.mean(dim=0)
+        rel = local - com.unsqueeze(0)
+        spin_phase = float(frag_state["phase"]) + 0.11 * age
+        spin_axis = torch.tensor(
+            [torch.sin(torch.tensor(spin_phase, device=positions.device)), 0.35, torch.cos(torch.tensor(spin_phase, device=positions.device))],
+            dtype=positions.dtype,
+            device=positions.device,
+        )
+        spin_axis = spin_axis / spin_axis.norm().clamp(min=1e-8)
+        spin = spin_gain * ramp * min(age / 30.0, 1.0)
+        spin_offset = spin * torch.cross(
+            spin_axis.unsqueeze(0).expand_as(rel),
+            rel,
+            dim=1,
+        )
+        out[mask] = local + offset.unsqueeze(0) + spin_offset
+
+    return out
+
+
+def update_fast_collapse_fragments(
+    positions,
+    fracture_field,
+    state,
+    fracture_params,
+    frame,
+):
+    labels = state["labels"]
+    start_frame = int(fracture_params.get('collapse_fast_start_frame', 4))
+    if frame < start_frame:
+        return labels, int(labels.max().item()) + 1, 0
+
+    c = fracture_field.c.clamp(0.0, 1.0)
+    opening = fracture_field.a if fracture_field.a is not None else torch.zeros_like(c)
+    opening_scale = torch.quantile(opening.detach(), 0.90).clamp(min=1e-8)
+    opening_norm = (opening / opening_scale).clamp(0.0, 1.0)
+
+    crack_front = fracture_field.crack_front
+    visited = (
+        crack_front.visited_mask.float()
+        if crack_front is not None and crack_front.visited_mask is not None
+        else torch.zeros_like(c)
+    )
+    tips = (
+        crack_front.tip_mask.float()
+        if crack_front is not None and crack_front.tip_mask is not None
+        else torch.zeros_like(c)
+    )
+
+    elapsed = max(frame - start_frame, 0)
+    threshold = max(
+        float(fracture_params.get('collapse_fast_min_threshold', 0.055)),
+        float(fracture_params.get('collapse_fast_threshold', 0.30))
+        - elapsed * float(fracture_params.get('collapse_fast_threshold_decay', 0.004)),
+    )
+    release = (
+        0.48 * c
+        + 0.24 * opening_norm
+        + 0.20 * visited
+        + 0.08 * tips
+    ).clamp(0.0, 1.0)
+    state["last_release_max"] = float(release.max().item())
+
+    unassigned = labels == 0
+    candidate_idx = torch.where(unassigned & (release >= threshold))[0]
+    if candidate_idx.numel() == 0:
+        return labels, int(labels.max().item()) + 1, 0
+
+    per_frame = max(int(fracture_params.get('collapse_fast_patches_per_frame', 8)), 1)
+    order = release[candidate_idx].argsort(descending=True)
+    seed_idx = candidate_idx[order[: min(candidate_idx.numel(), per_frame * 3)]]
+
+    bbox_extent = positions.max(dim=0).values - positions.min(dim=0).values
+    diag = float(bbox_extent.norm().item())
+    radius = max(0.008, float(fracture_params.get('collapse_fast_patch_radius', 0.060)) * diag)
+    core_radius = max(0.004, float(fracture_params.get('collapse_fast_patch_core_radius', 0.020)) * diag)
+    min_size = max(int(fracture_params.get('collapse_fast_min_size', 16)), 1)
+    max_size = max(
+        min_size,
+        int(round(float(fracture_params.get('collapse_fast_max_size_ratio', 0.035)) * positions.shape[0])),
+    )
+
+    created = 0
+    for seed in seed_idx.tolist():
+        if created >= per_frame:
+            break
+        if labels[seed] != 0:
+            continue
+        seed_pos = positions[seed]
+        dist = torch.norm(positions - seed_pos.unsqueeze(0), dim=1)
+        patch = (
+            (labels == 0)
+            & (dist <= radius)
+            & ((release >= 0.42 * threshold) | (dist <= core_radius))
+        )
+        patch_size = int(patch.sum().item())
+        if patch_size < min_size:
+            continue
+        if patch_size > max_size:
+            patch_idx = torch.where(patch)[0]
+            keep = patch_idx[dist[patch_idx].argsort()[:max_size]]
+            patch.zero_()
+            patch[keep] = True
+            patch[seed] = True
+
+        labels[patch] = int(state["next_id"])
+        state["next_id"] += 1
+        created += 1
+
+    state["released_nodes"] = int((labels > 0).sum().item())
+    return labels, int(labels.max().item()) + 1, created
+
+
+def run_vector_collapse_smoke(
+    positions,
+    normals,
+    fracture_params,
+    frames,
+    out_dir,
+    device,
+    plot_every=10,
+):
+    material_family = fracture_params.get('material_family', 'rough_quasi_brittle')
+    driver = SurfaceCrackDriver(material_family=material_family)
+    state = make_fast_collapse_state(positions.shape[0], device)
+    damage = torch.zeros(positions.shape[0], dtype=positions.dtype, device=device)
+    opening = torch.zeros_like(damage)
+    visited = torch.zeros(positions.shape[0], dtype=torch.bool, device=device)
+    tips = torch.zeros_like(visited)
+
+    seed_center = driver.default_impact_center(positions)
+    seed_dist = torch.norm(positions - seed_center.unsqueeze(0), dim=1)
+    seed = torch.exp(-0.5 * (seed_dist / max(driver.params.impact_radius, 1e-6)) ** 2)
+    damage = torch.maximum(damage, 0.22 * seed.clamp(0.0, 1.0))
+
+    noise = torch.sin(
+        41.0 * positions[:, 0]
+        - 23.0 * positions[:, 1]
+        + 17.0 * positions[:, 2]
+    )
+    noise = (0.5 + 0.5 * noise).clamp(0.0, 1.0)
+
+    print(f"\n{'='*50}")
+    print(f"Running {frames} frames (vectorized surface collapse smoke)")
+    print(f"Family: {material_family}")
+    print(f"{'='*50}\n")
+
+    plot_every = max(1, int(plot_every))
+    first_split_frame = None
+    max_n_frags = 1
+    max_released_nodes = 0
+    t0 = time.time()
+
+    for frame in range(frames):
+        drive = driver.build(positions, frame, normals=normals)
+        growth = drive["growth_drive"].clamp(0.0, 1.0)
+        init_score = drive["init_score"].clamp(0.0, 1.0)
+        tip_threshold = torch.quantile(growth.detach(), 0.992)
+        tips = growth >= tip_threshold
+        visit_threshold = max(0.16, 0.72 - 0.006 * frame)
+        visited |= (growth >= visit_threshold)
+
+        collapse_phase = max(0.0, min(1.0, (frame - 18) / max(frames - 18, 1)))
+        global_damage = collapse_phase * (0.08 + 0.22 * noise)
+        damage = torch.maximum(damage, 0.18 * init_score)
+        damage = (
+            damage
+            + 0.060 * growth
+            + 0.018 * visited.float()
+            + 0.012 * tips.float()
+        ).clamp(0.0, 1.0)
+        damage = torch.maximum(damage, global_damage.clamp(0.0, 0.42))
+        opening = 0.045 * (damage ** 2)
+
+        labels, n_frags, created = update_fast_collapse_labels_from_fields(
+            positions=positions,
+            damage=damage,
+            opening=opening,
+            visited=visited,
+            tips=tips,
+            state=state,
+            fracture_params=fracture_params,
+            frame=frame,
+        )
+        if n_frags > 1 and first_split_frame is None:
+            first_split_frame = frame
+        max_n_frags = max(max_n_frags, n_frags)
+        max_released_nodes = max(max_released_nodes, int(state["released_nodes"]))
+
+        if frame % plot_every == 0 or frame == frames - 1:
+            render_positions = apply_fragment_motion_offsets(
+                positions=positions,
+                labels=labels,
+                state=state,
+                frame=frame,
+                fracture_params=fracture_params,
+            )
+            plot_fracture_frame(
+                render_positions,
+                damage,
+                frame,
+                out_dir,
+                file_prefix="surface_crack",
+                title_extra=f"  |  displaced n_frags={n_frags} released={state['released_nodes']}",
+                visited=visited,
+                tips=tips,
+                fragment_ids=labels,
+                n_fragments=n_frags,
+            )
+            plot_opening_frame(
+                render_positions,
+                opening,
+                frame,
+                out_dir,
+                title_extra=f"  |  vector_collapse",
+            )
+            if n_frags > 1:
+                plot_fragment_frame(
+                    render_positions,
+                    labels,
+                    frame,
+                    out_dir,
+                    title_extra=f"  |  released={state['released_nodes']} new={created}",
+                    file_prefix="surface_fragment",
+                )
+            elapsed = time.time() - t0
+            print(
+                f"Frame {frame:3d}/{frames} "
+                f"c_max={float(damage.max().item()):.4f} "
+                f"n_frags={n_frags} released={state['released_nodes']} "
+                f"elapsed={elapsed:.1f}s"
+            )
+
+    print(f"\n{'='*50}")
+    print("Vector collapse smoke complete")
+    print(f"Output: {out_dir}")
+    print(f"  family = {material_family}")
+    print(f"  first_split_frame = {first_split_frame}")
+    print(f"  max_n_frags = {max_n_frags}")
+    print(f"  max_released_nodes = {max_released_nodes}")
+    print(f"{'='*50}\n")
+
+
+def run_surface_only_smoke(
+    positions,
+    normals,
+    fracture_params,
+    frames,
+    out_dir,
+    device,
+    plot_every=5,
+    fragment_every=None,
+):
+    material_family = fracture_params.get('material_family', 'neutral_reference')
+    graph = GaussianGraph(
+        k=fracture_params.get('graph_k', 12),
+        sigma=fracture_params.get('graph_sigma', 0.03),
+        rebuild_every=fracture_params.get('graph_rebuild_every', 5),
+        device=str(device),
+    )
+    if normals is not None:
+        graph.set_normals(torch.nn.functional.normalize(normals, dim=-1))
+
+    fracture_field = make_surface_fracture_field(fracture_params, graph, device)
+    fracture_field.initialize(positions.shape[0])
+    fast_collapse = bool(fracture_params.get('collapse_fast_path', False))
+    fragment_manager = None if fast_collapse else make_fragment_manager(fracture_params, device)
+    fast_collapse_state = (
+        make_fast_collapse_state(positions.shape[0], device)
+        if fast_collapse else None
+    )
+    driver = SurfaceCrackDriver(material_family=material_family)
+    seed_center = driver.default_impact_center(positions)
+    fracture_field.seed_damage(
+        positions=positions,
+        center=seed_center,
+        radius=driver.params.impact_radius,
+        magnitude=float(fracture_params.get('impact_seed_magnitude', 0.18)),
+        H_multiplier=0.0,
+    )
+
+    print(f"\n{'='*50}")
+    print(f"Running {frames} frames (surface-only matplotlib smoke)")
+    print(f"Family: {material_family}")
+    if fast_collapse:
+        print("Mode: fast collapse release")
+    print(f"{'='*50}\n")
+
+    plot_every = max(1, int(plot_every))
+    detect_every = max(
+        1,
+        int(
+            fragment_every
+            if fragment_every is not None
+            else fracture_params.get('fragment_detect_every', 2)
+        ),
+    )
+
+    first_split_frame = None
+    max_n_frags = 1
+    max_cut_edges = 0
+    max_closure_candidate_count = 0
+    max_released_nodes = 0
+    t0 = time.time()
+
+    for frame in range(frames):
+        drive = driver.build(positions, frame, normals=normals)
+        fracture_field.update(
+            positions=positions,
+            init_score=drive["init_score"],
+            growth_drive=drive["growth_drive"],
+            growth_dir=drive["growth_dir"],
+            F_gaussian=None,
+            impact_center=drive["impact_center"],
+        )
+
+        n_frags = (
+            int(fragment_manager.n_fragments)
+            if fragment_manager is not None and fragment_manager.fragment_ids is not None
+            else 1
+        )
+        fast_fragment_ids = None
+        created_fast = 0
+        if fast_collapse:
+            fast_fragment_ids, n_frags, created_fast = update_fast_collapse_fragments(
+                positions=positions,
+                fracture_field=fracture_field,
+                state=fast_collapse_state,
+                fracture_params=fracture_params,
+                frame=frame,
+            )
+            max_released_nodes = max(
+                max_released_nodes,
+                int(fast_collapse_state["released_nodes"]),
+            )
+            if n_frags > 1 and first_split_frame is None:
+                first_split_frame = frame
+        elif fragment_manager is not None:
+            should_detect = (
+                fragment_manager.fragment_ids is None
+                or frame % detect_every == 0
+                or frame == frames - 1
+            )
+            if should_detect:
+                crack_front = fracture_field.crack_front
+                tip_mask = crack_front.tip_mask if crack_front is not None else None
+                recent_front_mask = None
+                if crack_front is not None and crack_front.visited_mask is not None:
+                    recent_front_mask = crack_front.visited_mask & (fracture_field.c > 0.12)
+                n_frags = fragment_manager.detect_fragments(
+                    graph,
+                    fracture_field.c,
+                    positions=positions,
+                    opening=fracture_field.a,
+                    active_tip_mask=tip_mask,
+                    recent_front_mask=recent_front_mask,
+                    crack_normal=fracture_field.n,
+                    crack_tangent=crack_front.growth_dir if crack_front is not None else None,
+                )
+                max_cut_edges = max(max_cut_edges, fragment_manager.last_cut_edges)
+                max_closure_candidate_count = max(
+                    max_closure_candidate_count,
+                    fragment_manager.last_closure_candidate_count,
+                )
+                if n_frags > 1 and first_split_frame is None:
+                    first_split_frame = frame
+
+        max_n_frags = max(max_n_frags, n_frags)
+
+        if frame % plot_every == 0 or frame == frames - 1:
+            crack_front = fracture_field.crack_front
+            plot_fracture_frame(
+                positions,
+                fracture_field.c,
+                frame,
+                out_dir,
+                file_prefix="surface_crack",
+                title_extra=f"  |  n_frags={n_frags}",
+                visited=crack_front.visited_mask if crack_front is not None else None,
+                tips=crack_front.tip_mask if crack_front is not None else None,
+                fragment_ids=(
+                    fast_fragment_ids
+                    if fast_collapse
+                    else fragment_manager.fragment_ids if fragment_manager is not None else None
+                ),
+                n_fragments=n_frags,
+            )
+            plot_opening_frame(
+                positions,
+                fracture_field.a,
+                frame,
+                out_dir,
+                title_extra=f"  |  family={material_family}",
+            )
+            if fast_collapse and n_frags > 1:
+                plot_fragment_frame(
+                    positions,
+                    fast_fragment_ids,
+                    frame,
+                    out_dir,
+                    title_extra=(
+                        f"  |  released={fast_collapse_state['released_nodes']} "
+                        f"new={created_fast}"
+                    ),
+                    file_prefix="surface_fragment",
+                )
+            if (not fast_collapse) and fragment_manager is not None:
+                plot_cut_debug_frame(
+                    positions,
+                    graph,
+                    fragment_manager.last_cut_core_mask,
+                    fragment_manager.last_cut_edge_mask,
+                    frame,
+                    out_dir,
+                    title_extra=(
+                        f"  cut_edges={fragment_manager.last_cut_edges} "
+                        f"cross={fragment_manager.last_cross_edge_breaks}"
+                    ),
+                )
+                if n_frags > 1:
+                    plot_fragment_frame(
+                        positions,
+                        fragment_manager.fragment_ids,
+                        frame,
+                        out_dir,
+                        title_extra=f"  |  family={material_family}",
+                        file_prefix="surface_fragment",
+                    )
+                if fragment_manager.last_closure_candidate_count > 0 or frame == frames - 1:
+                    plot_closure_debug_frame(
+                        positions,
+                        graph,
+                        fragment_manager.last_closure_candidate_mask,
+                        fragment_manager.last_closure_boundary_mask,
+                        frame,
+                        out_dir,
+                        title_extra=(
+                            f"  closure={fragment_manager.last_closure_candidate_count} "
+                            f"score={fragment_manager.last_closure_score_max:.2f}"
+                        ),
+                    )
+
+        if frame % plot_every == 0 or frame == frames - 1:
+            elapsed = time.time() - t0
+            print(
+                f"Frame {frame:3d}/{frames} "
+                f"c_max={float(fracture_field.c.max().item()):.4f} "
+                f"n_frags={n_frags} cut_edges={max_cut_edges} "
+                f"released={max_released_nodes} "
+                f"elapsed={elapsed:.1f}s"
+            )
+
+    print(f"\n{'='*50}")
+    print("Surface-only smoke complete")
+    print(f"Output: {out_dir}")
+    print(f"  family = {material_family}")
+    print(f"  first_split_frame = {first_split_frame}")
+    print(f"  max_n_frags = {max_n_frags}")
+    print(f"  max_cut_edges = {max_cut_edges}")
+    print(f"  max_closure_candidate_count = {max_closure_candidate_count}")
+    print(f"  max_released_nodes = {max_released_nodes}")
+    print(f"{'='*50}\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Manifold fracture smoke test")
     parser.add_argument("--config", default="configs/gravity_drop_manifold.yaml")
     parser.add_argument("--frames", type=int, default=120)
-    parser.add_argument("--fast", action="store_true", help="50k particles, 64 grid")
+    parser.add_argument(
+        "--particles",
+        type=int,
+        default=50000,
+        help="Particle budget for matplotlib smoke tests (default: 50k)",
+    )
+    parser.add_argument(
+        "--max-particles",
+        type=int,
+        default=150000,
+        help="Hard cap for smoke-test particles (default: 150k)",
+    )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Compatibility alias for --particles 50000 --mpm-grids 64 --substeps 8",
+    )
+    parser.add_argument("--mpm-grids", type=int, default=64)
+    parser.add_argument("--substeps", type=int, default=8)
+    parser.add_argument(
+        "--surface-only",
+        action="store_true",
+        help="Run the new surface graph driver without MPM substeps",
+    )
+    parser.add_argument(
+        "--plot-every",
+        type=int,
+        default=5,
+        help="Matplotlib diagnostic frame interval for smoke tests",
+    )
+    parser.add_argument(
+        "--fragment-every",
+        type=int,
+        default=None,
+        help="Override fragment connected-component detection interval",
+    )
     parser.add_argument("--out", default="output/smoke_test")
     parser.add_argument("--clip", type=str, default=None, help="Material prompt for CLIP-driven priors")
     parser.add_argument("--clip-model", type=str, default="ViT-B/32")
     parser.add_argument("--db-path", type=str, default=None)
+    parser.add_argument(
+        "--family",
+        choices=sorted(FAMILY_RUNTIME_PRESETS.keys()),
+        default=None,
+        help="Direct material-family runtime preset override for fracture smoke tests",
+    )
+    parser.add_argument(
+        "--collapse",
+        action="store_true",
+        help="Surface-only stress test preset that aggressively releases fragments",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out)
@@ -463,10 +1330,16 @@ def main():
 
     # --- Config ---
     config = load_config(args.config)
-    if args.fast:
-        OmegaConf.update(config, "particles.target_count", 50000)
-        OmegaConf.update(config, "mpm.num_grids", 64)
-        OmegaConf.update(config, "rendering.physics_substeps", 8)
+    particle_budget = 50000 if args.fast else int(args.particles)
+    particle_budget = max(1000, min(particle_budget, int(args.max_particles)))
+    OmegaConf.update(config, "particles.target_count", particle_budget)
+    OmegaConf.update(config, "mpm.num_grids", int(args.mpm_grids))
+    OmegaConf.update(config, "rendering.physics_substeps", int(args.substeps))
+    print(
+        f"[SmokeTest] particle_budget={particle_budget} "
+        f"max_particles={int(args.max_particles)} "
+        f"grid={int(args.mpm_grids)} substeps={int(args.substeps)}"
+    )
 
     material_prior = None
     if args.clip:
@@ -512,6 +1385,13 @@ def main():
         )
         print(f"  Family: {material_prior['family']}")
 
+    if args.family:
+        config = apply_overrides_dict(config, FAMILY_RUNTIME_PRESETS[args.family])
+        print(f"[SmokeTest:family] Applied family preset: {args.family}")
+    if args.collapse:
+        config = apply_overrides_dict(config, SURFACE_COLLAPSE_OVERRIDES)
+        print("[SmokeTest:collapse] Applied aggressive surface-collapse preset")
+
     config = resolve_material_preset(config)
     config = validate_l0(config)
 
@@ -522,10 +1402,15 @@ def main():
         torch.cuda.manual_seed_all(42)
 
     print("Generating point clouds...")
+    surface_sample_ratio = (
+        1.0
+        if args.surface_only
+        else config.particles.get('surface_ratio', 0.5)
+    )
     converter = MeshToPointCloudConverter(
         mesh_path=config.mesh.path,
         target_particle_count=config.particles.target_count,
-        surface_sample_ratio=config.particles.get('surface_ratio', 0.5),
+        surface_sample_ratio=surface_sample_ratio,
         use_poisson=config.particles.get('use_poisson_sampling', False),
         normalize_to_unit_cube=config.particles.get('normalize_to_unit_cube', True),
     )
@@ -535,6 +1420,47 @@ def main():
     N_total = volume_points.shape[0]
     N_surf = surface_mask_np.sum()
     print(f"Particles: {N_total} total, {N_surf} surface")
+
+    # --- Fracture params ---
+    pf_params = OmegaConf.to_container(config.phase_field, resolve=True)
+    manifold_cfg = OmegaConf.to_container(
+        config.get('manifold', {}), resolve=True) if hasattr(config, 'manifold') else {}
+    fracture_params = {
+        **pf_params,
+        **manifold_cfg,
+        "Gc": float(config.material.Gc),
+        "l0": float(config.material.l0),
+    }
+
+    if args.surface_only:
+        x_surf = torch.from_numpy(np.asarray(surface_pcd.points).copy()).float().to(device)
+        n_surf = torch.from_numpy(np.asarray(surface_pcd.normals).copy()).float().to(device)
+        print(
+            f"Surface-only mode: using {x_surf.shape[0]} surface graph nodes "
+            f"and no volume/MPM particles"
+        )
+        if fracture_params.get('collapse_vector_path', False):
+            run_vector_collapse_smoke(
+                positions=x_surf,
+                normals=n_surf,
+                fracture_params=fracture_params,
+                frames=args.frames,
+                out_dir=out_dir,
+                device=device,
+                plot_every=args.plot_every,
+            )
+            return
+        run_surface_only_smoke(
+            positions=x_surf,
+            normals=n_surf,
+            fracture_params=fracture_params,
+            frames=args.frames,
+            out_dir=out_dir,
+            device=device,
+            plot_every=args.plot_every,
+            fragment_every=args.fragment_every,
+        )
+        return
 
     # --- MPM + Elasticity ---
     mpm_model = create_mpm_model(config, volume_pcd, device)
@@ -579,12 +1505,6 @@ def main():
         diffuse_damage_strength=float(gs_cfg.get('diffuse_damage_strength', 0.12)),
     )
     surface_mask = torch.from_numpy(surface_mask_np).bool().to(device)
-
-    # --- Fracture params ---
-    pf_params = OmegaConf.to_container(config.phase_field, resolve=True)
-    manifold_cfg = OmegaConf.to_container(
-        config.get('manifold', {}), resolve=True) if hasattr(config, 'manifold') else {}
-    fracture_params = {**pf_params, **manifold_cfg}
 
     # --- Seismic ---
     seismic_params = {}

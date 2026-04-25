@@ -89,7 +89,8 @@ class MaterialPredictor:
                  clip_model: str = "ViT-B/32",
                  transformer_checkpoint: str = None,
                  k: int = 5,
-                 device: str = None):
+                 device: str = None,
+                 keyword_rerank: bool = True):
         """
         Args:
             mode: "clip_knn" or "clip_transformer"
@@ -98,9 +99,14 @@ class MaterialPredictor:
             transformer_checkpoint: Path to trained transformer weights
             k: Number of neighbors for KNN
             device: torch device
+            keyword_rerank: Small lexical rerank on top of CLIP similarity.
+                This keeps CLIP as the semantic retriever while preventing
+                obvious material words such as "glass" from being displaced by
+                visually similar but physically different materials.
         """
         self.mode = mode
         self.k = k
+        self.keyword_rerank = bool(keyword_rerank)
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -148,9 +154,12 @@ class MaterialPredictor:
 
         # Cosine similarity with all DB entries
         similarities = (query_emb @ self.db_embeddings.T).squeeze(0)  # (N,)
-        topk = similarities.topk(k)
+        rerank_bonus = self._keyword_rerank_bonus(text) if self.keyword_rerank else torch.zeros_like(similarities)
+        retrieval_scores = similarities + rerank_bonus
+        topk = retrieval_scores.topk(k)
         topk_idx = topk.indices
         topk_scores = topk.values
+        topk_raw_scores = similarities[topk_idx]
 
         # Get parameter arrays
         params_all = self.db.get_full_params_array()  # (N, 4): E, Gc, nu, density
@@ -166,7 +175,79 @@ class MaterialPredictor:
 
         result["top_k_names"] = topk_names
         result["top_k_scores"] = topk_scores.cpu().numpy().tolist()
+        result["top_k_raw_scores"] = topk_raw_scores.cpu().numpy().tolist()
+        result["top_k_rerank_bonus"] = rerank_bonus[topk_idx].cpu().numpy().tolist()
         return result
+
+    def _keyword_rerank_bonus(self, text: str) -> torch.Tensor:
+        """Small query-aware prior for explicit material words.
+
+        CLIP is good at broad visual semantics, but transparent or brittle
+        objects often sit close together. A bounded bonus lets explicit words
+        such as "glass", "rubber", or "sandstone" win retrieval without
+        replacing CLIP with a brittle string matcher.
+        """
+        q = str(text).lower()
+        bonuses = np.zeros(len(self.db), dtype=np.float32)
+
+        def has_any(words):
+            return any(word in q for word in words)
+
+        for i, entry in enumerate(self.db.entries):
+            name = entry.name.lower()
+            category = entry.category.lower()
+            bonus = 0.0
+
+            if has_any(("glass", "bottle", "pane", "window", "shatter")):
+                if category == "glass":
+                    bonus += 0.085
+                if "glass" in name:
+                    bonus += 0.030
+                if ("acrylic" in name or "pmma" in name) and not has_any(("acrylic", "pmma", "plexiglass")):
+                    bonus -= 0.025
+
+            if has_any(("porcelain", "ceramic", "mug", "china")):
+                if category == "ceramic":
+                    bonus += 0.070
+                if any(token in name for token in ("porcelain", "stoneware", "china", "ceramic")):
+                    bonus += 0.040
+
+            if has_any(("concrete", "cement", "mortar")):
+                if category == "concrete":
+                    bonus += 0.085
+                if any(token in name for token in ("concrete", "mortar", "cement")):
+                    bonus += 0.035
+
+            if has_any(("sandstone", "limestone", "marble", "stone", "rock")):
+                if category == "stone":
+                    bonus += 0.060
+                if "sandstone" in q and "sandstone" in name:
+                    bonus += 0.095
+
+            if has_any(("rubber", "latex", "elastomer", "elastic")):
+                if any(token in name for token in ("rubber", "latex", "neoprene", "silicone")):
+                    bonus += 0.120
+            elif has_any(("soft", "deforming", "deform")) and "rubber" in name:
+                bonus += 0.055
+
+            if has_any(("ice", "frozen")) and (category == "ice" or "ice" in name):
+                bonus += 0.095
+
+            if has_any(("wood", "timber", "bamboo")):
+                if category == "wood":
+                    bonus += 0.080
+                if any(token in name for token in ("wood", "bamboo", "oak", "pine")):
+                    bonus += 0.030
+
+            if has_any(("metal", "steel", "aluminum", "iron")):
+                if category == "metal":
+                    bonus += 0.080
+                if any(token in name for token in ("steel", "aluminum", "iron")):
+                    bonus += 0.035
+
+            bonuses[i] = np.float32(np.clip(bonus, -0.04, 0.16))
+
+        return torch.as_tensor(bonuses, dtype=torch.float32, device=self.device)
 
     def _predict_knn(self, scores: torch.Tensor, topk_params: np.ndarray) -> dict:
         """Weighted average of top-K in log-space for E, Gc."""
