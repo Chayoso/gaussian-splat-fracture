@@ -114,6 +114,7 @@ class ManifoldSimulator:
             growth_gain=fp.get('growth_gain', 1.0),
             branching_bias=fp.get('branching_bias', 0.20),
             anisotropy_strength=fp.get('anisotropy_strength', 0.10),
+            crack_style=fp.get('sentence_style', fp.get('crack_style', 'material_default')),
             material_family=fp.get('material_family', 'neutral_reference'),
             device=device_str,
         )
@@ -196,6 +197,8 @@ class ManifoldSimulator:
             open_crack_release_enable=fp.get('open_crack_release_enable', True),
             open_crack_release_threshold=fp.get('open_crack_release_threshold', 0.0),
             open_crack_release_max_patches=fp.get('open_crack_release_max_patches', 2),
+            crack_style=fp.get('sentence_style', fp.get('crack_style', 'material_default')),
+            brittle_release_intensity=fp.get('brittle_release_intensity', 1.0),
             material_family=fp.get('material_family', 'neutral_reference'),
             device=device_str,
         ) if frag_enabled else None
@@ -210,6 +213,7 @@ class ManifoldSimulator:
         self.fragment_event_boost = float(fp.get('fragment_event_boost', 1.0))
         self._fragment_activation_frame = -1
         self.material_family = str(fp.get('material_family', 'neutral_reference'))
+        self.crack_style = str(fp.get('sentence_style', fp.get('crack_style', 'material_default')))
         self.shard_enable = False
         self.shard_count_scale = 0.0
         self.fragment_offset_gain = float(fp.get('fragment_offset_gain', 1.0))
@@ -1070,6 +1074,78 @@ class ManifoldSimulator:
 
         return growth_dir
 
+    def _apply_sentence_crack_style_drive(
+        self,
+        x_surf_world: Tensor,
+        init_score: Tensor,
+        growth_drive: Tensor,
+        impact_center_world: Optional[Tensor],
+    ) -> tuple[Tensor, Tensor]:
+        """Shape impact drive into sentence-level crack motifs.
+
+        This is a graphics-side controller layered on top of physical stress:
+        it only biases where the surface crack front can run. Material priors
+        still control whether those cracks can detach fragments.
+        """
+        style = self.crack_style
+        if (
+            impact_center_world is None
+            or style in {"material_default", "diffuse_microcrack"}
+            or x_surf_world.numel() == 0
+        ):
+            return init_score, growth_drive
+
+        rel = x_surf_world - impact_center_world.unsqueeze(0)
+        extent = x_surf_world.max(dim=0).values - x_surf_world.min(dim=0).values
+        diag = extent.norm().clamp(min=1e-6)
+        planar = rel[:, :2]
+        planar_r = planar.norm(dim=1).clamp(min=1e-8)
+        r_norm = (planar_r / (0.45 * diag)).clamp(0.0, 1.0)
+        theta = torch.atan2(planar[:, 1], planar[:, 0])
+
+        if style == "radial_shatter":
+            ray_count = 10.0
+            phase = 0.45
+            ray = (0.5 + 0.5 * torch.cos(ray_count * theta + phase)).clamp(0.0, 1.0)
+            ray = ray.pow(3.0)
+            near = torch.exp(-0.5 * (planar_r / (0.13 * diag)).pow(2.0))
+            far_gain = (0.28 + 0.72 * r_norm).clamp(0.0, 1.0)
+            ray_drive = (ray * far_gain + 0.22 * near).clamp(0.0, 1.0)
+            growth_drive = torch.maximum(growth_drive, 0.78 * ray_drive)
+            init_score = torch.maximum(init_score, 0.48 * near * (0.45 + 0.55 * ray))
+        elif style == "spiderweb_branching":
+            ray = (0.5 + 0.5 * torch.cos(8.0 * theta + 0.25)).clamp(0.0, 1.0).pow(2.0)
+            rings = (0.5 + 0.5 * torch.cos(28.0 * r_norm + 0.35)).clamp(0.0, 1.0).pow(2.0)
+            web = torch.maximum(ray, 0.72 * rings) * (0.18 + 0.82 * r_norm)
+            near = torch.exp(-0.5 * (planar_r / (0.16 * diag)).pow(2.0))
+            growth_drive = torch.maximum(growth_drive, 0.64 * web.clamp(0.0, 1.0))
+            init_score = torch.maximum(init_score, 0.36 * near * (0.55 + 0.45 * ray))
+        elif style == "single_smooth":
+            angle = torch.tensor(0.35, dtype=x_surf_world.dtype, device=x_surf_world.device)
+            axis = torch.stack([torch.cos(angle), torch.sin(angle)])
+            tangent = planar @ axis
+            cross = planar[:, 0] * axis[1] - planar[:, 1] * axis[0]
+            width = 0.045 * diag
+            line = torch.exp(-0.5 * (cross / width).pow(2.0))
+            forward = (tangent > (-0.10 * diag)).float()
+            line_drive = line * forward * (0.25 + 0.75 * r_norm)
+            growth_drive = torch.maximum(0.38 * growth_drive, 0.70 * line_drive)
+            near = torch.exp(-0.5 * (planar_r / (0.12 * diag)).pow(2.0))
+            init_score = torch.maximum(init_score, 0.36 * near * line)
+        elif style == "chunky_crumble":
+            noise = torch.sin(
+                31.0 * x_surf_world[:, 0]
+                - 17.0 * x_surf_world[:, 1]
+                + 23.0 * x_surf_world[:, 2]
+            )
+            grain = (0.5 + 0.5 * noise).clamp(0.0, 1.0)
+            broad = torch.exp(-0.5 * (planar_r / (0.26 * diag)).pow(2.0))
+            crumble = (0.45 * broad + 0.55 * grain * (0.25 + 0.75 * r_norm)).clamp(0.0, 1.0)
+            growth_drive = torch.maximum(growth_drive, 0.58 * crumble)
+            init_score = torch.maximum(init_score, 0.28 * broad * (0.55 + 0.45 * grain))
+
+        return init_score.clamp(0.0, 1.0), growth_drive.clamp(0.0, 1.0)
+
     @torch.no_grad()
     def _step_fracture(self):
         """
@@ -1128,6 +1204,12 @@ class ManifoldSimulator:
         growth_dir = self._build_growth_direction(
             stress_dir,
             x_surf_world,
+            impact_center_world,
+        )
+        init_score, growth_drive = self._apply_sentence_crack_style_drive(
+            x_surf_world,
+            init_score,
+            growth_drive,
             impact_center_world,
         )
 
@@ -1781,6 +1863,14 @@ class ManifoldSimulator:
         physical_mean_detached_distance = 0.0
         physical_fragment_drop = 0.0
         split_event_age = -1
+        z_min = 0.0
+        z_com = 0.0
+        v_com_z = 0.0
+        if self.x_mpm is not None:
+            z_min = float(self.x_mpm[:, 2].min().item())
+            z_com = float(self.x_mpm[:, 2].mean().item())
+        if self._v_com is not None:
+            v_com_z = float(self._v_com[2].item())
         render_state = self._last_render_state or {}
         if self.fragmentation_active and self._fragment_activation_frame >= 0:
             split_event_age = max(self.frame_count - self._fragment_activation_frame, 0)
@@ -1846,6 +1936,12 @@ class ManifoldSimulator:
         return {
             "frame": self.frame_count,
             "time": self.mpm.time,
+            "z_min": z_min,
+            "z_com": z_com,
+            "v_com_z": v_com_z,
+            "gravity_drop": bool(self._gravity_drop),
+            "gravity_contacted": bool(self._gravity_drop_contacted),
+            "gravity_ground_z": float(self._gravity_drop_ground_z),
             "c_max": c_max,
             "c_mean": c_mean,
             "n_cracked": n_cracked,
@@ -1902,6 +1998,12 @@ class ManifoldSimulator:
                                    if self.fragment_manager else 0.0),
             "closure_candidate_sizes": (self.fragment_manager.last_closure_candidate_sizes
                                          if self.fragment_manager else []),
+            "open_release_patches": (self.fragment_manager.last_open_release_patches
+                                      if self.fragment_manager else 0),
+            "open_release_nodes": (self.fragment_manager.last_open_release_nodes
+                                   if self.fragment_manager else 0),
+            "open_release_score_max": (self.fragment_manager.last_open_release_score_max
+                                       if self.fragment_manager else 0.0),
             "top_component_sizes": (self.fragment_manager.last_top_component_sizes
                                        if self.fragment_manager else []),
             "detached_distance": detached_distance,

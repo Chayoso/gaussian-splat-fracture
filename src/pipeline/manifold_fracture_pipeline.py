@@ -215,6 +215,10 @@ class ManifoldFracturePipeline:
             topk_entries,
             raw_params["top_k_scores"],
         )
+        material_prior = self._prior_adapter.apply_sentence_style(
+            material_prior,
+            text,
+        )
         return raw_params, material_prior
 
     def _run_clip(

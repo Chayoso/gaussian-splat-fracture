@@ -39,6 +39,7 @@ class CrackFront:
         growth_gain: float = 1.00,
         branching_bias: float = 0.20,
         anisotropy_strength: float = 0.10,
+        crack_style: str = "material_default",
         material_family: str = "neutral_reference",
         device: str = "cuda",
     ):
@@ -63,6 +64,7 @@ class CrackFront:
         self.growth_gain = growth_gain
         self.branching_bias = branching_bias
         self.anisotropy_strength = anisotropy_strength
+        self.crack_style = str(crack_style)
         self.material_family = str(material_family)
         self.device = torch.device(device)
 
@@ -74,7 +76,7 @@ class CrackFront:
 
     def _family_settings(self) -> dict:
         if self.material_family == "sharp_brittle":
-            return {
+            settings = {
                 "front_enabled": True,
                 "branch_scale": 0.35,
                 "continuity_scale": 1.35,
@@ -96,6 +98,43 @@ class CrackFront:
                 "closure_max_dist_scale": 0.22,
                 "closure_height_scale": 0.10,
             }
+            if self.crack_style == "radial_shatter":
+                settings.update({
+                    "branch_scale": 1.05,
+                    "continuity_scale": 0.92,
+                    "align_scale": 1.05,
+                    "revisit_penalty": 0.72,
+                    "successor_cap": 4,
+                    "seed_spacing_scale": 0.55,
+                    "lateral_branch_bonus": 0.20,
+                    "lateral_branch_threshold": 0.22,
+                    "branch_persist_steps": 1,
+                    "branch_persist_lateral": 0.28,
+                    "branch_extra_branches": 2,
+                    "closure_weight": 0.14,
+                    "closure_branch_threshold": 0.34,
+                    "closure_branch_bonus": 0.16,
+                    "closure_extra_branches": 2,
+                })
+            elif self.crack_style == "spiderweb_branching":
+                settings.update({
+                    "branch_scale": 0.95,
+                    "continuity_scale": 0.98,
+                    "align_scale": 1.00,
+                    "revisit_penalty": 0.70,
+                    "successor_cap": 4,
+                    "seed_spacing_scale": 0.60,
+                    "lateral_branch_bonus": 0.24,
+                    "lateral_branch_threshold": 0.20,
+                    "branch_persist_steps": 1,
+                    "branch_persist_lateral": 0.24,
+                    "branch_extra_branches": 2,
+                    "closure_weight": 0.20,
+                    "closure_branch_threshold": 0.30,
+                    "closure_branch_bonus": 0.18,
+                    "closure_extra_branches": 2,
+                })
+            return settings
         if self.material_family == "brittle_moderate":
             return {
                 "front_enabled": True,
@@ -470,13 +509,13 @@ class CrackFront:
             order = keep_score.argsort(descending=True)
             keep = keep[order]
             branch_topk = 1
+            branch_drive_threshold = max(
+                self.branch_drive_threshold - 0.58 * self.branching_bias * branch_scale,
+                0.08,
+            )
             if keep.numel() > 1 and successor_cap > 1 and can_branch:
                 second_drive = local_drive[keep[1]]
                 branch_ratio = max(self.branch_score_ratio - 0.30 * self.branching_bias * branch_scale, 0.54)
-                branch_drive_threshold = max(
-                    self.branch_drive_threshold - 0.58 * self.branching_bias * branch_scale,
-                    0.08,
-                )
                 if (
                     keep_score[order[1]] >= branch_ratio * keep_score[order[0]]
                     and second_drive >= branch_drive_threshold

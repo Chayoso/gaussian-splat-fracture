@@ -277,6 +277,181 @@ FAMILY_NAMES = (
     "neutral_reference",
 )
 
+
+FRACTURE_PRIOR_BOUNDS = {
+    "tau_init": (0.12, 0.90),
+    "growth_gain": (0.20, 1.90),
+    "band_width": (1.00, 3.40),
+    "band_fill_gain": (0.08, 1.10),
+    "open_gain": (0.08, 1.90),
+    "split_threshold": (0.22, 0.95),
+    "edge_break_rate": (0.10, 1.90),
+    "branching_bias": (0.00, 0.95),
+    "anisotropy_strength": (0.02, 0.95),
+}
+
+
+SENTENCE_STYLE_RULES = (
+    {
+        "name": "diffuse_microcrack",
+        "tokens": (
+            "diffuse", "microcrack", "micro crack", "tiny crack",
+            "tiny surface", "scratch", "scratches", "shallow",
+        ),
+        "fracture_mult": {
+            "tau_init": 1.55,
+            "growth_gain": 0.42,
+            "band_width": 1.65,
+            "band_fill_gain": 1.55,
+            "open_gain": 0.22,
+            "split_threshold": 1.45,
+            "edge_break_rate": 0.26,
+            "branching_bias": 0.35,
+            "anisotropy_strength": 0.55,
+        },
+        "runtime": {
+            "manifold.successor_topk": 0,
+            "manifold.max_branching_tips": 0,
+            "manifold.branch_drive_threshold": 0.99,
+            "manifold.front_threshold": 0.98,
+            "manifold.open_crack_release_enable": False,
+            "manifold.brittle_release_intensity": 0.0,
+            "gaussian_splatting.crack_gap_fraction": 0.08,
+            "gaussian_splatting.crack_opacity_reduction": 0.16,
+        },
+    },
+    {
+        "name": "spiderweb_branching",
+        "tokens": (
+            "spiderweb", "spider web", "branching", "branched",
+            "network", "web cracks", "wide branching",
+        ),
+        "fracture_mult": {
+            "tau_init": 0.92,
+            "growth_gain": 1.14,
+            "band_width": 1.10,
+            "band_fill_gain": 1.18,
+            "open_gain": 1.02,
+            "split_threshold": 0.90,
+            "edge_break_rate": 1.12,
+            "branching_bias": 4.20,
+            "anisotropy_strength": 0.68,
+        },
+        "runtime": {
+            "manifold.max_seed_points": 8,
+            "manifold.seed_quantile": 0.988,
+            "manifold.min_seed_spacing": 0.024,
+            "manifold.successor_topk": 3,
+            "manifold.max_branching_tips": 24,
+            "manifold.branch_score_ratio": 0.74,
+            "manifold.branch_drive_threshold": 0.22,
+            "manifold.branching_bias": 0.78,
+            "manifold.drive_quantile": 0.58,
+            "manifold.open_crack_release_max_patches": 6,
+            "manifold.open_crack_release_threshold": 0.43,
+            "manifold.brittle_release_intensity": 1.25,
+        },
+    },
+    {
+        "name": "radial_shatter",
+        "tokens": (
+            "radial", "many sharp", "shattering", "shatter",
+            "many cracks", "starburst",
+        ),
+        "fracture_mult": {
+            "tau_init": 0.88,
+            "growth_gain": 1.22,
+            "band_width": 0.94,
+            "band_fill_gain": 1.05,
+            "open_gain": 1.25,
+            "split_threshold": 0.82,
+            "edge_break_rate": 1.24,
+            "branching_bias": 2.80,
+            "anisotropy_strength": 0.82,
+        },
+        "runtime": {
+            "manifold.max_seed_points": 10,
+            "manifold.seed_quantile": 0.986,
+            "manifold.min_seed_spacing": 0.020,
+            "manifold.successor_topk": 4,
+            "manifold.max_branching_tips": 32,
+            "manifold.branch_score_ratio": 0.80,
+            "manifold.branch_drive_threshold": 0.18,
+            "manifold.branching_bias": 0.90,
+            "manifold.min_successor_score": 0.12,
+            "manifold.drive_quantile": 0.54,
+            "manifold.open_crack_release_max_patches": 16,
+            "manifold.open_crack_release_threshold": 0.34,
+            "manifold.brittle_release_intensity": 1.70,
+            "manifold.fragment_persistent_min_size": 3,
+            "manifold.fragment_render_min_size": 3,
+            "manifold.fragment_physical_min_size": 3,
+            "manifold.fragment_physical_overlap_threshold": 0.08,
+            "manifold.fragment_physical_release_velocity": 0.018,
+        },
+    },
+    {
+        "name": "chunky_crumble",
+        "tokens": (
+            "crumbling", "crumble", "chunks", "chunk", "granular",
+            "gritty", "rough pieces", "irregular chunks",
+        ),
+        "fracture_mult": {
+            "tau_init": 0.94,
+            "growth_gain": 1.04,
+            "band_width": 1.25,
+            "band_fill_gain": 1.22,
+            "open_gain": 0.92,
+            "split_threshold": 0.92,
+            "edge_break_rate": 1.20,
+            "branching_bias": 1.45,
+            "anisotropy_strength": 0.78,
+        },
+        "runtime": {
+            "manifold.max_seed_points": 6,
+            "manifold.seed_quantile": 0.990,
+            "manifold.min_seed_spacing": 0.030,
+            "manifold.successor_topk": 3,
+            "manifold.max_branching_tips": 28,
+            "manifold.branch_score_ratio": 0.76,
+            "manifold.branch_drive_threshold": 0.24,
+            "manifold.branching_bias": 0.82,
+            "manifold.open_crack_release_max_patches": 8,
+            "manifold.open_crack_release_threshold": 0.36,
+            "manifold.brittle_release_intensity": 1.35,
+        },
+    },
+    {
+        "name": "single_smooth",
+        "tokens": (
+            "one long", "single", "smooth", "clean fracture",
+            "clean crack", "clean split", "fracture line", "split in half",
+        ),
+        "fracture_mult": {
+            "tau_init": 1.12,
+            "growth_gain": 0.92,
+            "band_width": 0.78,
+            "band_fill_gain": 0.62,
+            "open_gain": 1.16,
+            "split_threshold": 0.92,
+            "edge_break_rate": 0.76,
+            "branching_bias": 0.18,
+            "anisotropy_strength": 1.85,
+        },
+        "runtime": {
+            "manifold.successor_topk": 1,
+            "manifold.max_branching_tips": 2,
+            "manifold.branch_score_ratio": 0.99,
+            "manifold.branch_drive_threshold": 0.88,
+            "manifold.drive_quantile": 0.86,
+            "manifold.damage_spread": 0.18,
+            "manifold.open_crack_release_max_patches": 2,
+            "manifold.open_crack_release_threshold": 0.44,
+            "manifold.brittle_release_intensity": 0.90,
+        },
+    },
+)
+
 NAME_FAMILY_OVERRIDES = {
     "rubber": "diffuse_damage",
     "latex": "diffuse_damage",
@@ -801,6 +976,60 @@ class MaterialPriorAdapter:
         weights = np.exp(logits)
         weights /= np.maximum(weights.sum(), 1e-12)
         return weights
+
+    @staticmethod
+    def _clamp_fracture_prior(prior: Dict[str, float]) -> Dict[str, float]:
+        out = dict(prior)
+        for key, (lo, hi) in FRACTURE_PRIOR_BOUNDS.items():
+            if key in out:
+                out[key] = _clamp(float(out[key]), lo, hi)
+        return out
+
+    @staticmethod
+    def sentence_style_for_text(text: str) -> Dict[str, object]:
+        q = str(text or "").lower()
+        for rule in SENTENCE_STYLE_RULES:
+            if any(token in q for token in rule["tokens"]):
+                return rule
+        return {"name": "material_default", "fracture_mult": {}, "runtime": {}}
+
+    def apply_sentence_style(
+        self,
+        material_prior: Dict[str, object],
+        text: str,
+    ) -> Dict[str, object]:
+        """Apply crack-shape wording on top of material CLIP retrieval.
+
+        The CLIP DB is intentionally material-centric, so shape phrases such as
+        "single smooth crack" or "spiderweb cracks" need a small semantic style
+        adapter after material retrieval.
+        """
+        style = self.sentence_style_for_text(text)
+        style_name = str(style.get("name", "material_default"))
+        if style_name == "material_default":
+            out = dict(material_prior)
+            runtime = dict(material_prior.get("runtime", {}))
+            runtime["manifold.sentence_style"] = style_name
+            out["runtime"] = runtime
+            out["sentence_style"] = style_name
+            return out
+
+        fracture = dict(material_prior["fracture"])
+        for key, mult in dict(style.get("fracture_mult", {})).items():
+            if key in fracture:
+                fracture[key] = float(fracture[key]) * float(mult)
+        fracture = self._clamp_fracture_prior(fracture)
+
+        family = str(material_prior.get("family", "neutral_reference"))
+        runtime = self.fracture_prior_to_runtime_overrides(fracture, family)
+        runtime.update(dict(style.get("runtime", {})))
+        runtime["manifold.sentence_style"] = style_name
+
+        out = dict(material_prior)
+        out["fracture"] = fracture
+        out["runtime"] = runtime
+        out["sentence_style"] = style_name
+        return out
 
     def style_for_entry(self, entry: MaterialEntry) -> Dict[str, float]:
         style = dict(DEFAULT_STYLE)

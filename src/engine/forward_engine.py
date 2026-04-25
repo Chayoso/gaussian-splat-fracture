@@ -129,6 +129,9 @@ class ForwardEngine:
             OmegaConf.update(config, "simulation.save_frames", False)
 
         # Parameter-dependent setup
+        self.last_simulator = None
+        self.last_stats_history = []
+        self.last_config = config
         mpm_model = create_mpm_model(config, self._volume_pcd, self.device)
         loading_params = configure_loading(config, mpm_model, self.device)
         elasticity = create_elasticity_model(config, self.device)
@@ -136,6 +139,7 @@ class ForwardEngine:
 
         simulator = self._create_simulator(config, mpm_model, gaussians,
                                             elasticity, loading_params)
+        self.last_simulator = simulator
 
         # Set initial normals
         if self._volume_normals_np is not None:
@@ -458,6 +462,8 @@ class ForwardEngine:
 
         total_frames = config.rendering.total_frames
         frames_out = []
+        stats_history = []
+        self.last_stats_history = stats_history
         render_last_only = bool(config.rendering.get('render_last_only', False))
         render_every = max(int(config.rendering.get('render_every', 1) or 1), 1)
         render_frames_cfg = config.rendering.get('render_frames', None)
@@ -523,6 +529,11 @@ class ForwardEngine:
             simulator._render_frame = frame
             # Physics step (including frame 0 to sync Gaussian positions)
             simulator.step_rendering()
+            if hasattr(simulator, "get_statistics"):
+                stats = dict(simulator.get_statistics())
+                stats["loop_frame"] = int(frame)
+                stats_history.append(stats)
+                self.last_stats_history = stats_history
 
             # Auto-detect impact frame for checkpointing
             if (hasattr(simulator, '_gravity_drop_contacted')

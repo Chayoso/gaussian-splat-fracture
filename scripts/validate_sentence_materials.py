@@ -107,6 +107,7 @@ def _write_markdown_report(rows: list[dict], path: Path, no_sim: bool) -> None:
     prior_cols = [
         "prompt",
         "family",
+        "sentence_style",
         "top1",
         "E_raw",
         "Gc_raw",
@@ -449,6 +450,7 @@ def main():
         raw = predictor.predict(prompt)
         topk_entries = [predictor.db.get_entry_by_name(name) for name in raw["top_k_names"]]
         material_prior = adapter.build_material_prior(topk_entries, raw["top_k_scores"])
+        material_prior = adapter.apply_sentence_style(material_prior, prompt)
         scaled = adapter.scale_physics_to_mpm(
             material_prior["physics"],
             base_density=float(config.material.density),
@@ -458,6 +460,7 @@ def main():
         row = {
             "prompt": prompt,
             "family": material_prior["family"],
+            "sentence_style": material_prior.get("sentence_style", "material_default"),
             "dominant_category": material_prior["dominant_category"],
             "top1": material_prior["top_k"][0]["name"] if material_prior["top_k"] else "",
             "top1_weight": material_prior["top_k"][0]["weight"] if material_prior["top_k"] else 0.0,

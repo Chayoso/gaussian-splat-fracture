@@ -67,6 +67,8 @@ class GraphFragmentManager:
         open_crack_release_enable: bool = True,
         open_crack_release_threshold: float = 0.0,
         open_crack_release_max_patches: int = 2,
+        crack_style: str = "material_default",
+        brittle_release_intensity: float = 1.0,
         material_family: str = "neutral_reference",
         device: str = "cuda",
     ):
@@ -113,6 +115,8 @@ class GraphFragmentManager:
         self.open_crack_release_enable = bool(open_crack_release_enable)
         self.open_crack_release_threshold = float(open_crack_release_threshold)
         self.open_crack_release_max_patches = max(int(open_crack_release_max_patches), 0)
+        self.crack_style = str(crack_style)
+        self.brittle_release_intensity = float(brittle_release_intensity)
         self.material_family = str(material_family)
         self.device = torch.device(device)
 
@@ -154,6 +158,9 @@ class GraphFragmentManager:
         self.last_closure_candidate_nodes: int = 0
         self.last_closure_score_max: float = 0.0
         self.last_closure_candidate_sizes: List[int] = []
+        self.last_open_release_patches: int = 0
+        self.last_open_release_nodes: int = 0
+        self.last_open_release_score_max: float = 0.0
         self.last_effective_edge_damage: Optional[Tensor] = None
         self.edge_cut_memory: Optional[Tensor] = None
         self.authoritative_cut_memory: Optional[Tensor] = None
@@ -229,6 +236,9 @@ class GraphFragmentManager:
             self.last_closure_candidate_nodes = 0
             self.last_closure_score_max = 0.0
             self.last_closure_candidate_sizes = []
+            self.last_open_release_patches = 0
+            self.last_open_release_nodes = 0
+            self.last_open_release_score_max = 0.0
             self.edge_cut_memory = None
             self.authoritative_cut_memory = None
             self.detached_node_memory = None
@@ -304,6 +314,9 @@ class GraphFragmentManager:
         self.last_closure_candidate_nodes = 0
         self.last_closure_score_max = 0.0
         self.last_closure_candidate_sizes = []
+        self.last_open_release_patches = 0
+        self.last_open_release_nodes = 0
+        self.last_open_release_score_max = 0.0
         self.last_authoritative_cut_mask = None
         self.last_support_lost_mask = None
         self.last_closure_candidate_mask = None
@@ -1214,7 +1227,7 @@ class GraphFragmentManager:
 
     def _open_release_params(self) -> dict:
         if self.material_family == "sharp_brittle":
-            return {
+            params = {
                 "seed_threshold": 0.52,
                 "release_threshold": 0.54,
                 "candidate_score": 0.10,
@@ -1224,10 +1237,10 @@ class GraphFragmentManager:
                 "min_contact_edges": max(24, 2 * self.min_boundary_edges),
                 "min_size": max(8, self.support_promote_min_size),
                 "max_size_ratio": 0.026,
-                "max_patches": min(self.open_crack_release_max_patches, 2),
+                "max_patches": self.open_crack_release_max_patches,
             }
-        if self.material_family == "brittle_moderate":
-            return {
+        elif self.material_family == "brittle_moderate":
+            params = {
                 "seed_threshold": 0.50,
                 "release_threshold": 0.56,
                 "candidate_score": 0.09,
@@ -1237,10 +1250,10 @@ class GraphFragmentManager:
                 "min_contact_edges": max(28, 2 * self.min_boundary_edges),
                 "min_size": max(14, self.support_promote_min_size),
                 "max_size_ratio": 0.035,
-                "max_patches": min(self.open_crack_release_max_patches, 2),
+                "max_patches": self.open_crack_release_max_patches,
             }
-        if self.material_family == "rough_quasi_brittle":
-            return {
+        elif self.material_family == "rough_quasi_brittle":
+            params = {
                 "seed_threshold": 0.45,
                 "release_threshold": 0.50,
                 "candidate_score": 0.075,
@@ -1252,18 +1265,86 @@ class GraphFragmentManager:
                 "max_size_ratio": 0.050,
                 "max_patches": self.open_crack_release_max_patches,
             }
-        return {
-            "seed_threshold": 0.58,
-            "release_threshold": 0.64,
-            "candidate_score": 0.12,
-            "radius_scale": 0.034,
-            "seed_radius_scale": 0.012,
-            "min_edges": max(160, 8 * self.min_boundary_edges),
-            "min_contact_edges": max(40, 2 * self.min_boundary_edges),
-            "min_size": max(18, self.support_promote_min_size),
-            "max_size_ratio": 0.020,
-            "max_patches": 0,
-        }
+        else:
+            params = {
+                "seed_threshold": 0.58,
+                "release_threshold": 0.64,
+                "candidate_score": 0.12,
+                "radius_scale": 0.034,
+                "seed_radius_scale": 0.012,
+                "min_edges": max(160, 8 * self.min_boundary_edges),
+                "min_contact_edges": max(40, 2 * self.min_boundary_edges),
+                "min_size": max(18, self.support_promote_min_size),
+                "max_size_ratio": 0.020,
+                "max_patches": 0,
+            }
+
+        style = self.crack_style
+        if style == "radial_shatter" and self.material_family == "sharp_brittle":
+            params.update({
+                "seed_threshold": 0.34,
+                "release_threshold": 0.35,
+                "candidate_score": 0.060,
+                "radius_scale": 0.036,
+                "seed_radius_scale": 0.012,
+                "min_edges": max(56, 4 * self.min_boundary_edges),
+                "min_contact_edges": max(8, self.min_boundary_edges // 2),
+                "min_size": max(4, self.support_promote_min_size),
+                "max_size_ratio": 0.026,
+                "max_patches": max(params["max_patches"], 16),
+            })
+        elif style == "spiderweb_branching" and self.material_family in {"sharp_brittle", "brittle_moderate"}:
+            params.update({
+                "seed_threshold": 0.43,
+                "release_threshold": 0.47,
+                "radius_scale": 0.050,
+                "seed_radius_scale": 0.018,
+                "min_edges": max(72, 4 * self.min_boundary_edges),
+                "min_contact_edges": max(16, self.min_boundary_edges),
+                "min_size": max(8, self.support_promote_min_size),
+                "max_size_ratio": 0.040,
+                "max_patches": max(params["max_patches"], 6),
+            })
+        elif style == "chunky_crumble" and self.material_family == "rough_quasi_brittle":
+            params.update({
+                "seed_threshold": 0.36,
+                "release_threshold": 0.40,
+                "candidate_score": 0.055,
+                "radius_scale": 0.070,
+                "seed_radius_scale": 0.030,
+                "min_edges": max(72, 3 * self.min_boundary_edges),
+                "min_contact_edges": max(16, self.min_boundary_edges),
+                "min_size": max(12, self.support_promote_min_size),
+                "max_size_ratio": 0.070,
+                "max_patches": max(params["max_patches"], 8),
+            })
+        elif style == "single_smooth":
+            params.update({
+                "seed_threshold": 0.44,
+                "release_threshold": 0.46,
+                "candidate_score": 0.080,
+                "radius_scale": max(params["radius_scale"], 0.060),
+                "seed_radius_scale": max(params["seed_radius_scale"], 0.018),
+                "min_contact_edges": max(12, self.min_boundary_edges),
+                "max_size_ratio": max(params["max_size_ratio"], 0.070),
+                "max_patches": min(max(params["max_patches"], 1), 2),
+            })
+        elif style == "diffuse_microcrack":
+            params["max_patches"] = 0
+
+        intensity = max(self.brittle_release_intensity, 1e-3)
+        if intensity != 1.0 and params["max_patches"] > 0:
+            loosen = min(max(intensity, 0.35), 2.25)
+            params["seed_threshold"] = max(0.18, params["seed_threshold"] / (0.72 + 0.28 * loosen))
+            params["release_threshold"] = max(0.18, params["release_threshold"] / (0.68 + 0.32 * loosen))
+            params["radius_scale"] *= min(1.35, 0.88 + 0.12 * loosen)
+            params["max_size_ratio"] *= min(1.45, 0.82 + 0.18 * loosen)
+            params["max_patches"] = max(
+                0,
+                int(round(float(params["max_patches"]) * min(loosen, 1.6))),
+            )
+
+        return params
 
     def _extract_open_crack_release_patches(
         self,
@@ -1387,12 +1468,19 @@ class GraphFragmentManager:
                 max_patch_size=max_patch_size,
                 min_contact_edges=int(params["min_contact_edges"]),
                 release_threshold=float(params["release_threshold"]),
+                candidate_score=float(params["candidate_score"]),
             )
             if patch is None:
                 continue
             used |= patch["mask"]
             patches.append(patch)
 
+        self.last_open_release_patches = len(patches)
+        self.last_open_release_nodes = int(sum(int(patch["size"]) for patch in patches))
+        self.last_open_release_score_max = (
+            max(float(patch.get("release_score", 0.0)) for patch in patches)
+            if patches else 0.0
+        )
         return patches
 
     def _build_open_crack_release_patch(
@@ -1410,13 +1498,14 @@ class GraphFragmentManager:
         max_patch_size: int,
         min_contact_edges: int,
         release_threshold: float,
+        candidate_score: float,
     ) -> Optional[dict]:
         seed_pos = positions[seed_index]
         dist = torch.norm(positions - seed_pos.unsqueeze(0), dim=1)
         candidate_mask = (
             (dist <= radius)
             & (~used_mask)
-            & ((release_field >= 0.10) | cut_node_mask)
+            & ((release_field >= candidate_score) | cut_node_mask)
         )
         seed_mask = (
             (dist <= seed_radius)
