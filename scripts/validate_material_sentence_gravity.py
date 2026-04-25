@@ -23,8 +23,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.validate_sentence_materials import (  # noqa: E402
+    _angular_metrics,
     _flatten_for_csv,
+    _front_topology_metrics,
     _runtime_fracture_params,
+    _save_final_crack_plot,
+    _slug,
     _surface_points,
     _write_markdown_report,
     simulate_prompt_metrics,
@@ -158,10 +162,14 @@ def run_surface_sweep(
     positions_np, normals_np = _surface_points(config, int(args.surface_particles))
 
     rows = []
-    for prompt in prompts:
+    for idx, prompt in enumerate(prompts):
         row, material_prior, scaled = _predict_row(prompt, predictor, adapter, config)
         fracture_params = _runtime_fracture_params(config, material_prior, scaled)
         print(f"[surface:{prefix}] {prompt!r} -> {row['family']} / {row['top1']}", flush=True)
+        plot_path = None
+        if bool(getattr(args, "plot_final", True)):
+            plot_path = out_dir / "final_plots" / prefix / f"{idx:02d}_{_slug(prompt)}.png"
+            row["final_plot"] = str(plot_path)
         metrics = simulate_prompt_metrics(
             positions_np,
             normals_np,
@@ -169,6 +177,8 @@ def run_surface_sweep(
             frames=int(args.surface_frames),
             device=device,
             fragment_every=int(args.fragment_every),
+            plot_path=plot_path,
+            plot_title=f"{prefix}: {prompt} | {row['family']} / {row['sentence_style']}",
         )
         row.update(metrics)
         rows.append(row)
@@ -265,7 +275,11 @@ def _bbox_metrics_tensor(positions: torch.Tensor, mask: torch.Tensor, prefix: st
 
 
 @torch.no_grad()
-def _final_simulator_crack_metrics(simulator) -> dict:
+def _final_simulator_crack_metrics(
+    simulator,
+    plot_path: Path | None = None,
+    plot_title: str | None = None,
+) -> dict:
     """Read final crack-front metrics directly from the no-render simulator."""
     ff = getattr(simulator, "fracture_field", None)
     if ff is None or getattr(ff, "c", None) is None:
@@ -309,8 +323,35 @@ def _final_simulator_crack_metrics(simulator) -> dict:
         "final_weak_count": int(weak.sum().item()),
         "final_branchiness": float(tips.sum().item() / max(int(visited.sum().item()), 1)),
     }
+    metrics.update({
+        f"final_{key}": value
+        for key, value in _front_topology_metrics(front, int(c.shape[0]), positions.device).items()
+    })
     metrics.update(_bbox_metrics_tensor(positions, cracked, "final_cracked"))
     metrics.update(_bbox_metrics_tensor(positions, visited, "final_visited"))
+    center = positions.mean(dim=0)
+    impact_center = getattr(simulator, "_impact_center", None)
+    if impact_center is not None:
+        try:
+            center = simulator.mapper.mpm_to_world(impact_center.unsqueeze(0)).squeeze(0).detach()
+        except Exception:
+            center = positions.mean(dim=0)
+    metrics.update(_angular_metrics(positions, cracked, center, "final_cracked"))
+    metrics.update(_angular_metrics(positions, visited, center, "final_visited"))
+    if plot_path is not None:
+        fragment_ids = None
+        manager = getattr(simulator, "fragment_manager", None)
+        if manager is not None and getattr(manager, "fragment_ids", None) is not None:
+            fragment_ids = manager.fragment_ids.detach()
+        _save_final_crack_plot(
+            positions=positions,
+            damage=c,
+            visited=visited,
+            tips=tips,
+            out_path=Path(plot_path),
+            title=plot_title or "gravity final crack morphology",
+            fragment_ids=fragment_ids,
+        )
     return metrics
 
 
@@ -374,7 +415,7 @@ def run_gravity_sweep(
         clip_model=args.clip_model,
     )
     rows = []
-    for prompt in prompts:
+    for idx, prompt in enumerate(prompts):
         t0 = time.time()
         print(f"[gravity] {prompt!r}", flush=True)
         try:
@@ -419,7 +460,15 @@ def run_gravity_sweep(
             "elapsed_sec": time.time() - t0,
         }
         row.update(_summarize_history(history))
-        row.update(_final_simulator_crack_metrics(getattr(pipeline.engine, "last_simulator", None)))
+        plot_path = None
+        if bool(getattr(args, "plot_final", True)):
+            plot_path = out_dir / "final_plots" / "gravity_material_validation" / f"{idx:02d}_{_slug(prompt)}.png"
+            row["final_plot"] = str(plot_path)
+        row.update(_final_simulator_crack_metrics(
+            getattr(pipeline.engine, "last_simulator", None),
+            plot_path=plot_path,
+            plot_title=f"gravity: {prompt} | {row['family']} / {row['sentence_style']}",
+        ))
         rows.append(row)
         _write_rows(rows, "gravity_material_validation", out_dir)
         _write_gravity_report(rows, out_dir)
@@ -451,6 +500,13 @@ def main() -> None:
     parser.add_argument("--gravity-z", type=float, default=-3500.0)
     parser.add_argument("--skip-surface", action="store_true")
     parser.add_argument("--skip-gravity", action="store_true")
+    parser.add_argument(
+        "--no-final-plots",
+        dest="plot_final",
+        action="store_false",
+        help="Disable final-frame matplotlib morphology PNGs.",
+    )
+    parser.set_defaults(plot_final=True)
     args = parser.parse_args()
 
     np.random.seed(int(args.seed))

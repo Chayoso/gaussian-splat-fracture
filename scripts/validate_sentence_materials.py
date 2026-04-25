@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -78,6 +79,113 @@ def _short_prompt(prompt: str, max_len: int = 42) -> str:
     return prompt[: max_len - 3] + "..."
 
 
+def _slug(text: str, max_len: int = 64) -> str:
+    text = re.sub(r"[^A-Za-z0-9]+", "_", str(text).strip().lower())
+    text = text.strip("_")
+    return (text or "prompt")[:max_len]
+
+
+def _save_final_crack_plot(
+    positions: torch.Tensor,
+    damage: torch.Tensor,
+    visited: torch.Tensor,
+    tips: torch.Tensor,
+    out_path: Path,
+    title: str,
+    fragment_ids: torch.Tensor | None = None,
+    cracked_threshold: float = 0.30,
+) -> None:
+    """Save a compact final-frame crack morphology diagnostic."""
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"[plot:warn] matplotlib unavailable: {exc}", flush=True)
+        return
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pos = positions.detach().float().cpu().numpy()
+    c = damage.detach().float().cpu().numpy()
+    visited_np = visited.detach().bool().cpu().numpy()
+    tips_np = tips.detach().bool().cpu().numpy()
+    cracked_np = c > float(cracked_threshold)
+    frag_np = None
+    if fragment_ids is not None:
+        frag_np = fragment_ids[: positions.shape[0]].detach().long().cpu().numpy()
+
+    views = [
+        ("X-Y top", 0, 1, "X", "Y"),
+        ("X-Z front", 0, 2, "X", "Z"),
+        ("Y-Z side", 1, 2, "Y", "Z"),
+    ]
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.6), constrained_layout=True)
+    fig.suptitle(title, fontsize=11)
+    scatter_for_colorbar = None
+
+    for ax, (view_name, i, j, xlabel, ylabel) in zip(axes, views):
+        ax.scatter(pos[:, i], pos[:, j], s=0.18, c="#d5d8dc", alpha=0.32, linewidths=0)
+
+        if frag_np is not None and (frag_np > 0).any():
+            released = frag_np > 0
+            ax.scatter(
+                pos[released, i],
+                pos[released, j],
+                s=0.70,
+                c=frag_np[released],
+                cmap="tab20",
+                alpha=0.62,
+                linewidths=0,
+            )
+
+        if cracked_np.any():
+            scatter_for_colorbar = ax.scatter(
+                pos[cracked_np, i],
+                pos[cracked_np, j],
+                s=1.20,
+                c=c[cracked_np],
+                cmap="inferno",
+                vmin=float(cracked_threshold),
+                vmax=max(float(c.max()), float(cracked_threshold) + 1e-4),
+                alpha=0.92,
+                linewidths=0,
+            )
+
+        if visited_np.any():
+            ax.scatter(
+                pos[visited_np, i],
+                pos[visited_np, j],
+                s=3.2,
+                facecolors="none",
+                edgecolors="#1f77b4",
+                linewidths=0.25,
+                alpha=0.78,
+            )
+
+        if tips_np.any():
+            ax.scatter(
+                pos[tips_np, i],
+                pos[tips_np, j],
+                s=18,
+                c="#00d7ff",
+                marker="x",
+                linewidths=0.8,
+            )
+
+        ax.set_title(view_name, fontsize=10)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(alpha=0.12, linewidth=0.5)
+
+    if scatter_for_colorbar is not None:
+        fig.colorbar(scatter_for_colorbar, ax=axes, shrink=0.78, label="damage c")
+
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
 def _normalized_pairwise(rows: list[dict], keys: list[str]) -> list[dict]:
     valid_keys = [key for key in keys if all(key in row for row in rows)]
     if not valid_keys or len(rows) < 2:
@@ -123,9 +231,12 @@ def _write_markdown_report(rows: list[dict], path: Path, no_sim: bool) -> None:
         "cracked_count",
         "visited_count",
         "tip_count",
+        "leaf_count",
+        "junction_count",
         "max_n_frags",
         "max_cut_edges",
         "branchiness",
+        "visited_angular_coverage",
         "cracked_span_x",
         "cracked_span_y",
         "cracked_span_z",
@@ -149,11 +260,19 @@ def _write_markdown_report(rows: list[dict], path: Path, no_sim: bool) -> None:
         "opening_max",
         "visited_count",
         "tip_count",
+        "leaf_count",
+        "junction_count",
+        "max_children",
+        "mean_children",
         "cracked_count",
         "weak_count",
         "max_n_frags",
         "max_cut_edges",
         "branchiness",
+        "visited_angular_coverage",
+        "visited_angular_entropy",
+        "cracked_angular_coverage",
+        "cracked_angular_entropy",
         "cracked_span_x",
         "cracked_span_y",
         "cracked_span_z",
@@ -162,6 +281,9 @@ def _write_markdown_report(rows: list[dict], path: Path, no_sim: bool) -> None:
     families = sorted({str(row.get("family", "")) for row in rows})
     cracked_values = [float(row.get("cracked_count", 0.0)) for row in rows if "cracked_count" in row]
     cmax_values = [float(row.get("c_max", 0.0)) for row in rows if "c_max" in row]
+    visited_values = [float(row.get("visited_count", 0.0)) for row in rows if "visited_count" in row]
+    frag_values = [float(row.get("max_n_frags", 0.0)) for row in rows if "max_n_frags" in row]
+    junction_values = [float(row.get("junction_count", 0.0)) for row in rows if "junction_count" in row]
 
     lines = [
         "# Sentence Material Validation",
@@ -176,7 +298,13 @@ def _write_markdown_report(rows: list[dict], path: Path, no_sim: bool) -> None:
             f"- cracked_count range: {_fmt(min(cracked_values), 0)} to {_fmt(max(cracked_values), 0)}",
             f"- c_max range: {_fmt(min(cmax_values))} to {_fmt(max(cmax_values))}",
         ])
-        if len(families) >= 3 and max(cracked_values) > min(cracked_values):
+        morphology_changed = (
+            (max(cracked_values) - min(cracked_values) >= 25.0)
+            or (visited_values and max(visited_values) - min(visited_values) >= 100.0)
+            or (frag_values and max(frag_values) - min(frag_values) >= 3.0)
+            or (junction_values and max(junction_values) - min(junction_values) >= 8.0)
+        )
+        if morphology_changed:
             lines.append("- result: sentence conditioning changes both material priors and crack morphology metrics.")
         else:
             lines.append("- result: material or morphology separation is weak; inspect top-k retrieval and style mapping.")
@@ -282,6 +410,79 @@ def _bbox_metrics(positions: torch.Tensor, mask: torch.Tensor, prefix: str) -> d
     }
 
 
+def _angular_metrics(
+    positions: torch.Tensor,
+    mask: torch.Tensor,
+    center: torch.Tensor,
+    prefix: str,
+    bins: int = 24,
+) -> dict:
+    if mask is None or not bool(mask.any()):
+        return {
+            f"{prefix}_angular_coverage": 0.0,
+            f"{prefix}_angular_entropy": 0.0,
+        }
+    rel = positions[mask, :2] - center[:2].unsqueeze(0)
+    if rel.numel() == 0:
+        return {
+            f"{prefix}_angular_coverage": 0.0,
+            f"{prefix}_angular_entropy": 0.0,
+        }
+    theta = torch.atan2(rel[:, 1], rel[:, 0])
+    two_pi = float(2.0 * torch.pi)
+    bin_pos = ((theta + torch.pi) / two_pi * int(bins)).floor().long()
+    bin_pos = bin_pos.clamp(0, int(bins) - 1)
+    hist = torch.bincount(bin_pos, minlength=int(bins)).float()
+    occupied = hist > 0
+    prob = hist / hist.sum().clamp(min=1e-8)
+    prob = prob[prob > 0]
+    entropy = -(prob * prob.log()).sum()
+    entropy = entropy / torch.log(torch.tensor(float(bins), device=positions.device))
+    return {
+        f"{prefix}_angular_coverage": float(occupied.float().mean().item()),
+        f"{prefix}_angular_entropy": float(entropy.item()),
+    }
+
+
+def _front_topology_metrics(crack_front, count: int, device: torch.device) -> dict:
+    if (
+        crack_front is None
+        or getattr(crack_front, "visited_mask", None) is None
+        or getattr(crack_front, "parent_index", None) is None
+    ):
+        return {
+            "leaf_count": 0,
+            "junction_count": 0,
+            "max_children": 0,
+            "mean_children": 0.0,
+        }
+
+    visited = crack_front.visited_mask[:count]
+    parent = crack_front.parent_index[:count]
+    valid_child = visited & (parent >= 0) & (parent < count)
+    child_count = torch.zeros(count, dtype=torch.long, device=device)
+    if bool(valid_child.any()):
+        ones = torch.ones(int(valid_child.sum().item()), dtype=torch.long, device=device)
+        child_count.scatter_add_(0, parent[valid_child], ones)
+
+    if int(visited.sum().item()) <= 0:
+        return {
+            "leaf_count": 0,
+            "junction_count": 0,
+            "max_children": 0,
+            "mean_children": 0.0,
+        }
+
+    leaf = visited & (child_count == 0)
+    junction = visited & (child_count >= 2)
+    return {
+        "leaf_count": int(leaf.sum().item()),
+        "junction_count": int(junction.sum().item()),
+        "max_children": int(child_count[visited].max().item()),
+        "mean_children": float(child_count[visited].float().mean().item()),
+    }
+
+
 @torch.no_grad()
 def simulate_prompt_metrics(
     positions_np: np.ndarray,
@@ -290,6 +491,8 @@ def simulate_prompt_metrics(
     frames: int,
     device: torch.device,
     fragment_every: int,
+    plot_path: Path | None = None,
+    plot_title: str | None = None,
 ) -> dict:
     positions = torch.from_numpy(positions_np).float().to(device)
     normals = torch.from_numpy(normals_np).float().to(device)
@@ -307,7 +510,8 @@ def simulate_prompt_metrics(
     fracture_field.initialize(positions.shape[0])
 
     family = fracture_params.get("material_family", "neutral_reference")
-    driver = SurfaceCrackDriver(material_family=family)
+    style = fracture_params.get("sentence_style", fracture_params.get("crack_style", "material_default"))
+    driver = SurfaceCrackDriver(material_family=family, crack_style=style)
     seed_center = driver.default_impact_center(positions)
     fracture_field.seed_damage(
         positions=positions,
@@ -384,8 +588,27 @@ def simulate_prompt_metrics(
         "max_closure_candidates": int(max_closure),
         "branchiness": float(tips.sum().item() / max(int(visited.sum().item()), 1)),
     }
+    metrics.update(_front_topology_metrics(crack_front, int(c.shape[0]), positions.device))
     metrics.update(_bbox_metrics(positions, cracked, "cracked"))
     metrics.update(_bbox_metrics(positions, visited, "visited"))
+    metrics.update(_angular_metrics(positions, cracked, seed_center, "cracked"))
+    metrics.update(_angular_metrics(positions, visited, seed_center, "visited"))
+
+    if plot_path is not None:
+        fragment_ids = (
+            fragment_manager.fragment_ids
+            if fragment_manager is not None and fragment_manager.fragment_ids is not None
+            else None
+        )
+        _save_final_crack_plot(
+            positions=positions,
+            damage=c,
+            visited=visited,
+            tips=tips,
+            out_path=Path(plot_path),
+            title=plot_title or "final crack morphology",
+            fragment_ids=fragment_ids,
+        )
     return metrics
 
 
@@ -406,6 +629,13 @@ def main():
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--out", default="output/sentence_material_validation")
     parser.add_argument("--no-sim", action="store_true", help="Only run CLIP/material-prior retrieval.")
+    parser.add_argument(
+        "--no-final-plots",
+        dest="plot_final",
+        action="store_false",
+        help="Disable final-frame matplotlib morphology PNGs.",
+    )
+    parser.set_defaults(plot_final=True)
     args = parser.parse_args()
 
     out_dir = Path(args.out)
@@ -485,6 +715,10 @@ def main():
 
         if not args.no_sim:
             print(f"\n[validate] {prompt!r} -> family={row['family']} top1={row['top1']}")
+            plot_path = None
+            if args.plot_final:
+                plot_path = out_dir / "final_plots" / f"{len(rows):02d}_{_slug(prompt)}.png"
+                row["final_plot"] = str(plot_path)
             metrics = simulate_prompt_metrics(
                 positions_np,
                 normals_np,
@@ -492,6 +726,8 @@ def main():
                 frames=int(args.frames),
                 device=device,
                 fragment_every=int(args.fragment_every),
+                plot_path=plot_path,
+                plot_title=f"{prompt} | {row['family']} / {row['sentence_style']}",
             )
             row.update(metrics)
 

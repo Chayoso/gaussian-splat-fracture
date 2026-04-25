@@ -1079,8 +1079,9 @@ class ManifoldSimulator:
         x_surf_world: Tensor,
         init_score: Tensor,
         growth_drive: Tensor,
+        growth_dir: Tensor,
         impact_center_world: Optional[Tensor],
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor]:
         """Shape impact drive into sentence-level crack motifs.
 
         This is a graphics-side controller layered on top of physical stress:
@@ -1093,7 +1094,9 @@ class ManifoldSimulator:
             or style in {"material_default", "diffuse_microcrack"}
             or x_surf_world.numel() == 0
         ):
-            return init_score, growth_drive
+            if style == "diffuse_microcrack":
+                return 0.45 * init_score, 0.38 * growth_drive, growth_dir
+            return init_score, growth_drive, growth_dir
 
         rel = x_surf_world - impact_center_world.unsqueeze(0)
         extent = x_surf_world.max(dim=0).values - x_surf_world.min(dim=0).values
@@ -1102,24 +1105,46 @@ class ManifoldSimulator:
         planar_r = planar.norm(dim=1).clamp(min=1e-8)
         r_norm = (planar_r / (0.45 * diag)).clamp(0.0, 1.0)
         theta = torch.atan2(planar[:, 1], planar[:, 0])
+        radial = torch.zeros_like(rel)
+        radial[:, :2] = planar / planar_r.unsqueeze(1).clamp(min=1e-8)
+        upward = torch.zeros_like(rel)
+        upward[:, 2] = 1.0
+        tangent = torch.zeros_like(rel)
+        tangent[:, 0] = -radial[:, 1]
+        tangent[:, 1] = radial[:, 0]
 
         if style == "radial_shatter":
-            ray_count = 10.0
+            ray_count = 12.0
             phase = 0.45
             ray = (0.5 + 0.5 * torch.cos(ray_count * theta + phase)).clamp(0.0, 1.0)
-            ray = ray.pow(3.0)
+            ray = ray.pow(2.6)
             near = torch.exp(-0.5 * (planar_r / (0.13 * diag)).pow(2.0))
-            far_gain = (0.28 + 0.72 * r_norm).clamp(0.0, 1.0)
-            ray_drive = (ray * far_gain + 0.22 * near).clamp(0.0, 1.0)
-            growth_drive = torch.maximum(growth_drive, 0.78 * ray_drive)
-            init_score = torch.maximum(init_score, 0.48 * near * (0.45 + 0.55 * ray))
+            far_gain = (0.20 + 0.80 * r_norm).clamp(0.0, 1.0)
+            ray_drive = (ray * far_gain + 0.28 * near).clamp(0.0, 1.0)
+            growth_drive = torch.maximum(growth_drive, 0.86 * ray_drive)
+            init_score = torch.maximum(init_score, 0.64 * near * (0.35 + 0.65 * ray))
+            growth_dir = self._safe_vector_normalize(1.55 * radial + 0.22 * upward)
         elif style == "spiderweb_branching":
-            ray = (0.5 + 0.5 * torch.cos(8.0 * theta + 0.25)).clamp(0.0, 1.0).pow(2.0)
-            rings = (0.5 + 0.5 * torch.cos(28.0 * r_norm + 0.35)).clamp(0.0, 1.0).pow(2.0)
-            web = torch.maximum(ray, 0.72 * rings) * (0.18 + 0.82 * r_norm)
+            ray = (0.5 + 0.5 * torch.cos(9.0 * theta + 0.25)).clamp(0.0, 1.0).pow(2.0)
+            rings = (0.5 + 0.5 * torch.cos(30.0 * r_norm + 0.35)).clamp(0.0, 1.0).pow(2.2)
+            web = torch.maximum(0.88 * ray, 0.82 * rings) * (0.16 + 0.84 * r_norm)
             near = torch.exp(-0.5 * (planar_r / (0.16 * diag)).pow(2.0))
-            growth_drive = torch.maximum(growth_drive, 0.64 * web.clamp(0.0, 1.0))
-            init_score = torch.maximum(init_score, 0.36 * near * (0.55 + 0.45 * ray))
+            growth_drive = torch.maximum(growth_drive, 0.76 * web.clamp(0.0, 1.0))
+            init_score = torch.maximum(init_score, 0.48 * near * (0.45 + 0.55 * ray))
+            tangent_sign = torch.sign(torch.sin(9.0 * theta + 0.25))
+            tangent_sign = torch.where(
+                tangent_sign.abs() > 0,
+                tangent_sign,
+                torch.ones_like(tangent_sign),
+            )
+            tangent = tangent * tangent_sign.unsqueeze(1)
+            ring_mix = (0.25 + 0.75 * rings).unsqueeze(1)
+            ray_mix = (0.35 + 0.65 * ray).unsqueeze(1)
+            growth_dir = self._safe_vector_normalize(
+                0.78 * ray_mix * radial
+                + 0.66 * ring_mix * tangent
+                + 0.18 * upward
+            )
         elif style == "single_smooth":
             angle = torch.tensor(0.35, dtype=x_surf_world.dtype, device=x_surf_world.device)
             axis = torch.stack([torch.cos(angle), torch.sin(angle)])
@@ -1132,6 +1157,10 @@ class ManifoldSimulator:
             growth_drive = torch.maximum(0.38 * growth_drive, 0.70 * line_drive)
             near = torch.exp(-0.5 * (planar_r / (0.12 * diag)).pow(2.0))
             init_score = torch.maximum(init_score, 0.36 * near * line)
+            axis3 = torch.zeros_like(rel)
+            axis3[:, 0] = axis[0]
+            axis3[:, 1] = axis[1]
+            growth_dir = self._safe_vector_normalize(axis3 + 0.16 * upward)
         elif style == "chunky_crumble":
             noise = torch.sin(
                 31.0 * x_surf_world[:, 0]
@@ -1143,8 +1172,9 @@ class ManifoldSimulator:
             crumble = (0.45 * broad + 0.55 * grain * (0.25 + 0.75 * r_norm)).clamp(0.0, 1.0)
             growth_drive = torch.maximum(growth_drive, 0.58 * crumble)
             init_score = torch.maximum(init_score, 0.28 * broad * (0.55 + 0.45 * grain))
+            growth_dir = self._safe_vector_normalize(0.60 * radial + 0.38 * tangent + 0.18 * upward)
 
-        return init_score.clamp(0.0, 1.0), growth_drive.clamp(0.0, 1.0)
+        return init_score.clamp(0.0, 1.0), growth_drive.clamp(0.0, 1.0), growth_dir
 
     @torch.no_grad()
     def _step_fracture(self):
@@ -1206,10 +1236,11 @@ class ManifoldSimulator:
             x_surf_world,
             impact_center_world,
         )
-        init_score, growth_drive = self._apply_sentence_crack_style_drive(
+        init_score, growth_drive, growth_dir = self._apply_sentence_crack_style_drive(
             x_surf_world,
             init_score,
             growth_drive,
+            growth_dir,
             impact_center_world,
         )
 

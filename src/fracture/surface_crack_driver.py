@@ -78,10 +78,12 @@ class SurfaceCrackDriver:
     def __init__(
         self,
         material_family: str = "neutral_reference",
+        crack_style: str = "material_default",
         impact_center: Optional[Tensor] = None,
         params: Optional[SurfaceCrackDriverParams] = None,
     ):
         self.material_family = str(material_family)
+        self.crack_style = str(crack_style)
         self.params = params or FAMILY_SURFACE_PARAMS.get(
             self.material_family,
             FAMILY_SURFACE_PARAMS["neutral_reference"],
@@ -109,6 +111,101 @@ class SurfaceCrackDriver:
             center = positions.mean(dim=0)
             center[2] = z_min
         return center
+
+    def _apply_style_drive(
+        self,
+        positions: Tensor,
+        center: Tensor,
+        init_score: Tensor,
+        growth_drive: Tensor,
+        growth_dir: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        style = self.crack_style
+        if style in {"material_default", "diffuse_microcrack"} or positions.numel() == 0:
+            if style == "diffuse_microcrack":
+                return 0.45 * init_score, 0.38 * growth_drive, growth_dir
+            return init_score, growth_drive, growth_dir
+
+        rel = positions - center.unsqueeze(0)
+        extent = positions.max(dim=0).values - positions.min(dim=0).values
+        diag = extent.norm().clamp(min=1e-6)
+        planar = rel[:, :2]
+        planar_r = planar.norm(dim=1).clamp(min=1e-8)
+        r_norm = (planar_r / (0.45 * diag)).clamp(0.0, 1.0)
+        theta = torch.atan2(planar[:, 1], planar[:, 0])
+
+        radial = torch.zeros_like(rel)
+        radial[:, :2] = planar / planar_r.unsqueeze(1).clamp(min=1e-8)
+        upward = torch.zeros_like(rel)
+        upward[:, 2] = 1.0
+        tangent = torch.zeros_like(rel)
+        tangent[:, 0] = -radial[:, 1]
+        tangent[:, 1] = radial[:, 0]
+
+        if style == "radial_shatter":
+            ray_count = 12.0
+            phase = 0.45
+            ray = (0.5 + 0.5 * torch.cos(ray_count * theta + phase)).clamp(0.0, 1.0)
+            ray = ray.pow(2.6)
+            near = torch.exp(-0.5 * (planar_r / (0.13 * diag)).pow(2.0))
+            far_gain = (0.20 + 0.80 * r_norm).clamp(0.0, 1.0)
+            ray_drive = (ray * far_gain + 0.28 * near).clamp(0.0, 1.0)
+            init_score = torch.maximum(init_score, 0.64 * near * (0.35 + 0.65 * ray))
+            growth_drive = torch.maximum(growth_drive, 0.86 * ray_drive)
+            growth_dir = self._safe_normalize(1.55 * radial + 0.22 * upward)
+
+        elif style == "spiderweb_branching":
+            spoke = (0.5 + 0.5 * torch.cos(9.0 * theta + 0.25)).clamp(0.0, 1.0).pow(2.0)
+            ring = (0.5 + 0.5 * torch.cos(30.0 * r_norm + 0.35)).clamp(0.0, 1.0).pow(2.2)
+            web = torch.maximum(0.88 * spoke, 0.82 * ring) * (0.16 + 0.84 * r_norm)
+            near = torch.exp(-0.5 * (planar_r / (0.16 * diag)).pow(2.0))
+            init_score = torch.maximum(init_score, 0.48 * near * (0.45 + 0.55 * spoke))
+            growth_drive = torch.maximum(growth_drive, 0.76 * web.clamp(0.0, 1.0))
+            tangent_sign = torch.sign(torch.sin(9.0 * theta + 0.25))
+            tangent_sign = torch.where(
+                tangent_sign.abs() > 0,
+                tangent_sign,
+                torch.ones_like(tangent_sign),
+            )
+            tangent = tangent * tangent_sign.unsqueeze(1)
+            ring_mix = (0.25 + 0.75 * ring).unsqueeze(1)
+            spoke_mix = (0.35 + 0.65 * spoke).unsqueeze(1)
+            growth_dir = self._safe_normalize(
+                0.78 * spoke_mix * radial
+                + 0.66 * ring_mix * tangent
+                + 0.18 * upward
+            )
+
+        elif style == "single_smooth":
+            angle = torch.tensor(0.35, dtype=positions.dtype, device=positions.device)
+            axis2 = torch.stack([torch.cos(angle), torch.sin(angle)])
+            tangent_pos = planar @ axis2
+            cross = planar[:, 0] * axis2[1] - planar[:, 1] * axis2[0]
+            width = 0.045 * diag
+            line = torch.exp(-0.5 * (cross / width).pow(2.0))
+            forward = (tangent_pos > (-0.10 * diag)).float()
+            line_drive = line * forward * (0.20 + 0.80 * r_norm)
+            init_score = torch.maximum(init_score, 0.42 * line)
+            growth_drive = torch.maximum(0.36 * growth_drive, 0.78 * line_drive)
+            axis = torch.zeros_like(rel)
+            axis[:, 0] = axis2[0]
+            axis[:, 1] = axis2[1]
+            growth_dir = self._safe_normalize(axis + 0.16 * upward)
+
+        elif style == "chunky_crumble":
+            noise = torch.sin(
+                31.0 * positions[:, 0]
+                - 17.0 * positions[:, 1]
+                + 23.0 * positions[:, 2]
+            )
+            grain = (0.5 + 0.5 * noise).clamp(0.0, 1.0)
+            broad = torch.exp(-0.5 * (planar_r / (0.26 * diag)).pow(2.0))
+            crumble = (0.45 * broad + 0.55 * grain * (0.25 + 0.75 * r_norm)).clamp(0.0, 1.0)
+            init_score = torch.maximum(init_score, 0.30 * broad * (0.55 + 0.45 * grain))
+            growth_drive = torch.maximum(growth_drive, 0.60 * crumble)
+            growth_dir = self._safe_normalize(0.60 * radial + 0.38 * tangent + 0.18 * upward)
+
+        return init_score.clamp(0.0, 1.0), growth_drive.clamp(0.0, 1.0), growth_dir
 
     def build(
         self,
@@ -174,6 +271,14 @@ class SurfaceCrackDriver:
             * branch
             * noise
         ).clamp(0.0, 1.0)
+
+        init_score, growth_drive, growth_dir = self._apply_style_drive(
+            positions,
+            center,
+            init_score,
+            growth_drive,
+            growth_dir,
+        )
 
         if self.material_family == "diffuse_damage":
             growth_drive = 0.45 * growth_drive

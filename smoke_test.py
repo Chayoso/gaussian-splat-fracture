@@ -559,6 +559,10 @@ def make_crack_front(fracture_params, device):
         growth_gain=fracture_params.get('growth_gain', 1.0),
         branching_bias=fracture_params.get('branching_bias', 0.20),
         anisotropy_strength=fracture_params.get('anisotropy_strength', 0.10),
+        crack_style=fracture_params.get(
+            'sentence_style',
+            fracture_params.get('crack_style', 'material_default'),
+        ),
         material_family=fracture_params.get('material_family', 'neutral_reference'),
         device=str(device),
     )
@@ -636,6 +640,11 @@ def make_fragment_manager(fracture_params, device):
         open_crack_release_enable=fracture_params.get('open_crack_release_enable', True),
         open_crack_release_threshold=fracture_params.get('open_crack_release_threshold', 0.0),
         open_crack_release_max_patches=fracture_params.get('open_crack_release_max_patches', 2),
+        crack_style=fracture_params.get(
+            'sentence_style',
+            fracture_params.get('crack_style', 'material_default'),
+        ),
+        brittle_release_intensity=fracture_params.get('brittle_release_intensity', 1.0),
         material_family=fracture_params.get('material_family', 'neutral_reference'),
         device=str(device),
     )

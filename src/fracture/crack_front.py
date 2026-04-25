@@ -83,6 +83,7 @@ class CrackFront:
                 "align_scale": 1.20,
                 "revisit_penalty": 0.95,
                 "successor_cap": 1,
+                "initial_seed_cap": 2,
                 "seed_spacing_scale": 1.25,
                 "lateral_branch_bonus": 0.00,
                 "lateral_branch_threshold": 1.00,
@@ -104,17 +105,18 @@ class CrackFront:
                     "continuity_scale": 0.92,
                     "align_scale": 1.05,
                     "revisit_penalty": 0.72,
-                    "successor_cap": 4,
-                    "seed_spacing_scale": 0.55,
-                    "lateral_branch_bonus": 0.20,
-                    "lateral_branch_threshold": 0.22,
+                    "successor_cap": max(self.successor_topk, 5),
+                    "initial_seed_cap": 10,
+                    "seed_spacing_scale": 0.46,
+                    "lateral_branch_bonus": 0.24,
+                    "lateral_branch_threshold": 0.18,
                     "branch_persist_steps": 1,
                     "branch_persist_lateral": 0.28,
-                    "branch_extra_branches": 2,
-                    "closure_weight": 0.14,
-                    "closure_branch_threshold": 0.34,
-                    "closure_branch_bonus": 0.16,
-                    "closure_extra_branches": 2,
+                    "branch_extra_branches": 3,
+                    "closure_weight": 0.10,
+                    "closure_branch_threshold": 0.40,
+                    "closure_branch_bonus": 0.10,
+                    "closure_extra_branches": 1,
                 })
             elif self.crack_style == "spiderweb_branching":
                 settings.update({
@@ -122,17 +124,37 @@ class CrackFront:
                     "continuity_scale": 0.98,
                     "align_scale": 1.00,
                     "revisit_penalty": 0.70,
-                    "successor_cap": 4,
-                    "seed_spacing_scale": 0.60,
-                    "lateral_branch_bonus": 0.24,
-                    "lateral_branch_threshold": 0.20,
+                    "successor_cap": max(self.successor_topk, 5),
+                    "initial_seed_cap": 8,
+                    "seed_spacing_scale": 0.50,
+                    "lateral_branch_bonus": 0.34,
+                    "lateral_branch_threshold": 0.16,
                     "branch_persist_steps": 1,
                     "branch_persist_lateral": 0.24,
-                    "branch_extra_branches": 2,
-                    "closure_weight": 0.20,
-                    "closure_branch_threshold": 0.30,
-                    "closure_branch_bonus": 0.18,
-                    "closure_extra_branches": 2,
+                    "branch_extra_branches": 3,
+                    "closure_weight": 0.34,
+                    "closure_branch_threshold": 0.22,
+                    "closure_branch_bonus": 0.32,
+                    "closure_extra_branches": 3,
+                    "closure_target_cap": 96,
+                    "closure_max_dist_scale": 0.36,
+                    "closure_height_scale": 0.16,
+                })
+            elif self.crack_style == "single_smooth":
+                settings.update({
+                    "branch_scale": 0.08,
+                    "continuity_scale": 1.55,
+                    "align_scale": 1.35,
+                    "revisit_penalty": 1.0,
+                    "successor_cap": 1,
+                    "initial_seed_cap": 1,
+                    "seed_spacing_scale": 1.80,
+                    "lateral_branch_bonus": 0.0,
+                    "lateral_branch_threshold": 1.0,
+                    "branch_persist_steps": 0,
+                    "branch_extra_branches": 0,
+                    "closure_weight": 0.0,
+                    "closure_extra_branches": 0,
                 })
             return settings
         if self.material_family == "brittle_moderate":
@@ -143,6 +165,7 @@ class CrackFront:
                 "align_scale": 1.00,
                 "revisit_penalty": 0.85,
                 "successor_cap": 3,
+                "initial_seed_cap": 3,
                 "seed_spacing_scale": 1.05,
                 "lateral_branch_bonus": 0.12,
                 "lateral_branch_threshold": 0.32,
@@ -166,6 +189,7 @@ class CrackFront:
                 "align_scale": 0.80,
                 "revisit_penalty": 0.22,
                 "successor_cap": max(self.successor_topk, 5),
+                "initial_seed_cap": max(self.max_seed_points, 6),
                 "seed_spacing_scale": 0.85,
                 "lateral_branch_bonus": 0.26,
                 "lateral_branch_threshold": 0.18,
@@ -189,6 +213,7 @@ class CrackFront:
                 "align_scale": 0.0,
                 "revisit_penalty": 1.0,
                 "successor_cap": 0,
+                "initial_seed_cap": 0,
                 "seed_spacing_scale": 1.50,
                 "lateral_branch_bonus": 0.0,
                 "lateral_branch_threshold": 1.0,
@@ -211,6 +236,7 @@ class CrackFront:
             "align_scale": 1.0,
             "revisit_penalty": 0.75,
             "successor_cap": max(1, min(self.successor_topk, 2)),
+            "initial_seed_cap": 2,
             "seed_spacing_scale": 1.0,
             "lateral_branch_bonus": 0.10,
             "lateral_branch_threshold": 0.28,
@@ -343,7 +369,10 @@ class CrackFront:
 
         selected = []
         min_seed_spacing = self.min_seed_spacing * family_cfg["seed_spacing_scale"]
-        max_seed_points = min(self.max_seed_points, family_cfg["successor_cap"] + 1)
+        max_seed_points = min(
+            self.max_seed_points,
+            max(0, int(family_cfg.get("initial_seed_cap", family_cfg["successor_cap"] + 1))),
+        )
         for idx in candidate_idx.tolist():
             if len(selected) >= max_seed_points:
                 break
