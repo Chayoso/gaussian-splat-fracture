@@ -71,6 +71,17 @@ class GraphFragmentManager:
         open_crack_release_max_patches: int = 2,
         crack_style: str = "material_default",
         brittle_release_intensity: float = 1.0,
+        catastrophic_release_enable: bool = False,
+        catastrophic_release_fragility: float = 0.0,
+        catastrophic_release_threshold: float = 0.36,
+        catastrophic_release_min_threshold: float = 0.08,
+        catastrophic_release_threshold_decay: float = 0.010,
+        catastrophic_release_patches_per_step: int = 0,
+        catastrophic_release_patch_radius: float = 0.060,
+        catastrophic_release_core_radius: float = 0.024,
+        catastrophic_release_min_size: int = 16,
+        catastrophic_release_max_size_ratio: float = 0.040,
+        catastrophic_release_max_released_ratio: float = 0.55,
         material_family: str = "neutral_reference",
         device: str = "cuda",
     ):
@@ -119,6 +130,18 @@ class GraphFragmentManager:
         self.open_crack_release_max_patches = max(int(open_crack_release_max_patches), 0)
         self.crack_style = str(crack_style)
         self.brittle_release_intensity = float(brittle_release_intensity)
+        self.catastrophic_release_enable = bool(catastrophic_release_enable)
+        self.catastrophic_release_fragility = float(catastrophic_release_fragility)
+        self.catastrophic_release_threshold = float(catastrophic_release_threshold)
+        self.catastrophic_release_min_threshold = float(catastrophic_release_min_threshold)
+        self.catastrophic_release_threshold_decay = float(catastrophic_release_threshold_decay)
+        self.catastrophic_release_patches_per_step = max(int(catastrophic_release_patches_per_step), 0)
+        self.catastrophic_release_patch_radius = float(catastrophic_release_patch_radius)
+        self.catastrophic_release_core_radius = float(catastrophic_release_core_radius)
+        self.catastrophic_release_min_size = max(int(catastrophic_release_min_size), 1)
+        self.catastrophic_release_max_size_ratio = float(catastrophic_release_max_size_ratio)
+        self.catastrophic_release_max_released_ratio = float(catastrophic_release_max_released_ratio)
+        self.catastrophic_release_step = 0
         self.material_family = str(material_family)
         self.device = torch.device(device)
 
@@ -163,6 +186,9 @@ class GraphFragmentManager:
         self.last_open_release_patches: int = 0
         self.last_open_release_nodes: int = 0
         self.last_open_release_score_max: float = 0.0
+        self.last_catastrophic_release_patches: int = 0
+        self.last_catastrophic_release_nodes: int = 0
+        self.last_catastrophic_release_score_max: float = 0.0
         self.last_effective_edge_damage: Optional[Tensor] = None
         self.edge_cut_memory: Optional[Tensor] = None
         self.authoritative_cut_memory: Optional[Tensor] = None
@@ -241,6 +267,9 @@ class GraphFragmentManager:
             self.last_open_release_patches = 0
             self.last_open_release_nodes = 0
             self.last_open_release_score_max = 0.0
+            self.last_catastrophic_release_patches = 0
+            self.last_catastrophic_release_nodes = 0
+            self.last_catastrophic_release_score_max = 0.0
             self.edge_cut_memory = None
             self.authoritative_cut_memory = None
             self.detached_node_memory = None
@@ -319,6 +348,9 @@ class GraphFragmentManager:
         self.last_open_release_patches = 0
         self.last_open_release_nodes = 0
         self.last_open_release_score_max = 0.0
+        self.last_catastrophic_release_patches = 0
+        self.last_catastrophic_release_nodes = 0
+        self.last_catastrophic_release_score_max = 0.0
         self.last_authoritative_cut_mask = None
         self.last_support_lost_mask = None
         self.last_closure_candidate_mask = None
@@ -526,6 +558,21 @@ class GraphFragmentManager:
         )
         explicit_patches.extend(
             self._extract_open_crack_release_patches(
+                positions=positions,
+                graph=graph,
+                corridor_edge_mask=corridor_edge_mask,
+                damage=damage,
+                opening=opening,
+                active_tip_mask=active_tip_mask,
+                recent_front_mask=recent_front_mask,
+                used_mask=(
+                    torch.stack([patch["mask"] for patch in explicit_patches]).any(dim=0)
+                    if explicit_patches else None
+                ),
+            )
+        )
+        explicit_patches.extend(
+            self._extract_catastrophic_release_patches(
                 positions=positions,
                 graph=graph,
                 corridor_edge_mask=corridor_edge_mask,
@@ -1646,6 +1693,245 @@ class GraphFragmentManager:
             reverse=True,
         )
         return patch_candidates[:max_patches]
+
+    def _extract_catastrophic_release_patches(
+        self,
+        positions: Optional[Tensor],
+        graph: GaussianGraph,
+        corridor_edge_mask: Tensor,
+        damage: Tensor,
+        opening: Optional[Tensor],
+        active_tip_mask: Optional[Tensor],
+        recent_front_mask: Optional[Tensor],
+        used_mask: Optional[Tensor] = None,
+    ) -> List[dict]:
+        """Collapse-displaced style release driven by CLIP material/style priors.
+
+        This intentionally does not require a closed crack ring. It is a
+        material-gated visual/fragment operator: when a brittle prompt creates a
+        strong crack field, compact surface patches become persistent fragment
+        labels and then reuse ManifoldSimulator's fragment displacement path.
+        """
+        if (
+            not self.catastrophic_release_enable
+            or self.material_family == "diffuse_damage"
+            or positions is None
+            or graph.knn_idx is None
+            or self.catastrophic_release_patches_per_step <= 0
+        ):
+            return []
+
+        N = int(positions.shape[0])
+        if N <= 0:
+            return []
+
+        fragility = max(0.0, min(float(self.catastrophic_release_fragility), 1.5))
+        if fragility <= 1e-6:
+            return []
+
+        device = positions.device
+        dtype = damage.dtype
+        if used_mask is None:
+            used = torch.zeros(N, dtype=torch.bool, device=device)
+        else:
+            used = used_mask.clone()
+
+        max_released_nodes = max(
+            self.catastrophic_release_min_size,
+            int(round(max(0.0, min(self.catastrophic_release_max_released_ratio, 1.0)) * N)),
+        )
+        remaining_budget = max_released_nodes - int(used.sum().item())
+        if remaining_budget < self.catastrophic_release_min_size:
+            return []
+
+        edge_density = torch.zeros(N, dtype=dtype, device=device)
+        if corridor_edge_mask is not None and bool(corridor_edge_mask.any()):
+            edge_rows, edge_cols = torch.where(corridor_edge_mask)
+            nbr_idx = graph.knn_idx[edge_rows, edge_cols]
+            ones = torch.ones(edge_rows.shape[0], dtype=dtype, device=device)
+            edge_count = torch.zeros(N, dtype=dtype, device=device)
+            edge_count.index_add_(0, edge_rows, ones)
+            edge_count.index_add_(0, nbr_idx, ones)
+            edge_density = (edge_count / edge_count.max().clamp(min=1.0)).clamp(0.0, 1.0)
+
+        if opening is not None:
+            opening_scale = torch.quantile(opening.detach(), 0.90).clamp(min=1e-8)
+            opening_norm = (opening / opening_scale).clamp(0.0, 1.0)
+        else:
+            opening_norm = torch.zeros_like(damage)
+
+        front_score = torch.zeros_like(damage)
+        if recent_front_mask is not None:
+            front_score = torch.maximum(front_score, recent_front_mask.float())
+        if active_tip_mask is not None:
+            front_score = torch.maximum(front_score, active_tip_mask.float())
+
+        release_field = (
+            0.42 * damage.clamp(0.0, 1.0)
+            + 0.20 * opening_norm
+            + 0.22 * front_score
+            + 0.16 * edge_density
+        ).clamp(0.0, 1.0)
+        if self.material_family == "sharp_brittle" and self.crack_style == "radial_shatter":
+            release_field = torch.maximum(
+                release_field,
+                (
+                    0.40 * damage.clamp(0.0, 1.0)
+                    + 0.12 * opening_norm
+                    + 0.28 * front_score
+                    + 0.20 * edge_density
+                ).clamp(0.0, 1.0),
+            )
+        elif self.material_family == "rough_quasi_brittle":
+            release_field = torch.maximum(
+                release_field,
+                (
+                    0.34 * damage.clamp(0.0, 1.0)
+                    + 0.18 * opening_norm
+                    + 0.18 * front_score
+                    + 0.30 * edge_density
+                ).clamp(0.0, 1.0),
+            )
+
+        threshold = max(
+            float(self.catastrophic_release_min_threshold),
+            float(self.catastrophic_release_threshold)
+            - float(self.catastrophic_release_step) * float(self.catastrophic_release_threshold_decay),
+        )
+        threshold = max(
+            float(self.catastrophic_release_min_threshold),
+            threshold / (0.82 + 0.28 * min(fragility, 1.0)),
+        )
+        self.catastrophic_release_step += 1
+
+        unassigned = ~used
+        candidate_idx = torch.where(unassigned & (release_field >= threshold))[0]
+        if candidate_idx.numel() == 0:
+            relaxed = max(float(self.catastrophic_release_min_threshold), 0.78 * threshold)
+            viable = torch.where(unassigned & (release_field >= relaxed))[0]
+            if viable.numel() == 0:
+                self.last_catastrophic_release_patches = 0
+                self.last_catastrophic_release_nodes = 0
+                self.last_catastrophic_release_score_max = 0.0
+                return []
+            top_count = min(max(self.catastrophic_release_patches_per_step * 3, 8), int(viable.numel()))
+            local = release_field[viable].topk(top_count).indices
+            candidate_idx = viable[local]
+
+        per_step = max(
+            1,
+            int(round(self.catastrophic_release_patches_per_step * (0.75 + 0.35 * min(fragility, 1.0)))),
+        )
+        seed_count = min(candidate_idx.numel(), max(per_step * 3, per_step))
+        order = release_field[candidate_idx].argsort(descending=True)
+        seed_idx = candidate_idx[order[:seed_count]]
+
+        bbox_extent = positions.max(dim=0).values - positions.min(dim=0).values
+        diag = float(bbox_extent.norm().item())
+        radius = max(
+            0.008,
+            float(self.catastrophic_release_patch_radius)
+            * (0.85 + 0.30 * min(fragility, 1.0))
+            * max(diag, 1e-6),
+        )
+        core_radius = max(
+            0.004,
+            float(self.catastrophic_release_core_radius)
+            * (0.90 + 0.20 * min(fragility, 1.0))
+            * max(diag, 1e-6),
+        )
+        min_size = max(int(self.catastrophic_release_min_size), 1)
+        max_patch_size = max(
+            min_size,
+            int(round(max(self.catastrophic_release_max_size_ratio, 0.001) * N)),
+        )
+
+        patches: List[dict] = []
+        released_now = 0
+        for seed in seed_idx.tolist():
+            if len(patches) >= per_step:
+                break
+            if released_now >= remaining_budget:
+                break
+            if bool(used[seed]):
+                continue
+
+            seed_pos = positions[seed]
+            dist = torch.norm(positions - seed_pos.unsqueeze(0), dim=1)
+            patch_mask = (
+                (~used)
+                & (dist <= radius)
+                & ((release_field >= 0.40 * threshold) | (dist <= core_radius))
+            )
+            patch_size = int(patch_mask.sum().item())
+            if patch_size < min_size:
+                continue
+
+            allowed_size = min(max_patch_size, remaining_budget - released_now)
+            if allowed_size < min_size:
+                break
+            if patch_size > allowed_size:
+                patch_idx = torch.where(patch_mask)[0]
+                keep_order = (0.68 * dist[patch_idx] - 0.32 * release_field[patch_idx]).argsort()
+                keep = patch_idx[keep_order[:allowed_size]]
+                patch_mask.zero_()
+                patch_mask[keep] = True
+                patch_mask[seed] = True
+                patch_size = int(patch_mask.sum().item())
+                if patch_size < min_size:
+                    continue
+
+            patch_side = patch_mask.unsqueeze(1)
+            neighbor_side = patch_mask[graph.knn_idx]
+            cross_boundary = patch_side ^ neighbor_side
+            if corridor_edge_mask is not None:
+                patch_boundary_mask = corridor_edge_mask & cross_boundary
+                contact_mask = corridor_edge_mask & (patch_side | neighbor_side)
+            else:
+                patch_boundary_mask = torch.zeros_like(cross_boundary)
+                contact_mask = torch.zeros_like(cross_boundary)
+            boundary_edges = int(patch_boundary_mask.sum().item())
+            contact_edges = int(contact_mask.sum().item())
+            patch_score = float(release_field[patch_mask].mean().item())
+            peak_score = float(release_field[patch_mask].max().item())
+            contact_score = min(1.0, contact_edges / max(float(patch_size), 1.0))
+            boundary_score = min(1.0, boundary_edges / max(float(patch_size), 1.0))
+            release_score = (
+                0.46 * peak_score
+                + 0.30 * patch_score
+                + 0.14 * contact_score
+                + 0.10 * boundary_score
+            )
+            if release_score < max(float(self.catastrophic_release_min_threshold), 0.72 * threshold):
+                continue
+
+            boundary_mask = patch_boundary_mask if boundary_edges > 0 else contact_mask
+            patches.append({
+                "mask": patch_mask,
+                "boundary_mask": boundary_mask,
+                "size": patch_size,
+                "seed_size": 1,
+                "cut_ratio": contact_score,
+                "center": positions[patch_mask].mean(dim=0),
+                "seed_center": seed_pos,
+                "plane_normal": torch.zeros(3, dtype=positions.dtype, device=positions.device),
+                "closure_score": 0.0,
+                "boundary_score": boundary_score,
+                "release_score": float(min(1.0, release_score + 0.20 * fragility)),
+                "support_lost": True,
+                "open_release": True,
+                "catastrophic_release": True,
+            })
+            used |= patch_mask
+            released_now += patch_size
+
+        self.last_catastrophic_release_patches = len(patches)
+        self.last_catastrophic_release_nodes = int(sum(int(patch["size"]) for patch in patches))
+        self.last_catastrophic_release_score_max = (
+            max(float(patch.get("release_score", 0.0)) for patch in patches)
+            if patches else 0.0
+        )
+        return patches
 
     def _build_open_crack_release_patch(
         self,

@@ -524,6 +524,10 @@ def simulate_prompt_metrics(
     fragment_manager = make_fragment_manager(fracture_params, device)
     max_cut_edges = 0
     max_closure = 0
+    max_open_release_patches = 0
+    max_open_release_nodes = 0
+    max_catastrophic_release_patches = 0
+    max_catastrophic_release_nodes = 0
     max_n_frags = 1
 
     for frame in range(int(frames)):
@@ -557,6 +561,22 @@ def simulate_prompt_metrics(
             max_n_frags = max(max_n_frags, int(n_frags))
             max_cut_edges = max(max_cut_edges, int(fragment_manager.last_cut_edges))
             max_closure = max(max_closure, int(fragment_manager.last_closure_candidate_count))
+            max_open_release_patches = max(
+                max_open_release_patches,
+                int(getattr(fragment_manager, "last_open_release_patches", 0)),
+            )
+            max_open_release_nodes = max(
+                max_open_release_nodes,
+                int(getattr(fragment_manager, "last_open_release_nodes", 0)),
+            )
+            max_catastrophic_release_patches = max(
+                max_catastrophic_release_patches,
+                int(getattr(fragment_manager, "last_catastrophic_release_patches", 0)),
+            )
+            max_catastrophic_release_nodes = max(
+                max_catastrophic_release_nodes,
+                int(getattr(fragment_manager, "last_catastrophic_release_nodes", 0)),
+            )
 
     c = fracture_field.c
     opening = fracture_field.a if fracture_field.a is not None else torch.zeros_like(c)
@@ -586,6 +606,10 @@ def simulate_prompt_metrics(
         "max_n_frags": int(max_n_frags),
         "max_cut_edges": int(max_cut_edges),
         "max_closure_candidates": int(max_closure),
+        "max_open_release_patches": int(max_open_release_patches),
+        "max_open_release_nodes": int(max_open_release_nodes),
+        "max_catastrophic_release_patches": int(max_catastrophic_release_patches),
+        "max_catastrophic_release_nodes": int(max_catastrophic_release_nodes),
         "branchiness": float(tips.sum().item() / max(int(visited.sum().item()), 1)),
     }
     metrics.update(_front_topology_metrics(crack_front, int(c.shape[0]), positions.device))

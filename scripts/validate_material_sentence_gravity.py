@@ -137,6 +137,18 @@ def _predict_row(
     return row, material_prior, scaled
 
 
+def _release_param_row(params: dict) -> dict:
+    return {
+        "runtime_catastrophic_release_enable": bool(params.get("catastrophic_release_enable", False)),
+        "runtime_catastrophic_release_fragility": float(params.get("catastrophic_release_fragility", 0.0)),
+        "runtime_catastrophic_release_threshold": float(params.get("catastrophic_release_threshold", 0.0)),
+        "runtime_catastrophic_release_min_threshold": float(params.get("catastrophic_release_min_threshold", 0.0)),
+        "runtime_catastrophic_release_patches_per_step": int(params.get("catastrophic_release_patches_per_step", 0)),
+        "runtime_catastrophic_release_patch_radius": float(params.get("catastrophic_release_patch_radius", 0.0)),
+        "runtime_catastrophic_release_max_released_ratio": float(params.get("catastrophic_release_max_released_ratio", 0.0)),
+    }
+
+
 @torch.no_grad()
 def run_surface_sweep(
     prompts: list[str],
@@ -165,6 +177,7 @@ def run_surface_sweep(
     for idx, prompt in enumerate(prompts):
         row, material_prior, scaled = _predict_row(prompt, predictor, adapter, config)
         fracture_params = _runtime_fracture_params(config, material_prior, scaled)
+        row.update(_release_param_row(fracture_params))
         print(f"[surface:{prefix}] {prompt!r} -> {row['family']} / {row['top1']}", flush=True)
         plot_path = None
         if bool(getattr(args, "plot_final", True)):
@@ -241,6 +254,9 @@ def _summarize_history(history: list[dict]) -> dict:
         "max_open_release_patches": int(max(int(row.get("open_release_patches", 0)) for row in history)),
         "max_open_release_nodes": int(max(int(row.get("open_release_nodes", 0)) for row in history)),
         "max_open_release_score": max_row("open_release_score_max"),
+        "max_catastrophic_release_patches": int(max(int(row.get("catastrophic_release_patches", 0)) for row in history)),
+        "max_catastrophic_release_nodes": int(max(int(row.get("catastrophic_release_nodes", 0)) for row in history)),
+        "max_catastrophic_release_score": max_row("catastrophic_release_score_max"),
         "max_physical_fragment_drop": max_row("physical_fragment_drop"),
         "max_physical_detached_distance": max_row("physical_detached_distance"),
         "max_detached_distance": max_row("detached_distance"),
@@ -361,13 +377,13 @@ def _write_gravity_report(rows: list[dict], out_dir: Path) -> None:
         "",
         "No-render gravity-drop run. CLIP predicts material priors, then the object falls under gravity and reports crack/fragment metrics.",
         "",
-        "| prompt | family | style | top1 | impact | frags max/final | cracked max/final | visited | tips | branch | c_max | cut_edges | open patches/nodes | drop | detach |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| prompt | family | style | top1 | impact | frags max/final | cracked max/final | visited | tips | branch | c_max | cut_edges | open p/n | cat p/n | drop | detach |",
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
         if row.get("error"):
             lines.append(
-                "| {prompt} | ERROR |  |  |  |  |  |  |  |  |  |  |  |  |  |".format(
+                "| {prompt} | ERROR |  |  |  |  |  |  |  |  |  |  |  |  |  |  |".format(
                     prompt=str(row.get("prompt", ""))[:46],
                 )
             )
@@ -375,7 +391,7 @@ def _write_gravity_report(rows: list[dict], out_dir: Path) -> None:
         lines.append(
             "| {prompt} | {family} | {style} | {top1} | {impact} | {maxf}/{finalf} | "
             "{maxc}/{finalc} | {visited} | {tips} | {branch:.3f} | "
-            "{cmax:.3f} | {cut} | {openp}/{openn} | {drop:.4f} | {detach:.4f} |".format(
+            "{cmax:.3f} | {cut} | {openp}/{openn} | {catp}/{catn} | {drop:.4f} | {detach:.4f} |".format(
                 prompt=row["prompt"][:46],
                 family=row["family"],
                 style=row.get("sentence_style", "material_default"),
@@ -392,6 +408,8 @@ def _write_gravity_report(rows: list[dict], out_dir: Path) -> None:
                 cut=row.get("max_cut_edges", 0),
                 openp=row.get("max_open_release_patches", 0),
                 openn=row.get("max_open_release_nodes", 0),
+                catp=row.get("max_catastrophic_release_patches", 0),
+                catn=row.get("max_catastrophic_release_nodes", 0),
                 drop=float(row.get("max_physical_fragment_drop", 0.0)),
                 detach=float(row.get("max_physical_detached_distance", 0.0)),
             )
@@ -459,6 +477,7 @@ def run_gravity_sweep(
             "density_mpm": result["params"]["density"],
             "elapsed_sec": time.time() - t0,
         }
+        row.update(_release_param_row(result["params"]))
         row.update(_summarize_history(history))
         plot_path = None
         if bool(getattr(args, "plot_final", True)):

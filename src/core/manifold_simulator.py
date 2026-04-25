@@ -199,6 +199,17 @@ class ManifoldSimulator:
             open_crack_release_max_patches=fp.get('open_crack_release_max_patches', 2),
             crack_style=fp.get('sentence_style', fp.get('crack_style', 'material_default')),
             brittle_release_intensity=fp.get('brittle_release_intensity', 1.0),
+            catastrophic_release_enable=fp.get('catastrophic_release_enable', False),
+            catastrophic_release_fragility=fp.get('catastrophic_release_fragility', 0.0),
+            catastrophic_release_threshold=fp.get('catastrophic_release_threshold', 0.36),
+            catastrophic_release_min_threshold=fp.get('catastrophic_release_min_threshold', 0.08),
+            catastrophic_release_threshold_decay=fp.get('catastrophic_release_threshold_decay', 0.010),
+            catastrophic_release_patches_per_step=fp.get('catastrophic_release_patches_per_step', 0),
+            catastrophic_release_patch_radius=fp.get('catastrophic_release_patch_radius', 0.060),
+            catastrophic_release_core_radius=fp.get('catastrophic_release_core_radius', 0.024),
+            catastrophic_release_min_size=fp.get('catastrophic_release_min_size', 16),
+            catastrophic_release_max_size_ratio=fp.get('catastrophic_release_max_size_ratio', 0.040),
+            catastrophic_release_max_released_ratio=fp.get('catastrophic_release_max_released_ratio', 0.55),
             material_family=fp.get('material_family', 'neutral_reference'),
             device=device_str,
         ) if frag_enabled else None
@@ -214,8 +225,8 @@ class ManifoldSimulator:
         self._fragment_activation_frame = -1
         self.material_family = str(fp.get('material_family', 'neutral_reference'))
         self.crack_style = str(fp.get('sentence_style', fp.get('crack_style', 'material_default')))
-        self.shard_enable = False
-        self.shard_count_scale = 0.0
+        self.shard_enable = bool(fp.get('shard_enable', False))
+        self.shard_count_scale = float(fp.get('shard_count_scale', 0.0))
         self.fragment_offset_gain = float(fp.get('fragment_offset_gain', 1.0))
         self.debris_motion_gain = float(fp.get('debris_motion_gain', 0.0))
         self.split_gap_gain = float(fp.get('split_gap_gain', 1.0))
@@ -2034,6 +2045,12 @@ class ManifoldSimulator:
             "open_release_nodes": (self.fragment_manager.last_open_release_nodes
                                    if self.fragment_manager else 0),
             "open_release_score_max": (self.fragment_manager.last_open_release_score_max
+                                       if self.fragment_manager else 0.0),
+            "catastrophic_release_patches": (self.fragment_manager.last_catastrophic_release_patches
+                                      if self.fragment_manager else 0),
+            "catastrophic_release_nodes": (self.fragment_manager.last_catastrophic_release_nodes
+                                   if self.fragment_manager else 0),
+            "catastrophic_release_score_max": (self.fragment_manager.last_catastrophic_release_score_max
                                        if self.fragment_manager else 0.0),
             "top_component_sizes": (self.fragment_manager.last_top_component_sizes
                                        if self.fragment_manager else []),
