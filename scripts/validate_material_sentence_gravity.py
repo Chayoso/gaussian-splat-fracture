@@ -146,6 +146,10 @@ def _release_param_row(params: dict) -> dict:
         "runtime_catastrophic_release_patches_per_step": int(params.get("catastrophic_release_patches_per_step", 0)),
         "runtime_catastrophic_release_patch_radius": float(params.get("catastrophic_release_patch_radius", 0.0)),
         "runtime_catastrophic_release_max_released_ratio": float(params.get("catastrophic_release_max_released_ratio", 0.0)),
+        "runtime_secondary_shatter_enable": bool(params.get("secondary_shatter_enable", False)),
+        "runtime_secondary_shatter_max_patches": int(params.get("secondary_shatter_max_patches", 0)),
+        "runtime_secondary_shatter_threshold": float(params.get("secondary_shatter_threshold", 0.0)),
+        "runtime_secondary_shatter_max_released_ratio": float(params.get("secondary_shatter_max_released_ratio", 0.0)),
     }
 
 
@@ -257,6 +261,9 @@ def _summarize_history(history: list[dict]) -> dict:
         "max_catastrophic_release_patches": int(max(int(row.get("catastrophic_release_patches", 0)) for row in history)),
         "max_catastrophic_release_nodes": int(max(int(row.get("catastrophic_release_nodes", 0)) for row in history)),
         "max_catastrophic_release_score": max_row("catastrophic_release_score_max"),
+        "max_secondary_shatter_patches": int(max(int(row.get("secondary_shatter_patches", 0)) for row in history)),
+        "max_secondary_shatter_nodes": int(max(int(row.get("secondary_shatter_nodes", 0)) for row in history)),
+        "max_secondary_shatter_score": max_row("secondary_shatter_score_max"),
         "max_physical_fragment_drop": max_row("physical_fragment_drop"),
         "max_physical_detached_distance": max_row("physical_detached_distance"),
         "max_detached_distance": max_row("detached_distance"),
@@ -377,13 +384,13 @@ def _write_gravity_report(rows: list[dict], out_dir: Path) -> None:
         "",
         "No-render gravity-drop run. CLIP predicts material priors, then the object falls under gravity and reports crack/fragment metrics.",
         "",
-        "| prompt | family | style | top1 | impact | frags max/final | cracked max/final | visited | tips | branch | c_max | cut_edges | open p/n | cat p/n | drop | detach |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| prompt | family | style | top1 | impact | frags max/final | cracked max/final | visited | tips | branch | c_max | cut_edges | open p/n | cat p/n | sec p/n | drop | detach |",
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
         if row.get("error"):
             lines.append(
-                "| {prompt} | ERROR |  |  |  |  |  |  |  |  |  |  |  |  |  |  |".format(
+                "| {prompt} | ERROR |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |".format(
                     prompt=str(row.get("prompt", ""))[:46],
                 )
             )
@@ -391,7 +398,7 @@ def _write_gravity_report(rows: list[dict], out_dir: Path) -> None:
         lines.append(
             "| {prompt} | {family} | {style} | {top1} | {impact} | {maxf}/{finalf} | "
             "{maxc}/{finalc} | {visited} | {tips} | {branch:.3f} | "
-            "{cmax:.3f} | {cut} | {openp}/{openn} | {catp}/{catn} | {drop:.4f} | {detach:.4f} |".format(
+            "{cmax:.3f} | {cut} | {openp}/{openn} | {catp}/{catn} | {secp}/{secn} | {drop:.4f} | {detach:.4f} |".format(
                 prompt=row["prompt"][:46],
                 family=row["family"],
                 style=row.get("sentence_style", "material_default"),
@@ -410,6 +417,8 @@ def _write_gravity_report(rows: list[dict], out_dir: Path) -> None:
                 openn=row.get("max_open_release_nodes", 0),
                 catp=row.get("max_catastrophic_release_patches", 0),
                 catn=row.get("max_catastrophic_release_nodes", 0),
+                secp=row.get("max_secondary_shatter_patches", 0),
+                secn=row.get("max_secondary_shatter_nodes", 0),
                 drop=float(row.get("max_physical_fragment_drop", 0.0)),
                 detach=float(row.get("max_physical_detached_distance", 0.0)),
             )

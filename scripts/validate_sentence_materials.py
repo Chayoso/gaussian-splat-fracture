@@ -528,6 +528,8 @@ def simulate_prompt_metrics(
     max_open_release_nodes = 0
     max_catastrophic_release_patches = 0
     max_catastrophic_release_nodes = 0
+    max_secondary_shatter_patches = 0
+    max_secondary_shatter_nodes = 0
     max_n_frags = 1
 
     for frame in range(int(frames)):
@@ -577,6 +579,14 @@ def simulate_prompt_metrics(
                 max_catastrophic_release_nodes,
                 int(getattr(fragment_manager, "last_catastrophic_release_nodes", 0)),
             )
+            max_secondary_shatter_patches = max(
+                max_secondary_shatter_patches,
+                int(getattr(fragment_manager, "last_secondary_shatter_patches", 0)),
+            )
+            max_secondary_shatter_nodes = max(
+                max_secondary_shatter_nodes,
+                int(getattr(fragment_manager, "last_secondary_shatter_nodes", 0)),
+            )
 
     c = fracture_field.c
     opening = fracture_field.a if fracture_field.a is not None else torch.zeros_like(c)
@@ -610,6 +620,8 @@ def simulate_prompt_metrics(
         "max_open_release_nodes": int(max_open_release_nodes),
         "max_catastrophic_release_patches": int(max_catastrophic_release_patches),
         "max_catastrophic_release_nodes": int(max_catastrophic_release_nodes),
+        "max_secondary_shatter_patches": int(max_secondary_shatter_patches),
+        "max_secondary_shatter_nodes": int(max_secondary_shatter_nodes),
         "branchiness": float(tips.sum().item() / max(int(visited.sum().item()), 1)),
     }
     metrics.update(_front_topology_metrics(crack_front, int(c.shape[0]), positions.device))

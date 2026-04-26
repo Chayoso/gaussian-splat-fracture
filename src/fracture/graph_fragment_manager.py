@@ -82,6 +82,17 @@ class GraphFragmentManager:
         catastrophic_release_min_size: int = 16,
         catastrophic_release_max_size_ratio: float = 0.040,
         catastrophic_release_max_released_ratio: float = 0.55,
+        secondary_shatter_enable: bool = False,
+        secondary_shatter_start_step: int = 4,
+        secondary_shatter_threshold: float = 0.18,
+        secondary_shatter_floor: float = 0.0,
+        secondary_shatter_max_patches: int = 0,
+        secondary_shatter_sector_count: int = 24,
+        secondary_shatter_band_count: int = 3,
+        secondary_shatter_height_count: int = 2,
+        secondary_shatter_min_size: int = 8,
+        secondary_shatter_max_size_ratio: float = 0.012,
+        secondary_shatter_max_released_ratio: float = 0.70,
         material_family: str = "neutral_reference",
         device: str = "cuda",
     ):
@@ -142,6 +153,17 @@ class GraphFragmentManager:
         self.catastrophic_release_max_size_ratio = float(catastrophic_release_max_size_ratio)
         self.catastrophic_release_max_released_ratio = float(catastrophic_release_max_released_ratio)
         self.catastrophic_release_step = 0
+        self.secondary_shatter_enable = bool(secondary_shatter_enable)
+        self.secondary_shatter_start_step = max(int(secondary_shatter_start_step), 0)
+        self.secondary_shatter_threshold = float(secondary_shatter_threshold)
+        self.secondary_shatter_floor = float(secondary_shatter_floor)
+        self.secondary_shatter_max_patches = max(int(secondary_shatter_max_patches), 0)
+        self.secondary_shatter_sector_count = max(int(secondary_shatter_sector_count), 1)
+        self.secondary_shatter_band_count = max(int(secondary_shatter_band_count), 1)
+        self.secondary_shatter_height_count = max(int(secondary_shatter_height_count), 1)
+        self.secondary_shatter_min_size = max(int(secondary_shatter_min_size), 1)
+        self.secondary_shatter_max_size_ratio = float(secondary_shatter_max_size_ratio)
+        self.secondary_shatter_max_released_ratio = float(secondary_shatter_max_released_ratio)
         self.material_family = str(material_family)
         self.device = torch.device(device)
 
@@ -189,6 +211,9 @@ class GraphFragmentManager:
         self.last_catastrophic_release_patches: int = 0
         self.last_catastrophic_release_nodes: int = 0
         self.last_catastrophic_release_score_max: float = 0.0
+        self.last_secondary_shatter_patches: int = 0
+        self.last_secondary_shatter_nodes: int = 0
+        self.last_secondary_shatter_score_max: float = 0.0
         self.last_effective_edge_damage: Optional[Tensor] = None
         self.edge_cut_memory: Optional[Tensor] = None
         self.authoritative_cut_memory: Optional[Tensor] = None
@@ -270,6 +295,9 @@ class GraphFragmentManager:
             self.last_catastrophic_release_patches = 0
             self.last_catastrophic_release_nodes = 0
             self.last_catastrophic_release_score_max = 0.0
+            self.last_secondary_shatter_patches = 0
+            self.last_secondary_shatter_nodes = 0
+            self.last_secondary_shatter_score_max = 0.0
             self.edge_cut_memory = None
             self.authoritative_cut_memory = None
             self.detached_node_memory = None
@@ -351,6 +379,9 @@ class GraphFragmentManager:
         self.last_catastrophic_release_patches = 0
         self.last_catastrophic_release_nodes = 0
         self.last_catastrophic_release_score_max = 0.0
+        self.last_secondary_shatter_patches = 0
+        self.last_secondary_shatter_nodes = 0
+        self.last_secondary_shatter_score_max = 0.0
         self.last_authoritative_cut_mask = None
         self.last_support_lost_mask = None
         self.last_closure_candidate_mask = None
@@ -573,6 +604,21 @@ class GraphFragmentManager:
         )
         explicit_patches.extend(
             self._extract_catastrophic_release_patches(
+                positions=positions,
+                graph=graph,
+                corridor_edge_mask=corridor_edge_mask,
+                damage=damage,
+                opening=opening,
+                active_tip_mask=active_tip_mask,
+                recent_front_mask=recent_front_mask,
+                used_mask=(
+                    torch.stack([patch["mask"] for patch in explicit_patches]).any(dim=0)
+                    if explicit_patches else None
+                ),
+            )
+        )
+        explicit_patches.extend(
+            self._extract_secondary_shatter_patches(
                 positions=positions,
                 graph=graph,
                 corridor_edge_mask=corridor_edge_mask,
@@ -1928,6 +1974,213 @@ class GraphFragmentManager:
         self.last_catastrophic_release_patches = len(patches)
         self.last_catastrophic_release_nodes = int(sum(int(patch["size"]) for patch in patches))
         self.last_catastrophic_release_score_max = (
+            max(float(patch.get("release_score", 0.0)) for patch in patches)
+            if patches else 0.0
+        )
+        return patches
+
+    def _extract_secondary_shatter_patches(
+        self,
+        positions: Optional[Tensor],
+        graph: GaussianGraph,
+        corridor_edge_mask: Tensor,
+        damage: Tensor,
+        opening: Optional[Tensor],
+        active_tip_mask: Optional[Tensor],
+        recent_front_mask: Optional[Tensor],
+        used_mask: Optional[Tensor] = None,
+    ) -> List[dict]:
+        """Late-stage surface tessellation for complete brittle breakup.
+
+        Catastrophic release follows the crack field with compact local patches.
+        This secondary pass is deliberately more graphical: after the crack
+        field has matured, brittle radial prompts can split the affected surface
+        into many stable sector/band labels without requiring closed rings.
+        """
+        if (
+            not self.secondary_shatter_enable
+            or self.material_family == "diffuse_damage"
+            or positions is None
+            or graph.knn_idx is None
+            or self.secondary_shatter_max_patches <= 0
+            or self.catastrophic_release_step < self.secondary_shatter_start_step
+        ):
+            return []
+
+        N = int(positions.shape[0])
+        if N <= 0:
+            return []
+
+        device = positions.device
+        dtype = damage.dtype
+        used = (
+            torch.zeros(N, dtype=torch.bool, device=device)
+            if used_mask is None else used_mask.clone()
+        )
+        max_released_nodes = max(
+            self.secondary_shatter_min_size,
+            int(round(max(0.0, min(self.secondary_shatter_max_released_ratio, 1.0)) * N)),
+        )
+        remaining_budget = max_released_nodes - int(used.sum().item())
+        if remaining_budget < self.secondary_shatter_min_size:
+            return []
+
+        edge_density = torch.zeros(N, dtype=dtype, device=device)
+        if corridor_edge_mask is not None and bool(corridor_edge_mask.any()):
+            edge_rows, edge_cols = torch.where(corridor_edge_mask)
+            nbr_idx = graph.knn_idx[edge_rows, edge_cols]
+            ones = torch.ones(edge_rows.shape[0], dtype=dtype, device=device)
+            edge_count = torch.zeros(N, dtype=dtype, device=device)
+            edge_count.index_add_(0, edge_rows, ones)
+            edge_count.index_add_(0, nbr_idx, ones)
+            edge_density = (edge_count / edge_count.max().clamp(min=1.0)).clamp(0.0, 1.0)
+
+        if opening is not None:
+            opening_scale = torch.quantile(opening.detach(), 0.90).clamp(min=1e-8)
+            opening_norm = (opening / opening_scale).clamp(0.0, 1.0)
+        else:
+            opening_norm = torch.zeros_like(damage)
+
+        front_score = torch.zeros_like(damage)
+        if recent_front_mask is not None:
+            front_score = torch.maximum(front_score, recent_front_mask.float())
+        if active_tip_mask is not None:
+            front_score = torch.maximum(front_score, active_tip_mask.float())
+
+        release_field = (
+            0.34 * damage.clamp(0.0, 1.0)
+            + 0.18 * opening_norm
+            + 0.22 * front_score
+            + 0.26 * edge_density
+        ).clamp(0.0, 1.0)
+
+        fragility = max(0.0, min(float(self.catastrophic_release_fragility), 1.5))
+        weights = (damage.clamp(min=0.0) + 0.35 * opening_norm + 0.25 * edge_density).detach()
+        if bool((weights > 1e-6).any()):
+            center = (positions * weights.unsqueeze(1)).sum(dim=0) / weights.sum().clamp(min=1e-8)
+        else:
+            center = positions.mean(dim=0)
+        centered = positions - center.unsqueeze(0)
+        xy = centered[:, :2]
+        radial = torch.norm(xy, dim=1)
+        radial_norm = radial / radial.max().clamp(min=1e-8)
+        theta = torch.atan2(xy[:, 1], xy[:, 0])
+        z = positions[:, 2]
+        z_norm = ((z - z.min()) / (z.max() - z.min()).clamp(min=1e-8)).clamp(0.0, 1.0)
+
+        floor = max(float(self.secondary_shatter_floor), 0.0)
+        if self.material_family == "sharp_brittle" and self.crack_style == "radial_shatter":
+            floor = max(floor, 0.13 + 0.055 * min(fragility, 1.0))
+        elif self.material_family == "rough_quasi_brittle" and self.crack_style == "chunky_crumble":
+            floor = max(floor, 0.08 + 0.030 * min(fragility, 1.0))
+        if floor > 0.0:
+            phase = theta * max(self.secondary_shatter_sector_count, 1) * 0.5
+            phase = phase + radial_norm * max(self.secondary_shatter_band_count, 1) * math.pi
+            wedge_score = 0.5 + 0.5 * torch.sin(phase)
+            coeff = torch.tensor([12.9898, 78.233, 37.719], dtype=positions.dtype, device=device)
+            hashed = torch.sin((positions * coeff.unsqueeze(0)).sum(dim=1)) * 43758.5453
+            hash_score = hashed - torch.floor(hashed)
+            release_field = torch.maximum(
+                release_field,
+                (floor + 0.025 * wedge_score + 0.015 * hash_score).clamp(0.0, 1.0),
+            )
+
+        threshold = max(
+            0.02,
+            float(self.secondary_shatter_threshold) / (0.90 + 0.25 * min(fragility, 1.0)),
+        )
+        candidate = (~used) & (release_field >= threshold)
+        if not bool(candidate.any()):
+            return []
+
+        sectors = self.secondary_shatter_sector_count
+        bands = self.secondary_shatter_band_count
+        heights = self.secondary_shatter_height_count
+        sector_id = (((theta + math.pi) / (2.0 * math.pi)) * sectors).floor().long()
+        sector_id = sector_id.clamp(0, sectors - 1)
+        band_id = (radial_norm * bands).floor().long().clamp(0, bands - 1)
+        height_id = (z_norm * heights).floor().long().clamp(0, heights - 1)
+        group_id = sector_id + sectors * (band_id + bands * height_id)
+        unique_groups = group_id[candidate].unique(sorted=False)
+
+        min_size = max(int(self.secondary_shatter_min_size), 1)
+        max_patch_size = max(
+            min_size,
+            int(round(max(self.secondary_shatter_max_size_ratio, 0.001) * N)),
+        )
+        group_candidates = []
+        for gid in unique_groups.tolist():
+            mask = candidate & (group_id == gid)
+            size = int(mask.sum().item())
+            if size < min_size:
+                continue
+            score = float(release_field[mask].mean().item())
+            peak = float(release_field[mask].max().item())
+            size_score = min(1.0, size / max(float(max_patch_size), 1.0))
+            group_candidates.append((0.52 * peak + 0.34 * score + 0.14 * size_score, gid, size))
+
+        group_candidates.sort(reverse=True)
+        patches: List[dict] = []
+        released_now = 0
+        for _, gid, _ in group_candidates[: max(self.secondary_shatter_max_patches * 2, 1)]:
+            if len(patches) >= self.secondary_shatter_max_patches:
+                break
+            if released_now >= remaining_budget:
+                break
+            patch_mask = candidate & (group_id == gid) & (~used)
+            patch_size = int(patch_mask.sum().item())
+            if patch_size < min_size:
+                continue
+            allowed_size = min(max_patch_size, remaining_budget - released_now)
+            if allowed_size < min_size:
+                break
+            if patch_size > allowed_size:
+                patch_idx = torch.where(patch_mask)[0]
+                local = release_field[patch_idx].topk(int(allowed_size)).indices
+                keep = patch_idx[local]
+                patch_mask.zero_()
+                patch_mask[keep] = True
+                patch_size = int(patch_mask.sum().item())
+                if patch_size < min_size:
+                    continue
+
+            patch_side = patch_mask.unsqueeze(1)
+            neighbor_side = patch_mask[graph.knn_idx]
+            cross_boundary = patch_side ^ neighbor_side
+            if corridor_edge_mask is not None:
+                patch_boundary_mask = corridor_edge_mask & cross_boundary
+            else:
+                patch_boundary_mask = torch.zeros_like(cross_boundary)
+            boundary_mask = patch_boundary_mask if bool(patch_boundary_mask.any()) else cross_boundary
+            boundary_edges = int(boundary_mask.sum().item())
+            patch_score = float(release_field[patch_mask].mean().item())
+            peak_score = float(release_field[patch_mask].max().item())
+            boundary_score = min(1.0, boundary_edges / max(float(patch_size), 1.0))
+            release_score = min(1.0, 0.42 * peak_score + 0.36 * patch_score + 0.22 * boundary_score)
+            seed_index = int(torch.where(patch_mask)[0][0].item())
+            patches.append({
+                "mask": patch_mask,
+                "boundary_mask": boundary_mask,
+                "size": patch_size,
+                "seed_size": 1,
+                "cut_ratio": boundary_score,
+                "center": positions[patch_mask].mean(dim=0),
+                "seed_center": positions[seed_index],
+                "plane_normal": torch.zeros(3, dtype=positions.dtype, device=positions.device),
+                "closure_score": 0.0,
+                "boundary_score": boundary_score,
+                "release_score": max(0.72, release_score),
+                "support_lost": True,
+                "open_release": True,
+                "catastrophic_release": True,
+                "secondary_shatter": True,
+            })
+            used |= patch_mask
+            released_now += patch_size
+
+        self.last_secondary_shatter_patches = len(patches)
+        self.last_secondary_shatter_nodes = int(sum(int(patch["size"]) for patch in patches))
+        self.last_secondary_shatter_score_max = (
             max(float(patch.get("release_score", 0.0)) for patch in patches)
             if patches else 0.0
         )

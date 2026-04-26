@@ -210,6 +210,17 @@ class ManifoldSimulator:
             catastrophic_release_min_size=fp.get('catastrophic_release_min_size', 16),
             catastrophic_release_max_size_ratio=fp.get('catastrophic_release_max_size_ratio', 0.040),
             catastrophic_release_max_released_ratio=fp.get('catastrophic_release_max_released_ratio', 0.55),
+            secondary_shatter_enable=fp.get('secondary_shatter_enable', False),
+            secondary_shatter_start_step=fp.get('secondary_shatter_start_step', 4),
+            secondary_shatter_threshold=fp.get('secondary_shatter_threshold', 0.18),
+            secondary_shatter_floor=fp.get('secondary_shatter_floor', 0.0),
+            secondary_shatter_max_patches=fp.get('secondary_shatter_max_patches', 0),
+            secondary_shatter_sector_count=fp.get('secondary_shatter_sector_count', 24),
+            secondary_shatter_band_count=fp.get('secondary_shatter_band_count', 3),
+            secondary_shatter_height_count=fp.get('secondary_shatter_height_count', 2),
+            secondary_shatter_min_size=fp.get('secondary_shatter_min_size', 8),
+            secondary_shatter_max_size_ratio=fp.get('secondary_shatter_max_size_ratio', 0.012),
+            secondary_shatter_max_released_ratio=fp.get('secondary_shatter_max_released_ratio', 0.70),
             material_family=fp.get('material_family', 'neutral_reference'),
             device=device_str,
         ) if frag_enabled else None
@@ -2051,6 +2062,12 @@ class ManifoldSimulator:
             "catastrophic_release_nodes": (self.fragment_manager.last_catastrophic_release_nodes
                                    if self.fragment_manager else 0),
             "catastrophic_release_score_max": (self.fragment_manager.last_catastrophic_release_score_max
+                                       if self.fragment_manager else 0.0),
+            "secondary_shatter_patches": (self.fragment_manager.last_secondary_shatter_patches
+                                      if self.fragment_manager else 0),
+            "secondary_shatter_nodes": (self.fragment_manager.last_secondary_shatter_nodes
+                                   if self.fragment_manager else 0),
+            "secondary_shatter_score_max": (self.fragment_manager.last_secondary_shatter_score_max
                                        if self.fragment_manager else 0.0),
             "top_component_sizes": (self.fragment_manager.last_top_component_sizes
                                        if self.fragment_manager else []),
