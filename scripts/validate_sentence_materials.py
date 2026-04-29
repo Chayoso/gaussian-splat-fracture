@@ -103,8 +103,14 @@ def _release_mode_for_row(row: dict) -> str:
 
 def _release_verdict_for_row(row: dict) -> tuple[str, str]:
     mode = _release_mode_for_row(row)
-    max_frags = int(row.get("max_n_fragments", row.get("max_n_frags", 0)) or 0)
-    final_frags = int(row.get("final_n_fragments", row.get("final_fragment_label_count", max_frags)) or 0)
+    max_frags = max(
+        int(row.get("max_n_fragments", row.get("max_n_frags", 0)) or 0),
+        int(row.get("final_component_count", 0) or 0),
+    )
+    final_frags = max(
+        int(row.get("final_n_fragments", row.get("final_fragment_label_count", max_frags)) or 0),
+        int(row.get("final_component_count", 0) or 0),
+    )
     released = float(row.get("final_released_node_ratio", 0.0) or 0.0)
     largest = float(row.get("final_largest_fragment_ratio", 1.0) or 1.0)
     detach = float(row.get("max_physical_detached_distance", row.get("physical_detached_distance", 0.0)) or 0.0)
