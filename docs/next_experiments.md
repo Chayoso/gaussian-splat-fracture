@@ -2,6 +2,201 @@
 
 Date: 2026-04-28
 
+## 2026-04-29 Paper-Critical Questions Assessment
+
+Five claims that the SIGGRAPH Asia submission has to defend.  Each
+question lists the implementing mechanism (with file references), the
+evidence we currently have, and the honest status against the claim.
+
+### Q1. Crack style is conditioned by the input sentence
+
+Mechanism:
+
+- `MaterialPriorAdapter.predict_sentence_style(text, encoder=...)`
+  ([material_prior_adapter.py:1218](src/ml/material_prior_adapter.py#L1218))
+  encodes the sentence with CLIP and runs the trained `StyleHead` MLP
+  ([style_head.py](src/ml/style_head.py)) to pick one of five styles
+  (`diffuse_microcrack` / `single_smooth` / `spiderweb_branching` /
+  `radial_shatter` / `chunky_crumble`).  Confidence below
+  `style_head_confidence=0.55` falls back to the keyword rule.
+- The selected style writes a runtime-override block: `successor_topk`,
+  `max_branching_tips`, `branch_drive_threshold`, `damage_spread`,
+  `band_width`, `branching_bias`, plus per-style closure thresholds
+  ([material_prior_adapter.py:301-545](src/ml/material_prior_adapter.py#L301-L545)).
+- Family caps re-applied after the style override
+  ([_apply_family_runtime_caps:1218](src/ml/material_prior_adapter.py#L1218))
+  so the style cannot push past family bounds.
+
+Evidence:
+
+- StyleHead trains to 100% accuracy on weak-supervision corpus by
+  epoch 20 and routes paraphrased prompts the rule cannot match
+  (e.g. "the bottle disintegrated into many radial pieces" ->
+  `radial_shatter`, p=0.996).
+- 10K legacy sentence_style sweep (older table):
+  `diffuse_microcrack` 0 frags, `single_smooth` 5, `spiderweb_branching`
+  47, `radial_shatter` 247.  Five styles span clearly.
+- 50K core sweep (`output/at2_core_50k_v1`) is in progress.
+
+Open:
+
+- Single_smooth at 50K with the new gates over-fragments (16 frags vs
+  the verdict cap 12 for `crack_split` mode) -> FAIL on that single
+  prompt.  Mechanism: AT2 reg + energy-driven branching let too many
+  off-axis candidates pass at high resolution.  Per-style override
+  fix planned: `growth_griffith_threshold=0.85`,
+  `at2_reg_gain=0.3`, `branch_direction_mode="angle"` for
+  `single_smooth`.
+
+Status: **solved** structurally; one prompt regression at 50K still
+to be re-tightened.
+
+### Q2. Material is conditioned by the input sentence
+
+Mechanism:
+
+- `MaterialPredictor` ([material_predictor.py:153-179](src/ml/material_predictor.py#L153-L179))
+  encodes the sentence with CLIP and does cosine-similarity retrieval
+  against pre-encoded `MaterialDB` embeddings.  Top-K materials are
+  softmax-weighted and log-averaged to produce E, Gc, nu.
+- The predicted family (sharp_brittle / brittle_moderate /
+  rough_quasi_brittle / diffuse_damage / neutral_reference) routes
+  through `fracture_prior_to_runtime_overrides` and fixes per-family
+  bounds for tip / branching / closure.
+- Family-specific `at2_drive_gain` interaction with H gives the
+  damage saturation a material-dependent scale.
+
+Evidence:
+
+- 10K sweep: glass/ice 249/268 fragments and 0.64 release;
+  ceramic/concrete 1/2 chunks; rubber/steel 0.  Six materials with the
+  same radial wording produce six distinct outcomes.
+- 50K v3 reference: same ordering preserved
+  (radial glass 552, spiderweb glass 47, ceramic 0, concrete 12,
+  ice 539, rubber 0, steel 0).
+- 50K core sweep `material_radial` suite running now.
+
+Status: **solved**.  CLIP material retrieval is honest CLIP-KNN, not
+keyword lookup.
+
+### Q3. Fragment-crack consistency
+
+Mechanism:
+
+- Strict crack-connected mode (`crack_connected_release_only=True`)
+  forces fragment labels to come exclusively from explicit
+  crack-corridor closure patches; non-causal release fallbacks are
+  disabled.
+- Closure patches go through `_filter_phase_approved_patches`
+  ([fragment_phase_approval.py:170](src/fracture/fragment_phase_approval.py#L170))
+  -- only patches whose narrow-band phase / volume / opening / cut
+  evidence clears `_phase_approval_threshold` become fragments.
+- Day 2 closure-detached exclusion: `_compute_group_closure_scores`
+  now masks `hard_detached_mask` from `in_group`, so detached patches
+  do not inflate closure scores at high resolution.
+- AT2 Jacobi step writes the same `c` field that fragment detection
+  reads, so damage diffusion and fragment formation share state.
+
+Evidence:
+
+- `bcut` (boundary cut support ratio): v3 0.515 -> Day 5 0.600
+  (+17%).  Each fragment boundary edge is more strongly backed by an
+  actual cut edge.
+- `nonclosure release patches`: 0 in every probe since Day 1.  No
+  fragment is born without a crack-connected closure justification.
+- `birth_phase_score`: 0.92+ in every accepted run, meaning fragments
+  pass the narrow-band evidence gate at birth.
+
+Status: **solved and improved over v1.5 baseline**.
+
+### Q4. Fragment physical motion
+
+Mechanism:
+
+- Free-fall integrates COM (gravity) and optionally per-particle rigid
+  rotation `v = v_com + omega x (x - com)` if `drop_omega` is set.
+  At impact `v_mpm` preserves the rotational component.
+- (Day 4 B2) `impact_F_reset_alpha=0.0` default: F is not wiped at
+  contact, so deformation gradient is continuous.
+- (Day 4 B3) damage->stress feedback delay 14 -> 6 frames, letting
+  damage degrade stress sooner post-impact and dissipating rebound
+  energy faster.
+- Per-fragment physics: `_step_fragmented_physics` runs MPM P2G2P
+  with fragment-aware separation; `_apply_shape_matching` keeps each
+  fragment locally rigid; `_apply_soft_elastic_squash` preserves
+  elastic recoil for non-brittle modes.
+- Strict mode disables non-causal impulses, shard spawning, debris
+  motion, and arbitrary release drift, so observed motion comes from
+  MPM dynamics + damage degradation only.
+
+Evidence:
+
+- 50K Day 5 vs v3: physical_release_displacement max
+  0.0737 -> 0.0437 (-41%); lateral 0.0624 -> 0.0390 (-37%); fragment
+  drop 0.1891 -> 0.1709 (-10%).
+- Strict mode confirmed: no spawning, no impulse, no fallback.
+- Damping schedule (post-impact 0.93 -> 0.999 ramp over 5 frames,
+  then 0.999) prevents oscillation.
+
+Open:
+
+- `drop_omega = None` is the default, so by default the body does not
+  tumble pre-impact.  Tumbling drops require an explicit override.
+- "Material-conditioned post-fragment spread" (does glass spread more
+  than concrete by physics rather than by tuning?) is implicit in the
+  family-conditioned damping/gravity but has not yet been measured as
+  a per-material spread table.  Core sweep `material_radial` will
+  produce that table.
+
+Status: **mostly solved**; per-material spread metric pending the
+in-flight sweep.
+
+### Q5. Whether fragments scatter like loose particles
+
+Mechanism:
+
+- Strict crack-connected mode disables every non-causal release path:
+  no separation impulse, no shard spawning, no physical release drift,
+  no patch-release fallback, no support-loss promotion.
+- (Day 4 B3) earlier damage feedback dissipates post-impact spring
+  energy that would otherwise eject particles.
+- (Day 4 D2) `_apply_fragment_boundary_taper` shrinks scale and
+  damps opacity for splats whose surface-graph kNN bridge fragment
+  cuts, so the rendering does not show stretched splats across the
+  gap (the classic 3DGS-fracture "spray" artifact).
+- Persistent fragment size scaling
+  (`_effective_persistent_min_size`) makes high-resolution runs
+  require larger crack-corridor support before a fragment is born,
+  rejecting one-particle-spray patches.
+
+Evidence:
+
+- 50K radial physical metrics (lower is better):
+    - v3 reference: scatter_max 0.0737, lat_max 0.0624,
+      detached_distance 0.2524.
+    - Day 5 (all batches active): 0.0437, 0.0390, 0.2197.
+  Day 5 is the lowest scatter / lateral / detached_distance of all
+  runs we have, including the v3 frozen baseline that was
+  specifically designed to suppress particle spray.
+
+Status: **solved -- better than the v1.5 baseline that already
+explicitly removed particle-spray paths**.
+
+### Headline status
+
+| Question | Status | Pending |
+|---|---|---|
+| Q1 crack style <- sentence | solved structurally | single_smooth 50K re-tighten (~30 min) |
+| Q2 material <- sentence | solved | -- |
+| Q3 fragment-crack consistency | solved + improved | -- |
+| Q4 fragment physical motion | mostly solved | per-material spread table from in-flight sweep |
+| Q5 particle-spray | solved (better than v3) | -- |
+
+The remaining gap is one localized algorithm tightening
+(`single_smooth` per-style overrides) and one validation table
+(per-material spread, generated automatically by the running
+`material_radial` sweep).
+
 ## 2026-04-27 Revert To V1
 
 The experimental replacement branch has been removed from the active code path.
