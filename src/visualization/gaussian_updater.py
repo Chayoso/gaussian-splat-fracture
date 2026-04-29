@@ -333,6 +333,77 @@ class GaussianCrackVisualizer:
         gaussians._interior_normals = None
 
     @torch.no_grad()
+    def _apply_fragment_boundary_taper(
+        self,
+        gaussians,
+        fragment_ids: Tensor,
+        graph_knn_idx: Tensor,
+        boundary_threshold: float = 0.25,
+        max_scale_shrink: float = 0.40,
+        max_opacity_drop: float = 0.50,
+    ) -> None:
+        """Shrink scale and reduce opacity for splats that bridge fragment cuts.
+
+        A 3DGS splat whose ~3-sigma footprint extends across a fragment
+        boundary causes the classic "stretched splat across the gap" artifact
+        in fracture renders.  We approximate the bridging condition by the
+        fraction of the splat's surface-graph kNN that belong to a different
+        fragment than self; bridging splats are tapered proportional to the
+        boundary fraction (above ``boundary_threshold``).
+
+        Args:
+            fragment_ids: (N_surf,) per-Gaussian fragment label
+            graph_knn_idx: (N_surf, k) kNN index tensor on the same N_surf
+            boundary_threshold: fraction of mismatched neighbors above which
+                a splat is considered to bridge a cut
+            max_scale_shrink: max log-scale shrink (1 - shrink) at boundary
+            max_opacity_drop: max opacity multiplicative drop at boundary
+        """
+        if fragment_ids is None or graph_knn_idx is None:
+            return
+        N = int(fragment_ids.shape[0])
+        if N <= 0 or graph_knn_idx.shape[0] != N:
+            return
+        base_n = int(self._base_count) if self._base_count else N
+        if gaussians._scaling.data.shape[0] < base_n or N > base_n:
+            return
+        if graph_knn_idx.numel() == 0:
+            return
+
+        nbr_frags = fragment_ids[graph_knn_idx]                # (N, k)
+        self_frags = fragment_ids.unsqueeze(1)
+        mismatch = (nbr_frags != self_frags).float()           # (N, k)
+        boundary_fraction = mismatch.mean(dim=1)               # (N,)
+
+        active = boundary_fraction > boundary_threshold
+        if not bool(active.any()):
+            return
+
+        taper = (
+            (boundary_fraction - boundary_threshold)
+            / max(1.0 - boundary_threshold, 1e-6)
+        ).clamp(0.0, 1.0)
+
+        active_idx = torch.where(active)[0]
+        active_idx = active_idx[active_idx < base_n]
+        if active_idx.numel() == 0:
+            return
+        t = taper[active_idx]
+
+        scale_mult = (1.0 - max_scale_shrink * t).clamp(min=0.20)
+        log_mult = torch.log(scale_mult).unsqueeze(1)
+        gaussians._scaling.data[active_idx] = (
+            gaussians._scaling.data[active_idx] + log_mult
+        )
+
+        opacity_mult = (1.0 - max_opacity_drop * t).clamp(min=0.05)
+        prob = torch.sigmoid(gaussians._opacity.data[active_idx])
+        new_prob = (prob * opacity_mult.unsqueeze(1)).clamp(1e-6, 1.0 - 1e-6)
+        gaussians._opacity.data[active_idx] = torch.log(
+            new_prob / (1.0 - new_prob)
+        )
+
+    @torch.no_grad()
     def _apply_fragment_shell_styling(
         self,
         gaussians,
@@ -453,6 +524,7 @@ class GaussianCrackVisualizer:
         crack_visited: Tensor = None,
         fragment_ids: Tensor = None,
         shard_mask: Tensor = None,
+        graph_knn_idx: Tensor = None,
     ):
         """Update Gaussian properties each frame.
 
@@ -465,6 +537,10 @@ class GaussianCrackVisualizer:
             F_per_gaussian:   (N_surf, 3, 3) deformation gradient per Gaussian
             crack_normals:    (N_surf, 3) crack normal directions (from manifold fracture)
             crack_opening:    (N_surf,) crack opening magnitudes (from manifold fracture)
+            graph_knn_idx:    (N_surf, k) per-node kNN indices on the surface
+                              graph; if provided, splats whose neighbors
+                              straddle a fragment boundary are tapered to
+                              avoid stretching artifacts across the cut.
         """
         # Store camera position for back-face normal flipping
         self._camera_pos = camera_pos
@@ -504,6 +580,12 @@ class GaussianCrackVisualizer:
             fragment_ids=fragment_ids,
             shard_mask=shard_mask,
         )
+
+        # Taper splats whose support footprint straddles a fragment cut so
+        # they don't visibly stretch across the gap.
+        if fragment_ids is not None and graph_knn_idx is not None:
+            self._apply_fragment_boundary_taper(
+                gaussians, fragment_ids, graph_knn_idx)
 
         self._append_interior_crack_faces(
             gaussians,

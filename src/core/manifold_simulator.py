@@ -338,10 +338,15 @@ class ManifoldSimulator(
         self._next_physical_fragment_id = 1
         self._reset_frame_fragment_event_stats()
 
+        # Post-impact damage→stress feedback timing.  Original baseline used
+        # 8-frame delay + 6-frame ramp = 14 decoupled frames, leaving
+        # shape-matching as the dominant cohesion in the most informative
+        # window.  Conservative tightening (4+2 = 6 frames) keeps stability
+        # while letting damage influence stress earlier.
         self.damage_feedback_delay_frames = int(
-            fp.get('damage_feedback_delay_frames', 8))
+            fp.get('damage_feedback_delay_frames', 4))
         self.damage_feedback_ramp_frames = int(
-            fp.get('damage_feedback_ramp_frames', 6))
+            fp.get('damage_feedback_ramp_frames', 2))
         self.interior_damage_scale = float(
             fp.get('interior_damage_scale', 0.2))
         self.volumetric_cut_damage_scale = float(
@@ -533,10 +538,22 @@ class ManifoldSimulator(
         self._gravity_drop = True
         self._gravity_drop_ground_z = ground_z
         self._gravity_drop_contacted = False
-        self._v_com = torch.zeros(3, device=self.mpm.gravity.device)
+        device = self.mpm.gravity.device
+        self._v_com = torch.zeros(3, device=device)
+        # Initial angular velocity of the body during free-fall (rad / sec).
+        # Default zero; can be set non-zero from config to give a tumbling
+        # drop, in which case impact velocities reflect the rigid rotation.
+        drop_omega = self.fracture_cfg.get('drop_omega', None)
+        if drop_omega is None:
+            self._omega_com = torch.zeros(3, device=device)
+        else:
+            self._omega_com = torch.tensor(
+                list(drop_omega), device=device, dtype=torch.float32
+            )
         if self.x_mpm is not None:
             self._shape_match_rest_positions = self.x_mpm.detach().clone()
-        print(f"[GravityDrop] Enabled. Ground at z={ground_z}")
+        print(f"[GravityDrop] Enabled. Ground at z={ground_z}, "
+              f"omega={self._omega_com.tolist()}")
 
     def initialize(self, init_positions: Tensor):
         """Initialize simulation state from particle positions in [0,1]^3."""
@@ -674,11 +691,25 @@ class ManifoldSimulator(
     @torch.no_grad()
     def _step_physics(self, dt: float):
         """Single MPM physics timestep."""
-        # Phase 1: free-fall (no grid physics)
+        # Phase 1: free-fall (no grid physics).  COM follows gravity; if a
+        # non-zero drop_omega was configured, every particle additionally
+        # gets a rigid-body rotational velocity v = omega x (x - com), so
+        # the body tumbles in flight and arrives at the ground with
+        # spatially-varying impact velocities (no torque, omega is
+        # conserved in free-fall).
         if self._gravity_drop and not self._gravity_drop_contacted:
             g = self.mpm.gravity
             self._v_com = self._v_com + dt * g
-            self.x_mpm = self.x_mpm + dt * self._v_com.unsqueeze(0)
+            omega = getattr(self, '_omega_com', None)
+            if omega is not None and float(omega.norm().item()) > 1e-8:
+                com = self.x_mpm.mean(dim=0)
+                rel = self.x_mpm - com.unsqueeze(0)
+                v_rot = torch.cross(
+                    omega.unsqueeze(0).expand_as(rel), rel, dim=1)
+                v_total = self._v_com.unsqueeze(0) + v_rot
+                self.x_mpm = self.x_mpm + dt * v_total
+            else:
+                self.x_mpm = self.x_mpm + dt * self._v_com.unsqueeze(0)
 
             z_min = self.x_mpm[:, 2].min().item()
             step = self._physics_step
@@ -1388,6 +1419,14 @@ class ManifoldSimulator(
             crack_tips=crack_tips,
             crack_visited=crack_visited,
             fragment_ids=surf_frag,
+            graph_knn_idx=(
+                self.graph.knn_idx
+                if (self.graph is not None
+                    and getattr(self.graph, "knn_idx", None) is not None
+                    and surf_frag is not None
+                    and self.graph.knn_idx.shape[0] == surf_frag.shape[0])
+                else None
+            ),
         )
 
         shard_mask = None
@@ -1428,7 +1467,18 @@ class ManifoldSimulator(
     def _handle_ground_impact(self):
         """Handle ground contact in gravity drop mode."""
         self._gravity_drop_contacted = True
-        self.v_mpm[:] = self._v_com.unsqueeze(0)
+        # Per-particle impact velocity: COM translation plus rigid rotation
+        # contribution if the body is tumbling.  This preserves angular
+        # momentum across the impact event (B1+B2 SIGGRAPH defense).
+        omega = getattr(self, '_omega_com', None)
+        if omega is not None and float(omega.norm().item()) > 1e-8:
+            com = self.x_mpm.mean(dim=0)
+            rel = self.x_mpm - com.unsqueeze(0)
+            v_rot = torch.cross(
+                omega.unsqueeze(0).expand_as(rel), rel, dim=1)
+            self.v_mpm[:] = self._v_com.unsqueeze(0) + v_rot
+        else:
+            self.v_mpm[:] = self._v_com.unsqueeze(0)
         v_impact = self._v_com[2].item()
         impact_speed = abs(float(v_impact))
         self._soft_impact_speed = impact_speed
@@ -1440,9 +1490,24 @@ class ManifoldSimulator(
             self.fragment_manager.impact_release_gain = self._impact_release_gain
         print(f"  [IMPACT] Ground contact! v_impact={v_impact:.3f}")
 
+        # Soft F reset: blend F toward identity rather than wipe.  alpha=0
+        # preserves all pre-impact deformation (paper-defensible: physics is
+        # continuous through impact); alpha=1 is the legacy hard reset.
+        # Default alpha is 0.0 because in pure free-fall F doesn't accumulate
+        # significant deviation from I, so the soft path is numerically safe.
+        f_reset_alpha = float(
+            self.fracture_cfg.get('impact_F_reset_alpha', 0.0)
+        )
+        f_reset_alpha = min(max(f_reset_alpha, 0.0), 1.0)
         N = self.F.shape[0]
-        self.F = torch.eye(3, device=self.F.device).unsqueeze(0).expand(N, 3, 3).clone()
-        self.C = torch.zeros_like(self.C)
+        if f_reset_alpha > 0.0:
+            eye = torch.eye(
+                3, device=self.F.device, dtype=self.F.dtype
+            ).unsqueeze(0).expand(N, 3, 3)
+            self.F = ((1.0 - f_reset_alpha) * self.F
+                      + f_reset_alpha * eye).clone()
+            self.C = (1.0 - f_reset_alpha) * self.C
+        # else: leave F and C as-is — physics is continuous.
         self.frame_count = 0
         self._impact_frame_count = 0
 
