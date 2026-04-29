@@ -217,6 +217,113 @@ Readout:
   same settings on at least one non-bunny mesh before using this as final
   paper evidence.
 
+## 2026-04-29 SIGGRAPH Asia Push (Day 1-5 algorithm)
+
+The week-1 algorithm work targets the audit-flagged claim risks for the
+SIGGRAPH Asia submission.  Five batches landed:
+
+### Day 1 — AT2 Jacobi base + Tier 1 cleanup (`0aac388`)
+
+- `tip_based_fracture_field._evolve_damage_at2`: row-normalized graph
+  Jacobi step toward the AT2 phase-field equilibrium
+
+      c_eq = (a*H + b*(l0/sigma)^2 * lap_c) / (1 + a*H)
+
+  with `a = at2_drive_gain` and `b = at2_reg_gain`.  Runs as a base
+  layer before the structured tip-based advance so that broad damage
+  diffusion + irreversible H-driven saturation follows the standard
+  Bourdin-Francfort-Marigo form.  Defaults `a=1.0, b=1.0,
+  at2_dc_fraction=0.5`.  `at2_drive_gain=0.0` disables AT2 for ablation.
+- Removed the dead aspirational `gaussian_fracture_field.py`; AT2 logic
+  now lives in `tip_based_fracture_field`.
+- Cleanup: `_effective_impact_release_gain` (dead helper),
+  `gaussian_splitter.py:425-433` (unreachable), 11 orphan YAML keys in
+  `phase_field:`, deterministic CUDA flags.
+
+### Day 2 — Griffith gate + energy branching + family cap + SH l=1 + closure/phase fixes (`c2f49db`)
+
+- Griffith gate: candidate must clear `growth_griffith_threshold=0.50`
+  of normalized drive before being considered, separate from the soft
+  aggregate score.  Defends "energy-conditioned propagation" against
+  the percentile-only baseline.
+- `branch_direction_mode="energy"`: branch picks lateral candidate
+  with highest local drive (Karma-Lobkovsky-like).  Hash-noise angle
+  target demoted to a soft modulator floored at 0.50.  `"angle"` mode
+  preserved for ablation.
+- `phase_cc_modulation_enable` splits CC-detection role from
+  birth-approval; ablations toggling `phase_approval_enable` no longer
+  also disable narrow-band CC modulation.
+- `_compute_group_closure_scores` excludes `hard_detached_mask` so
+  detached patches don't inflate closure scores at high resolution.
+- `_apply_family_runtime_caps` re-applies family bounds for
+  `successor_topk` / `max_branching_tips` / `branch_drive_threshold` /
+  `branch_score_ratio` after style-runtime override.
+- `_rotate_sh_features_rest` rotates l=1 SH dipole coefficients by
+  the polar-decomposition rotation; l>=2 damped by 0.5
+  (non-accumulative because `_features_rest` resets each frame).
+
+### Day 4 — Free-fall angular momentum + soft F reset + damage delay + splat boundary taper (`5ea58dd`)
+
+- `_omega_com` initial angular velocity (configurable via
+  `drop_omega`); during free-fall every particle moves with
+  `v = v_com + omega x (x - com)`, body tumbles in flight.  At impact,
+  per-particle `v_mpm` preserves the rotational component.
+- `impact_F_reset_alpha = 0.0` default replaces the unconditional
+  `F=I` wipe with a configurable blend.  `alpha=1` preserved for
+  ablation.
+- `damage_feedback_delay_frames` 8 -> 4, `damage_feedback_ramp_frames`
+  6 -> 2.  Halves the post-impact decoupling window 14 -> 6 frames.
+- `_apply_fragment_boundary_taper` shrinks scale (up to 60%) and
+  damps opacity (up to 50%) of splats whose surface-graph kNN bridge
+  fragment cuts (> 25% mismatch).
+
+### Day 5 — CLIP-conditioned style head with weak supervision (`40a1b56`)
+
+- `src/ml/style_head.py`: tiny two-layer MLP (CLIP_dim -> 128 ->
+  num_styles) on a 38-phrase x 6-prefix template corpus, weak-labeled
+  by the existing keyword rule.  Trains to 100% accuracy by epoch 20,
+  caches at `~/.cache/gaussian_phase_field/style_head.pt`.
+- `predict_sentence_style(text, encoder=...)` runs the head and falls
+  back to the rule when top softmax < `style_head_confidence=0.55`.
+- Verified paraphrase generalization: "the bottle disintegrated into
+  many radial pieces" routes to `radial_shatter` at p=0.996 although
+  the rule's "radial"/"shatter" tokens do not match
+  "disintegrated"/"pieces".
+
+### Validation
+
+50K radial probe (sharp_brittle / radial_shatter):
+
+| run | fragments | release | bcut | phase birth | birth | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| accepted v3 reference | 552 | 0.594 | 0.515 | 0.920 | 0 | PASS |
+| Day 1 (AT2 base) | 371 | 0.680 | 0.554 | 0.945 | 0 | PASS |
+| Day 2 (+ Griffith + energy branch) | 282 | 0.680 | 0.647 | 0.927 | 0 | PASS |
+
+Outputs: `output/at2_day1_50k_radial_probe_v1`,
+`output/at2_day2_50k_radial_probe_v1`.
+
+Reading: the stricter physics gates (AT2 + Griffith + energy
+branching) reject weaker candidate branches, so fragment count drops
+~50% from the v3 reference but boundary-cut support `bcut` climbs
+from 0.515 -> 0.647 -- fewer fragments, but each is more rigorously
+cut-bounded.  Released ratio stays at the sharp_brittle cap (0.68)
+and phase-birth score remains in the accepted band.  Paper position:
+"energy-conditioned, AT2-coupled crack-front fragmentation produces
+fewer but more physically grounded fragments than the v3
+percentile-gate baseline."
+
+### Open items (week 2)
+
+- Full 7-prompt 50K sweep with all five batches active.
+- Mesh generalization: bunny + spot + truck at 50K.
+- Ablation matrix: phase_approval, at2_drive_gain,
+  branch_direction_mode, growth_griffith_threshold, enable_style_head,
+  phase_cc_modulation_enable.
+- Baseline comparison vs PAC-NeRF / 3DGS-fracture.
+- 100K probe.
+- Controllability metric and small user study.
+
 ## 2026-04-29 Resolution-Scaled Fragment Size
 
 Problem:
