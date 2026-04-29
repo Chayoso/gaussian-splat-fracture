@@ -46,6 +46,7 @@ class CrackFront:
         growth_griffith_threshold: float = 0.50,
         branch_direction_mode: str = "energy",
         branch_angle_prior_floor: float = 0.50,
+        branch_event_topk: int = 2,
         device: str = "cuda",
     ):
         self.seed_quantile = seed_quantile
@@ -84,6 +85,12 @@ class CrackFront:
         # candidate still receives `floor` of the score).
         self.branch_angle_prior_floor = min(
             max(float(branch_angle_prior_floor), 0.0), 1.0)
+        # Resolution-invariant branch gate: only the top-K branch_event
+        # scores per tip are allowed to branch, regardless of how dense
+        # the local kNN graph is.  Replaces the old absolute
+        # `branch_event_threshold` with a relative ranking that scales
+        # automatically from 10K to 100K particles.
+        self.branch_event_topk = max(int(branch_event_topk), 1)
         self.device = torch.device(device)
 
         self.tip_mask: Optional[Tensor] = None
@@ -1209,10 +1216,37 @@ class CrackFront:
             extra_budget = branch_budget + closure_budget
             if keep.numel() > 0 and keep.numel() < successor_cap and can_branch_tip and extra_budget > 0:
                 extra_pool = keep.new_tensor([], dtype=keep.dtype)
+
+                # Top-K relative gate on branch_event_score: only the K
+                # strongest energy-branch candidates per tip are eligible,
+                # which makes the gate resolution-invariant (the absolute
+                # number of branches stays bounded as graph density grows).
+                # The legacy per-family `branch_event_threshold` is kept as
+                # a soft minimum-magnitude floor (filters near-zero noise).
+                event_legacy_thresh = float(
+                    family_cfg.get("branch_event_threshold", 1.0)
+                )
+                # Saturated >=1.0 means "branch only on perfect score" --
+                # this already disables event-driven branching for the
+                # corresponding style; honor it.
+                if event_legacy_thresh >= 1.0 - 1e-6:
+                    event_topk_floor = float("inf")
+                else:
+                    n_event_cand = int(branch_event_score.numel())
+                    k_top = min(int(self.branch_event_topk), n_event_cand)
+                    if k_top > 0:
+                        event_topk_floor = float(
+                            branch_event_score.topk(k_top).values.min().item()
+                        )
+                    else:
+                        event_topk_floor = float("inf")
+                event_soft_floor = min(event_legacy_thresh, 0.05)
+
                 branch_candidates = torch.where(
                     (lateral_score >= family_cfg["lateral_branch_threshold"])
                     & (local_drive >= max(0.10, 0.65 * branch_drive_threshold))
-                    & (branch_event_score >= float(family_cfg.get("branch_event_threshold", 1.0)))
+                    & (branch_event_score >= event_topk_floor)
+                    & (branch_event_score >= event_soft_floor)
                     & (branch_target_align >= float(family_cfg.get("branch_target_align_threshold", 0.0)))
                     & (score >= 0.50 * self.min_successor_score)
                 )[0]

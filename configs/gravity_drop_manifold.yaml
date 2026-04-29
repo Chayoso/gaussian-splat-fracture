@@ -82,6 +82,12 @@ manifold:
   # score is floored at `branch_angle_prior_floor` to avoid hard zeros.
   branch_direction_mode: energy
   branch_angle_prior_floor: 0.50
+  # Resolution-invariant branch gate: only the top-K branch_event
+  # scores per tip can fire a branch, regardless of how dense the
+  # local kNN graph is.  Replaces the legacy absolute
+  # `branch_event_threshold` with a relative top-K mask so 10K and 50K
+  # produce comparable branch density per tip per step.
+  branch_event_topk: 2
   fragment_detect_every: 2
   fragment_damage_threshold: 0.50
   min_fragment_particles: 40

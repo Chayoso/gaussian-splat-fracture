@@ -134,6 +134,7 @@ class ManifoldSimulator(
             growth_griffith_threshold=fp.get('growth_griffith_threshold', 0.50),
             branch_direction_mode=fp.get('branch_direction_mode', 'energy'),
             branch_angle_prior_floor=fp.get('branch_angle_prior_floor', 0.50),
+            branch_event_topk=fp.get('branch_event_topk', 2),
             device=device_str,
         )
 
