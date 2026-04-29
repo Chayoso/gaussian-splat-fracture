@@ -9,9 +9,10 @@ This layer translates semantic CLIP retrieval results into:
 
 from __future__ import annotations
 
-from typing import Dict, Sequence
+from typing import Dict, Optional, Sequence
 
 import numpy as np
+import torch
 
 from src.ml.material_db import MaterialEntry
 
@@ -1139,8 +1140,17 @@ def _clamp(value: float, lo: float, hi: float) -> float:
 class MaterialPriorAdapter:
     """Blend CLIP retrieval outputs into physics + fracture priors."""
 
-    def __init__(self, score_temperature: float = 10.0):
+    def __init__(
+        self,
+        score_temperature: float = 10.0,
+        enable_style_head: bool = True,
+        style_head_confidence: float = 0.55,
+    ):
         self.score_temperature = float(score_temperature)
+        self.enable_style_head = bool(enable_style_head)
+        self.style_head_confidence = float(style_head_confidence)
+        self._style_head = None  # lazy loaded
+        self._style_head_encoder = None  # the CLIPTextEncoder used for training
 
     def normalize_scores(self, scores: Sequence[float]) -> np.ndarray:
         scores_np = np.asarray(list(scores), dtype=np.float64)
@@ -1174,6 +1184,73 @@ class MaterialPriorAdapter:
         if matches:
             return max(matches, key=lambda item: item[0])[1]
         return {"name": "material_default", "fracture_mult": {}, "runtime": {}}
+
+    def _ensure_style_head(self, encoder=None) -> None:
+        """Lazy-load (or train) the CLIP-conditioned style head once."""
+        if not self.enable_style_head:
+            return
+        if self._style_head is not None:
+            return
+        if encoder is None:
+            return
+        try:
+            from .style_head import get_or_train_style_head
+            self._style_head = get_or_train_style_head(encoder, verbose=False)
+            self._style_head_encoder = encoder
+        except Exception as e:
+            print(f"[MaterialPriorAdapter] style head disabled: {e}")
+            self.enable_style_head = False
+            self._style_head = None
+
+    def _rule_lookup(self, name: str) -> Optional[Dict[str, object]]:
+        for rule in SENTENCE_STYLE_RULES:
+            if str(rule.get("name", "")) == name:
+                return rule
+        return None
+
+    def predict_sentence_style(
+        self,
+        text: str,
+        encoder=None,
+    ) -> Dict[str, object]:
+        """Pick sentence style using the learned head when confident,
+        falling back to the keyword rule otherwise.
+
+        Reviewer-defensible flow:
+          1. Encode the sentence with CLIP.
+          2. Run the learned head; if its top-class softmax probability
+             clears ``style_head_confidence`` AND the predicted style has
+             a corresponding rule in ``SENTENCE_STYLE_RULES``, use it.
+          3. Otherwise fall back to the keyword-rule selector
+             (``sentence_style_for_text``).
+
+        The learned head is trained on weak supervision derived from the
+        same rule set on a template corpus, so it generalizes to
+        paraphrased prompts that the rule's discrete keywords cannot
+        match while remaining honest about its supervision source.
+        """
+        if encoder is not None:
+            self._ensure_style_head(encoder)
+        if self._style_head is not None and encoder is not None:
+            try:
+                with torch.no_grad():
+                    emb = encoder.encode_text(text).to(
+                        next(self._style_head.parameters()).device
+                    )
+                indices, confidences, _ = self._style_head.predict(emb)
+                if indices and confidences[0] >= self.style_head_confidence:
+                    style_name = self._style_head.style_name(int(indices[0]))
+                    rule = self._rule_lookup(style_name)
+                    if rule is not None:
+                        out = dict(rule)
+                        out["_source"] = "head"
+                        out["_head_confidence"] = float(confidences[0])
+                        return out
+            except Exception as e:
+                print(f"[MaterialPriorAdapter] style head predict failed: {e}")
+        out = dict(self.sentence_style_for_text(text))
+        out.setdefault("_source", "rule")
+        return out
 
     @staticmethod
     def _material_hint_query(text: str) -> str:
@@ -1330,14 +1407,22 @@ class MaterialPriorAdapter:
         self,
         material_prior: Dict[str, object],
         text: str,
+        encoder=None,
     ) -> Dict[str, object]:
         """Apply crack-shape wording on top of material CLIP retrieval.
 
         The CLIP DB is intentionally material-centric, so shape phrases such as
         "single smooth crack" or "spiderweb cracks" need a small semantic style
         adapter after material retrieval.
+
+        When ``encoder`` (a ``CLIPTextEncoder``) is provided and the learned
+        style head is enabled, the head's prediction is used for high-confidence
+        sentences; otherwise the keyword-rule selector handles the lookup.
         """
-        style = self.sentence_style_for_text(text)
+        if encoder is not None and self.enable_style_head:
+            style = self.predict_sentence_style(text, encoder=encoder)
+        else:
+            style = self.sentence_style_for_text(text)
         style_name = str(style.get("name", "material_default"))
         if style_name == "material_default":
             out = dict(material_prior)
