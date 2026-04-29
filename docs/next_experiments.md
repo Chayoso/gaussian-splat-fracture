@@ -777,25 +777,26 @@ Interpretation:
 
 ## Current retained outputs
 
-Only the useful comparison outputs are kept under `output/`:
+Only the comparison-anchor and in-flight sweep outputs are kept under
+`output/` for the SIGGRAPH Asia push:
 
-- `phase_approved_birth_sweep_10k_v2`: current accepted 10K/64-grid raw CLIP
-  sweep with 10 Y-Z snapshots and mp4.
-- `phase_approved_birth_sweep_50k_v3`: current accepted 50K/64-grid raw CLIP
-  sweep with 10 Y-Z media frames and mp4.
-- `siggraph_evidence_sentence_style_quick10k_v1`: same object/impact,
-  different sentence style.
-- `siggraph_evidence_material_radial_quick10k_v1`: same radial sentence,
-  different material.
-- `siggraph_evidence_style_interpolation_quick10k_v1`: sentence style
-  interpolation control curve.
-- `siggraph_evidence_mesh_repro_smoke2k_v2`: bunny/spot/truck smoke
-  generalization with completed impact media.
-- `siggraph_evidence_ablation_quick10k_v1`: first 10K ablation suite.
-- `siggraph_evidence_phase_gate_stress_quick10k_v4`: controlled 10K concrete
-  stress ablation with suite-level Y-Z montage/mp4 for phase-gate on/off.
+- `media_restore_50k_radial_scale_probe_v3`: v3 reference baseline
+  (552 frags / 0.594 release / 0.515 bcut at 50K radial glass) used
+  as the legacy comparison anchor.
+- `at2_day1_50k_radial_probe_v1`: Day 1 (AT2 base) 50K radial probe.
+- `at2_day2_50k_radial_probe_v1`: Day 2 (+ Griffith + energy branch)
+  50K radial probe.
+- `at2_day5_50k_radial_probe_v1`: Day 5 (all batches active) 50K
+  radial probe -- the current best.
+- `at2_core_50k_v1` (in flight): full core sweep (sentence_style +
+  material_radial) at 50K.
+- (will be created by the chain) `at2_mesh_50k_v1`,
+  `at2_ablation_10k_v1`, `at2_100k_radial_probe_v1`.
 
-Older smoke/probe/archive outputs were removed to keep the workspace manageable.
+Older media-restore probe iterations, 10K spiderweb / radial probes,
+the smoke-test scratch outputs, and the aborted 50K sweep have been
+removed (~273 MB cleanup) since their outcomes are subsumed by the
+above runs.
 
 ## Current read
 
