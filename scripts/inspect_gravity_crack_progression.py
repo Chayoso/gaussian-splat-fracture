@@ -31,6 +31,7 @@ from scripts.validate_sentence_materials import (  # noqa: E402
 )
 from src.pipeline.manifold_fracture_pipeline import ManifoldFracturePipeline  # noqa: E402
 from src.diagnostics.raw_graph_plot import save_raw_graph_diagnostic as _save_raw_graph_diagnostic  # noqa: E402
+from src.diagnostics.physical_fragment_plot import save_physical_diagnostic as _save_physical_diagnostic  # noqa: E402
 from src.utils.knn import knn_search  # noqa: E402
 
 
@@ -323,6 +324,7 @@ def _snapshot_metrics(
 
     base_name = f"frame_{frame:04d}_impact_{frame - impact_frame:03d}"
     plot_path = out_dir / "snapshots" / f"{base_name}_raw_graph.png"
+    physical_plot_path = out_dir / "snapshots" / f"{base_name}_physical.png"
     if save_plot:
         _save_raw_graph_diagnostic(
             positions=positions,
@@ -344,6 +346,54 @@ def _snapshot_metrics(
             mesh_visual_state=mesh_visual_state,
             material_family=str(getattr(simulator, "material_family", "")),
         )
+
+        # Physical-fragment view: actual MPM particle positions + the
+        # filtered `_physical_fragment_labels` registry.  This view
+        # avoids floating Gaussians because every node is either base
+        # body (label 0) or a member of a coherent persistent chunk.
+        physical_positions = None
+        physical_frag_ids = None
+        x_mpm = getattr(simulator, "x_mpm", None)
+        surface_mask = getattr(simulator, "surface_mask", None)
+        mapper = getattr(simulator, "mapper", None)
+        physical_labels = getattr(simulator, "_physical_fragment_labels", None)
+        surface_indices = getattr(simulator, "_surface_indices", None)
+        if (
+            x_mpm is not None
+            and surface_mask is not None
+            and mapper is not None
+        ):
+            try:
+                physical_positions = mapper.mpm_to_world(x_mpm[surface_mask])
+            except Exception:
+                physical_positions = None
+        if (
+            physical_labels is not None
+            and surface_indices is not None
+            and physical_positions is not None
+        ):
+            try:
+                physical_frag_ids = physical_labels[surface_indices]
+            except Exception:
+                physical_frag_ids = None
+
+        if physical_positions is not None:
+            _save_physical_diagnostic(
+                positions=physical_positions[: c.shape[0]],
+                damage=c,
+                physical_fragment_ids=(
+                    physical_frag_ids[: c.shape[0]]
+                    if physical_frag_ids is not None
+                    else None
+                ),
+                visited=visited,
+                tips=tips,
+                out_path=physical_plot_path,
+                title=(
+                    f"{prompt} | physical view loop={frame} "
+                    f"impact+{frame - impact_frame}"
+                ),
+            )
 
     row = {
         "loop_frame": int(frame),
