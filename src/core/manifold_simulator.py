@@ -1161,6 +1161,7 @@ class ManifoldSimulator(
             and self.crack_style in {
                 "radial_shatter",
                 "spiderweb",
+                "spiderweb_branching",
             }
             and self._gravity_drop_contacted
             and frames_since_impact <= int(

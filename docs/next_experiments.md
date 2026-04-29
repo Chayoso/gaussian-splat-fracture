@@ -167,6 +167,56 @@ Disallowed post-freeze changes:
   prompt-triggered fragment birth, or high-particle-count tuning patches that
   change the v1.5 baseline without a separate branch.
 
+## 2026-04-29 Media-Morphology Restore
+
+Problem:
+
+- The freeze snapshot kept the v1.5 code structure, but the active style
+  runtime overrides suppressed the previous accepted media morphology:
+  radial glass dropped from the media-era `~0.64` release / hundreds of
+  fragments to a small-fragment-count partial break.
+- The issue was not a physics rewrite target.  The style runtime was
+  overriding the simulator's impact-closure defaults and forcing large minimum
+  fragment patches.
+
+Patch:
+
+- Removed radial/spiderweb style-local `impact_closure_*` overrides so the
+  simulator's crack-connected impact closure defaults control early brittle
+  shatter again.
+- Restored radial/spiderweb persistent fragment size to the family/base
+  scale instead of the later large-patch setting.
+- Fixed the style name check so `spiderweb_branching` participates in the same
+  impact closure path as the simulator's spiderweb mode.
+- Changed material-family enforcement so family caps are upper bounds; a
+  sentence style can request a lower release cap.  Spiderweb uses this to keep
+  connected web cracking lower-release than radial shatter.
+
+Validation:
+
+- Output: `output/media_restore_10k_sweep_20260429_v1`
+- Report: `output/media_restore_10k_sweep_20260429_v1/progression_sweep_report.md`
+- Y-Z montage: `output/media_restore_10k_sweep_20260429_v1/yz_media/yz_sentence_result_montage.png`
+- Y-Z MP4: `output/media_restore_10k_sweep_20260429_v1/yz_media/yz_sentence_result.mp4`
+
+| prompt class | verdict | detached | released ratio | bcut | birth |
+|---|---|---:|---:|---:|---:|
+| glass radial | PASS | 256 | 0.641 | 0.609 | 0 |
+| glass spiderweb | PASS | 73 | 0.160 | 0.622 | 0 |
+| ceramic single crack | PASS | 0 | 0.000 | 0.000 | -1 |
+| concrete chunks | PASS | 11 | 0.074 | 0.703 | 1 |
+| ice radial | PASS | 262 | 0.639 | 0.597 | 0 |
+| rubber no fracture | PASS | 0 | 0.000 | 0.000 | -1 |
+| steel denting | PASS | 0 | 0.000 | 0.000 | -1 |
+
+Readout:
+
+- This patch restores the accepted media-era contrast without reintroducing
+  non-causal fallback release or particle-spray paths.
+- Generalization risk is bounded but not eliminated.  The next check should be
+  same settings on at least one non-bunny mesh before using this as final
+  paper evidence.
+
 ## 2026-04-28 SIGGRAPH Asia Evidence Plan
 
 The next work is not a solver rewrite.  The realistic paper direction is to
