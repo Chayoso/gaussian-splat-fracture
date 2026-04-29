@@ -292,26 +292,42 @@ SIGGRAPH Asia submission.  Five batches landed:
 
 ### Validation
 
-50K radial probe (sharp_brittle / radial_shatter):
+50K radial probe (sharp_brittle / radial_shatter), incremental builds:
 
-| run | fragments | release | bcut | phase birth | birth | verdict |
-|---|---:|---:|---:|---:|---:|---|
-| accepted v3 reference | 552 | 0.594 | 0.515 | 0.920 | 0 | PASS |
-| Day 1 (AT2 base) | 371 | 0.680 | 0.554 | 0.945 | 0 | PASS |
-| Day 2 (+ Griffith + energy branch) | 282 | 0.680 | 0.647 | 0.927 | 0 | PASS |
+| run | n_frags | release | bcut | phase birth | scatter_max | lat_max | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| accepted v3 reference | 438 | 0.598 | 0.515 | 0.920 | 0.0737 | 0.0624 | PASS |
+| Day 1 (AT2 base) | 361 | 0.680 | 0.554 | 0.945 | 0.0420 | 0.0417 | PASS |
+| Day 2 (+ Griffith + energy branch) | 276 | 0.680 | 0.647 | 0.927 | 0.0554 | 0.0494 | PASS |
+| Day 5 (+ B1+B2+B3 + D2) | 271 | 0.680 | 0.600 | 0.921 | 0.0437 | 0.0390 | PASS |
 
-Outputs: `output/at2_day1_50k_radial_probe_v1`,
-`output/at2_day2_50k_radial_probe_v1`.
+Outputs: `output/at2_day{1,2,5}_50k_radial_probe_v1`.
 
-Reading: the stricter physics gates (AT2 + Griffith + energy
-branching) reject weaker candidate branches, so fragment count drops
-~50% from the v3 reference but boundary-cut support `bcut` climbs
-from 0.515 -> 0.647 -- fewer fragments, but each is more rigorously
-cut-bounded.  Released ratio stays at the sharp_brittle cap (0.68)
-and phase-birth score remains in the accepted band.  Paper position:
-"energy-conditioned, AT2-coupled crack-front fragmentation produces
-fewer but more physically grounded fragments than the v3
-percentile-gate baseline."
+`scatter_max` is `max(physical_release_displacement)` across the
+post-impact propagation -- a direct measure of how far fragments
+physically separate after detach.  `lat_max` is the lateral component
+of the same.
+
+Reading:
+
+- The stricter physics gates (AT2 + Griffith + energy branching)
+  reject weaker candidate branches, so fragment count drops ~38% from
+  the v3 reference but boundary-cut support `bcut` climbs from
+  0.515 -> 0.600.  Fewer fragments, more rigorously cut-bounded.
+- Released ratio stays at the sharp_brittle cap (0.68) and phase-birth
+  score remains in the accepted band.
+- The Day 4 batch (B1 angular momentum + B2 soft F reset + B3
+  damage_feedback delay 14 -> 6 frames + D2 splat boundary taper)
+  was a regression risk for "particles flying apart"; the actual data
+  shows the opposite: scatter_max drops to 0.0437 (-41% vs v3),
+  lat_max to 0.0390 (-37% vs v3).  Earlier damage->stress feedback
+  degrades stress sooner, so post-impact rebound dissipates faster
+  and fragments stay locally coherent rather than scattering.
+
+Paper position: "energy-conditioned AT2-coupled crack-front
+fragmentation with continuous-physics impact handling produces fewer,
+better-cut, more spatially coherent fragments than the v3
+percentile-gate / hard-F-reset baseline."
 
 ### Open items (week 2)
 
