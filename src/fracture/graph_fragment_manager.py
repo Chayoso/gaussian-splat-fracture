@@ -64,6 +64,8 @@ class GraphFragmentManager(
         detached_node_decay: float = 0.95,
         persistent_min_fragment_size: int = 8,
         persistent_min_fragment_size_ratio: float = 0.0,
+        persistent_min_fragment_reference_nodes: int = 10000,
+        persistent_min_fragment_resolution_exponent: float = 0.5,
         component_hysteresis: float = 0.35,
         post_split_threshold_scale: float = 0.92,
         cut_surface_enable: bool = False,
@@ -96,6 +98,8 @@ class GraphFragmentManager(
         impact_closure_layer_count: int = 0,
         impact_closure_min_size_ratio: float = 0.0,
         impact_closure_max_size_ratio: float = 0.0,
+        impact_closure_adaptive_extra_frames: int = 6,
+        impact_closure_completion_ratio: float = 0.92,
         phase_approval_enable: bool = True,
         phase_approval_threshold_scale: float = 1.0,
         phase_approval_threshold_offset: float = 0.0,
@@ -128,6 +132,10 @@ class GraphFragmentManager(
         self.persistent_min_fragment_size = persistent_min_fragment_size
         self.persistent_min_fragment_size_ratio = max(
             float(persistent_min_fragment_size_ratio), 0.0)
+        self.persistent_min_fragment_reference_nodes = max(
+            int(persistent_min_fragment_reference_nodes), 1)
+        self.persistent_min_fragment_resolution_exponent = max(
+            float(persistent_min_fragment_resolution_exponent), 0.0)
         self.component_hysteresis = component_hysteresis
         self.post_split_threshold_scale = post_split_threshold_scale
         self.cut_surface_enable = bool(cut_surface_enable)
@@ -163,6 +171,10 @@ class GraphFragmentManager(
             float(impact_closure_min_size_ratio), 0.0)
         self.impact_closure_max_size_ratio = max(
             float(impact_closure_max_size_ratio), 0.0)
+        self.impact_closure_adaptive_extra_frames = max(
+            int(impact_closure_adaptive_extra_frames), 0)
+        self.impact_closure_completion_ratio = min(
+            max(float(impact_closure_completion_ratio), 0.0), 1.0)
         self.phase_approval_enable = bool(phase_approval_enable)
         self.phase_approval_threshold_scale = float(phase_approval_threshold_scale)
         self.phase_approval_threshold_offset = float(phase_approval_threshold_offset)
@@ -255,8 +267,14 @@ class GraphFragmentManager(
         self.fragment_support_lost: List[bool] = []
 
     def _effective_persistent_min_size(self, total_nodes: int) -> int:
+        base_size = max(int(self.persistent_min_fragment_size), 1)
+        resolution_scale = max(
+            float(total_nodes) / float(self.persistent_min_fragment_reference_nodes),
+            1.0,
+        ) ** self.persistent_min_fragment_resolution_exponent
+        resolution_size = int(round(float(base_size) * resolution_scale))
         ratio_size = int(round(float(total_nodes) * self.persistent_min_fragment_size_ratio))
-        return max(int(self.persistent_min_fragment_size), ratio_size, 1)
+        return max(base_size, resolution_size, ratio_size, 1)
 
     def detect_fragments(
         self,

@@ -209,6 +209,10 @@ class ManifoldSimulator(
             detached_node_decay=fp.get('fragment_detached_node_decay', 0.95),
             persistent_min_fragment_size=fp.get('fragment_persistent_min_size', 8),
             persistent_min_fragment_size_ratio=fp.get('fragment_persistent_min_size_ratio', 0.0),
+            persistent_min_fragment_reference_nodes=fp.get(
+                'fragment_persistent_reference_nodes', 10000),
+            persistent_min_fragment_resolution_exponent=fp.get(
+                'fragment_persistent_resolution_exponent', 0.5),
             component_hysteresis=fp.get('fragment_component_hysteresis', 0.35),
             post_split_threshold_scale=fp.get('fragment_post_split_threshold_scale', 0.92),
             cut_surface_enable=fp.get('cut_surface_enable', False),
@@ -241,6 +245,10 @@ class ManifoldSimulator(
             impact_closure_layer_count=fp.get('impact_closure_layer_count', 0),
             impact_closure_min_size_ratio=fp.get('impact_closure_min_size_ratio', 0.0),
             impact_closure_max_size_ratio=fp.get('impact_closure_max_size_ratio', 0.0),
+            impact_closure_adaptive_extra_frames=fp.get(
+                'impact_closure_adaptive_extra_frames', 6),
+            impact_closure_completion_ratio=fp.get(
+                'impact_closure_completion_ratio', 0.92),
             phase_approval_enable=fp.get('phase_approval_enable', True),
             phase_approval_threshold_scale=fp.get('phase_approval_threshold_scale', 1.0),
             phase_approval_threshold_offset=fp.get('phase_approval_threshold_offset', 0.0),
@@ -1155,6 +1163,30 @@ class ManifoldSimulator(
         )
         surface_volume_damage = self._get_surface_volume_damage_proxy(N_surf)
         frames_since_impact = int(getattr(self, "_impact_frame_count", 10**6))
+        default_target = 0.64 if self.crack_style == "radial_shatter" else 0.50
+        configured_target = float(
+            getattr(self.fragment_manager, "configured_impact_closure_target_ratio", -1.0)
+        )
+        target = configured_target if configured_target >= 0.0 else default_target
+        target = min(
+            max(target, 0.0),
+            float(self.fragment_manager._strict_closure_release_cap()),
+        )
+        configured_active_frames = int(
+            getattr(self.fragment_manager, "configured_impact_closure_active_frames", 2)
+        )
+        active_window = configured_active_frames
+        released_ratio = (
+            float(getattr(self.fragment_manager, "last_hard_detached_nodes", 0))
+            / max(float(N_surf), 1.0)
+        )
+        completion_ratio = float(
+            getattr(self.fragment_manager, "impact_closure_completion_ratio", 0.92)
+        )
+        if released_ratio < completion_ratio * max(target, 0.0):
+            active_window += int(
+                getattr(self.fragment_manager, "impact_closure_adaptive_extra_frames", 0)
+            )
         impact_closure_active = bool(
             self.crack_connected_release_only
             and self.material_family == "sharp_brittle"
@@ -1164,17 +1196,10 @@ class ManifoldSimulator(
                 "spiderweb_branching",
             }
             and self._gravity_drop_contacted
-            and frames_since_impact <= int(
-                getattr(self.fragment_manager, "configured_impact_closure_active_frames", 2)
-            )
+            and frames_since_impact <= active_window
         )
         self.fragment_manager.impact_closure_active = impact_closure_active
         if impact_closure_active:
-            default_target = 0.64 if self.crack_style == "radial_shatter" else 0.50
-            configured_target = float(
-                getattr(self.fragment_manager, "configured_impact_closure_target_ratio", -1.0)
-            )
-            target = configured_target if configured_target >= 0.0 else default_target
             default_max_patches = 96 if self.crack_style == "radial_shatter" else 56
             configured_max_patches = int(
                 getattr(self.fragment_manager, "configured_impact_closure_max_patches", -1)

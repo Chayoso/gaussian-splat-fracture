@@ -217,6 +217,61 @@ Readout:
   same settings on at least one non-bunny mesh before using this as final
   paper evidence.
 
+## 2026-04-29 Resolution-Scaled Fragment Size
+
+Problem:
+
+- The media-morphology restore uses `fragment_persistent_min_size = 8` for
+  radial/spiderweb brittle styles, matching the accepted 10K behavior.
+- At 50K particles, the same 8-node threshold represents a much smaller surface
+  area, so the first glass radial probe over-fragmented immediately:
+  `418` fragment labels by impact+2 and a mean non-base size of only `~41`
+  nodes.
+- This is a resolution-scaling issue, not a new material parameter target.
+
+Patch:
+
+- `GraphFragmentManager` now computes the effective persistent minimum fragment
+  size from the configured base size, the ratio floor, and a 10K reference-node
+  scale:
+  `base_size * max(total_nodes / reference_nodes, 1)^exponent`.
+- Default reference is `10000` and default exponent is `0.5`, so 10K behavior
+  is unchanged while 50K/100K require a larger but not linearly larger
+  crack-corridor patch before a persistent fragment can be born.
+- A linear exponent `1.0` probe was too conservative for the surface-manifold
+  surrogate: it reduced the 50K radial tiny-fragment burst, but capped release
+  at `~0.22` instead of the accepted `~0.60` brittle range.
+- A sqrt exponent probe recovered the early 50K radial release to `~0.40` with
+  readable fragments, but then plateaued because strict impact closure only
+  stayed active for two post-impact frames.
+- Strict impact closure now stays active for up to six extra frames only while
+  the current released ratio is below `92%` of the material/style release cap.
+  This keeps the causal crack-connected birth path, but gives higher-resolution
+  runs enough detections to reach the same release band.
+- This intentionally avoids broad parameter retuning and keeps the v1.5
+  algorithm identity intact.
+
+Validation target:
+
+- Re-run a 50K radial probe first.  It should retain high brittle release but
+  avoid the immediate tiny-fragment explosion seen in the aborted 50K sweep.
+- Only after the probe passes should the full seven-prompt 50K sweep and 100K
+  probe be regenerated.
+
+Validation result:
+
+- Output: `output/media_restore_50k_radial_scale_probe_v3`
+- Report: `output/media_restore_50k_radial_scale_probe_v3/progression_sweep_report.md`
+- Final glass radial result: PASS, `494` detached fragments, released ratio
+  `0.598`, boundary-cut support `0.515`, phase birth score `0.920`, birth at
+  impact+0.
+- The accepted 50K reference was `552` fragments / `0.594` release.  The new
+  result recovers the same release band while reducing over-fragmentation and
+  raising the effective minimum non-base fragment size to `18` nodes.
+- A full-sweep restart with four extra frames reached only `0.559` on the first
+  radial case, so the default was widened to six extra frames before accepting
+  the 50K sweep.
+
 ## 2026-04-28 SIGGRAPH Asia Evidence Plan
 
 The next work is not a solver rewrite.  The realistic paper direction is to

@@ -93,6 +93,8 @@ manifold:
   fragment_min_boundary_edges: 18
   fragment_detached_node_decay: 0.95
   fragment_persistent_min_size: 8
+  fragment_persistent_reference_nodes: 10000
+  fragment_persistent_resolution_exponent: 0.5
   fragment_component_hysteresis: 0.34
   fragment_post_split_threshold_scale: 0.90
   fragment_impulse_strength: 0.00
@@ -131,6 +133,8 @@ manifold:
   open_crack_release_enable: false    # No arbitrary damage/support-loss patch release
   open_crack_release_threshold: 1.0
   open_crack_release_max_patches: 0
+  impact_closure_adaptive_extra_frames: 6
+  impact_closure_completion_ratio: 0.92
   aniso_ratio: 1.0                   # 1.0 = isotropic (no directional bias)
   damage_source_scale: 0.35          # Physics-driven advance at crack front
   damage_spread: 0.36                # Neutral baseline: narrower than rough quasi-brittle
