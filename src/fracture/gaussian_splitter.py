@@ -422,16 +422,6 @@ class GaussianSplitter:
             "new_start_idx": n_base,
         }
 
-        print(f"[Splitter] Split {n_split} Gaussians → "
-              f"{N_orig} → {N_new} total")
-
-        return {
-            'n_split': n_split,
-            'split_mask': split_mask,
-            'split_idx': split_idx,
-            'new_start_idx': N_orig,
-        }
-
     @staticmethod
     def _quat_to_rotmat(q: Tensor) -> Tensor:
         """Convert wxyz quaternions to rotation matrices.

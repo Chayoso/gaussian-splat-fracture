@@ -5,6 +5,7 @@ Caches expensive mesh/particle setup, re-creates parameter-dependent
 components (elasticity, simulator) per simulate() call.
 """
 
+import os
 import sys
 import copy
 import time
@@ -13,6 +14,9 @@ import torch
 from pathlib import Path
 from typing import List, Optional
 from omegaconf import OmegaConf
+
+# Deterministic CUDA matmul workspace (must be set before any CUDA op)
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -53,6 +57,11 @@ class ForwardEngine:
         torch.manual_seed(42)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(42)
+        # Deterministic ops where possible; warn_only avoids hard-failing
+        # on ops without a deterministic CUDA impl (kept warn-level for now).
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
         # Resolve device
         device_type = self.base_config.device.type
@@ -119,6 +128,9 @@ class ForwardEngine:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
         # Deep-copy config and apply overrides
         config = OmegaConf.create(OmegaConf.to_container(self.base_config, resolve=True))

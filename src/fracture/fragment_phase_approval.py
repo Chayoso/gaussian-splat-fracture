@@ -208,10 +208,6 @@ class FragmentPhaseApprovalMixin:
             "rough_quasi_brittle",
         }
 
-    def _effective_impact_release_gain(self) -> float:
-        """Runtime impact/external-force gain used only for release promotion."""
-        return max(0.35, min(float(getattr(self, "impact_release_gain", 1.0)), 2.75))
-
     def _authoritative_cut_threshold(self) -> float:
         thresh = self.authoritative_cut_threshold
         if self.material_family == "sharp_brittle":

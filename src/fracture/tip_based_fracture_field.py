@@ -45,6 +45,10 @@ class GaussianFractureField:
         material_drive_floor: Optional[float] = None,
         diffuse_damage_gain: float = 0.16,
         diffuse_neighborhood_steps: int = 2,
+        at2_jacobi_enable: bool = True,
+        at2_drive_gain: float = 1.0,
+        at2_reg_gain: float = 1.0,
+        at2_dc_fraction: float = 0.5,
         graph: Optional[GaussianGraph] = None,
         crack_front: Optional[CrackFront] = None,
         device: str = "cuda",
@@ -84,6 +88,10 @@ class GaussianFractureField:
             self.material_drive_floor = 0.0
         self.diffuse_damage_gain = float(diffuse_damage_gain)
         self.diffuse_neighborhood_steps = max(int(diffuse_neighborhood_steps), 1)
+        self.at2_jacobi_enable = bool(at2_jacobi_enable)
+        self.at2_drive_gain = max(float(at2_drive_gain), 0.0)
+        self.at2_reg_gain = max(float(at2_reg_gain), 0.0)
+        self.at2_dc_fraction = min(max(float(at2_dc_fraction), 0.0), 1.0)
         self.device = torch.device(device)
 
         self.graph = graph or GaussianGraph(device=device)
@@ -184,6 +192,14 @@ class GaussianFractureField:
         if self._frame_count <= self.warmup_frames:
             return
 
+        # AT2 phase-field base layer (graph Jacobi step toward equilibrium).
+        # Runs before the tip-based structured advance so that broad damage
+        # diffusion and irreversible H-driven saturation follow the standard
+        # Bourdin-Francfort-Marigo form, with crack-front propagation acting
+        # as a structured correction on top.
+        if self.at2_jacobi_enable:
+            self._evolve_damage_at2(positions)
+
         seeded = 0
         advanced = 0
         if not self.enable_front_propagation:
@@ -243,6 +259,49 @@ class GaussianFractureField:
                 f"tips={tip_count} visited={visited_count} "
                 f"seeded={seeded} advanced={advanced} cracked={cracked_count}"
             )
+
+    def _evolve_damage_at2(self, positions: Tensor) -> None:
+        """One Jacobi step toward the AT2 phase-field equilibrium.
+
+        Solves on the row-normalized Gaussian graph:
+
+            c_eq[i] = (a*H[i] + b*(l0/sigma)^2 * lap_c[i]) / (1 + a*H[i])
+
+        where H is the irreversible normalized history (already updated this
+        frame by `update()`), lap_c is the weighted graph Laplacian, sigma is
+        the graph kernel bandwidth, and a, b are `at2_drive_gain`,
+        `at2_reg_gain` respectively.  The update is taken irreversibly:
+        c_new = c + clamp(c_eq - c, 0, dC_max * at2_dc_fraction).
+        """
+        if (
+            self.H is None
+            or self.c is None
+            or self.graph.knn_idx is None
+            or self.graph.weights is None
+            or self.c.numel() == 0
+        ):
+            return
+
+        a = float(self.at2_drive_gain)
+        b = float(self.at2_reg_gain)
+        if a <= 0.0 and b <= 0.0:
+            return
+
+        drive = a * self.H.clamp(0.0, 1.0)
+        if b > 0.0:
+            sigma_sq = max(float(self.graph.sigma) ** 2, 1e-12)
+            l0_sq = float(self.l0) ** 2
+            lap_c = self.graph.graph_laplacian(self.c)
+            reg = b * (l0_sq / sigma_sq) * lap_c
+        else:
+            reg = torch.zeros_like(self.c)
+
+        denom = (1.0 + drive).clamp(min=1e-8)
+        c_eq = ((drive + reg) / denom).clamp(0.0, 1.0)
+
+        max_dc = self.dC_max * self.at2_dc_fraction
+        dc = (c_eq - self.c).clamp(min=0.0, max=max_dc)
+        self.c = (self.c + dc).clamp(0.0, 1.0)
 
     def _seed_front(
         self,

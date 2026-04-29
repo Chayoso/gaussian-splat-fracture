@@ -48,17 +48,6 @@ material:
 phase_field:
   warmup_frames: 3
   dC_max: 0.02
-  crack_tip_speed: 15.0
-  crack_width: 0.004
-  max_total_cracks: 120
-  crack_aniso_ratio: 200.0
-  branch_angle: 40.0
-  branch_min_length: 1
-  branch_probability: 0.95
-  max_branches_per_path: 10
-  nucleation_fraction: 0.15
-  max_nucleation_per_frame: 5
-  nucleation_min_spacing: 4
   fragmentation_enabled: true
   fragment_damage_threshold: 0.5
   min_fragment_particles: 50
@@ -75,6 +64,13 @@ manifold:
   material_drive_floor: 0.025
   diffuse_damage_gain: 0.16
   diffuse_neighborhood_steps: 2
+  # AT2 phase-field base layer: graph Jacobi step toward
+  # c_eq = (a*H + b*(l0/sigma)^2 * lap_c) / (1 + a*H).
+  # `at2_drive_gain=0.0` disables the AT2 contribution (pure tip-based ablation).
+  at2_jacobi_enable: true
+  at2_drive_gain: 1.0
+  at2_reg_gain: 1.0
+  at2_dc_fraction: 0.5
   fragment_detect_every: 2
   fragment_damage_threshold: 0.50
   min_fragment_particles: 40
