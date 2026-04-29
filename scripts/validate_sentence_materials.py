@@ -72,6 +72,98 @@ def _fmt(value, digits: int = 3) -> str:
     return f"{value_f:.{digits}f}"
 
 
+def _release_mode_for_row(row: dict) -> str:
+    family = str(row.get("family", ""))
+    style = str(row.get("sentence_style", row.get("crack_style", "")))
+    prompt = str(row.get("prompt", "")).lower()
+    if (
+        family == "diffuse_damage"
+        or (family == "neutral_reference" and ("steel" in prompt or "metal" in prompt))
+        or style == "diffuse_microcrack"
+        or "without visible fracture" in prompt
+        or "no visible fracture" in prompt
+        or "without brittle fracture" in prompt
+        or "denting" in prompt
+    ):
+        return "no_fragment"
+    if style == "single_smooth":
+        return "crack_split"
+    if bool(row.get("runtime_crack_connected_release_only", False)):
+        return "crack_connected_fragment"
+    if family == "sharp_brittle" and style == "radial_shatter":
+        return "complete_shatter"
+    if family == "sharp_brittle" and style == "spiderweb_branching":
+        return "fragmented_web"
+    if family == "rough_quasi_brittle" and style == "chunky_crumble":
+        return "chunk_release"
+    if family in {"sharp_brittle", "brittle_moderate", "rough_quasi_brittle"}:
+        return "partial_fragment"
+    return "crack_only"
+
+
+def _release_verdict_for_row(row: dict) -> tuple[str, str]:
+    mode = _release_mode_for_row(row)
+    max_frags = int(row.get("max_n_fragments", row.get("max_n_frags", 0)) or 0)
+    final_frags = int(row.get("final_n_fragments", row.get("final_fragment_label_count", max_frags)) or 0)
+    released = float(row.get("final_released_node_ratio", 0.0) or 0.0)
+    largest = float(row.get("final_largest_fragment_ratio", 1.0) or 1.0)
+    detach = float(row.get("max_physical_detached_distance", row.get("physical_detached_distance", 0.0)) or 0.0)
+    drop = float(row.get("max_physical_fragment_drop", row.get("physical_fragment_drop", 0.0)) or 0.0)
+    moved = max(detach, drop)
+    family = str(row.get("family", ""))
+    style = str(row.get("sentence_style", row.get("crack_style", "")))
+    bcut = float(row.get("final_bcut", row.get("fragment_boundary_cut_support_ratio", 0.0)) or 0.0)
+    first_detach = int(row.get("first_detach_since_impact", -1) or -1)
+    branch_events = int(row.get("branch_event_count", row.get("final_branch_event_count", 0)) or 0)
+    nonclosure_patches = int(row.get("max_open_release_patches", 0) or 0)
+    has_motion_metrics = (
+        "max_physical_detached_distance" in row
+        or "max_physical_fragment_drop" in row
+        or "physical_detached_distance" in row
+        or "physical_fragment_drop" in row
+    )
+
+    passed = False
+    if mode == "crack_connected_fragment":
+        if family == "sharp_brittle" and style == "radial_shatter":
+            passed = (
+                max_frags >= 24
+                and released >= 0.35
+                and released <= 0.68
+                and largest <= 0.65
+                and bcut >= 0.35
+                and branch_events >= 32
+                and nonclosure_patches == 0
+                and (first_detach < 0 or first_detach <= 2)
+                and (moved <= 0.35 or not has_motion_metrics)
+            )
+        else:
+            passed = (
+                max_frags >= 2
+                and released >= 0.01
+                and released <= 0.55
+                and largest >= 0.40
+                and branch_events >= 2
+                and nonclosure_patches == 0
+                and (moved <= 0.35 or not has_motion_metrics)
+            )
+    elif mode == "complete_shatter":
+        passed = max_frags >= 48 and released >= 0.40 and largest <= 0.70 and (moved >= 0.04 or not has_motion_metrics)
+    elif mode == "fragmented_web":
+        passed = max_frags >= 16 and released >= 0.12 and largest <= 0.88 and (moved >= 0.025 or not has_motion_metrics)
+    elif mode == "chunk_release":
+        passed = max_frags >= 8 and released >= 0.08 and largest <= 0.92 and (moved >= 0.02 or not has_motion_metrics)
+    elif mode == "crack_split":
+        passed = 1 <= max_frags <= 12 and largest >= 0.50 and nonclosure_patches == 0
+    elif mode == "partial_fragment":
+        passed = max_frags >= 2 and released >= 0.03
+    elif mode == "no_fragment":
+        passed = final_frags <= 1 and released <= 0.01 and moved <= 0.01 and nonclosure_patches == 0
+    else:
+        passed = max_frags <= 4
+    return mode, "PASS" if passed else "FAIL"
+
+
 def _short_prompt(prompt: str, max_len: int = 42) -> str:
     prompt = " ".join(str(prompt).split())
     if len(prompt) <= max_len:
@@ -93,7 +185,10 @@ def _save_final_crack_plot(
     out_path: Path,
     title: str,
     fragment_ids: torch.Tensor | None = None,
+    parent_index: torch.Tensor | None = None,
+    activation_step: torch.Tensor | None = None,
     cracked_threshold: float = 0.30,
+    draw_cross_fragment_segments: bool = True,
 ) -> None:
     """Save a compact final-frame crack morphology diagnostic."""
     try:
@@ -114,6 +209,20 @@ def _save_final_crack_plot(
     frag_np = None
     if fragment_ids is not None:
         frag_np = fragment_ids[: positions.shape[0]].detach().long().cpu().numpy()
+    segment_np = None
+    if parent_index is not None:
+        parent = parent_index[: positions.shape[0]].detach().long().cpu()
+        valid = visited.detach().bool().cpu() & (parent >= 0) & (parent < positions.shape[0])
+        child_idx = torch.where(valid)[0]
+        if child_idx.numel() > 0:
+            step_np = None
+            if activation_step is not None:
+                step_np = activation_step[: positions.shape[0]].detach().long().cpu()[child_idx].numpy()
+            segment_np = (
+                child_idx.numpy(),
+                parent[child_idx].numpy(),
+                step_np,
+            )
 
     views = [
         ("X-Y top", 0, 1, "X", "Y"),
@@ -162,6 +271,35 @@ def _save_final_crack_plot(
                 linewidths=0.25,
                 alpha=0.78,
             )
+        if segment_np is not None:
+            child_idx, parent_idx, step_np = segment_np
+            norm = None
+            cmap = None
+            if step_np is not None and step_np.size > 0 and step_np.max() > step_np.min():
+                norm = matplotlib.colors.Normalize(vmin=float(step_np.min()), vmax=float(step_np.max()))
+                cmap = plt.get_cmap("viridis")
+            for seg_i, (child, parent) in enumerate(zip(child_idx, parent_idx)):
+                if (
+                    not draw_cross_fragment_segments
+                    and frag_np is not None
+                    and child < frag_np.shape[0]
+                    and parent < frag_np.shape[0]
+                    and frag_np[child] != frag_np[parent]
+                ):
+                    continue
+                color = "#0b4f9c"
+                alpha = 0.18
+                if norm is not None and cmap is not None:
+                    color = cmap(norm(float(step_np[seg_i])))
+                    alpha = 0.32
+                ax.plot(
+                    [pos[parent, i], pos[child, i]],
+                    [pos[parent, j], pos[child, j]],
+                    color=color,
+                    alpha=alpha,
+                    linewidth=0.35,
+                    solid_capstyle="round",
+                )
 
         if tips_np.any():
             ax.scatter(
@@ -231,15 +369,25 @@ def _write_markdown_report(rows: list[dict], path: Path, no_sim: bool) -> None:
         "cracked_count",
         "visited_count",
         "tip_count",
+        "tip_event_count",
+        "branch_event_count",
+        "branch_event_angle_mean_deg",
         "leaf_count",
         "junction_count",
         "max_n_frags",
+        "final_released_node_ratio",
+        "final_largest_fragment_ratio",
+        "final_nonbase_fragment_min_size",
+        "expected_release_mode",
+        "fragment_release_verdict",
         "max_cut_edges",
+        "max_open_release_patches",
         "branchiness",
         "visited_angular_coverage",
         "cracked_span_x",
         "cracked_span_y",
         "cracked_span_z",
+        "final_fragment_entropy",
     ]
     prior_keys = [
         "E_raw",
@@ -269,6 +417,11 @@ def _write_markdown_report(rows: list[dict], path: Path, no_sim: bool) -> None:
         "max_n_frags",
         "max_cut_edges",
         "branchiness",
+        "tip_event_count",
+        "branch_event_count",
+        "branch_event_frame_count",
+        "branch_event_angle_mean_deg",
+        "branch_event_angle_std_deg",
         "visited_angular_coverage",
         "visited_angular_entropy",
         "cracked_angular_coverage",
@@ -276,6 +429,11 @@ def _write_markdown_report(rows: list[dict], path: Path, no_sim: bool) -> None:
         "cracked_span_x",
         "cracked_span_y",
         "cracked_span_z",
+        "final_released_node_ratio",
+        "final_largest_fragment_ratio",
+        "final_nonbase_fragment_min_size",
+        "final_nonbase_fragment_mean_size",
+        "final_fragment_entropy",
     ]
 
     families = sorted({str(row.get("family", "")) for row in rows})
@@ -294,9 +452,12 @@ def _write_markdown_report(rows: list[dict], path: Path, no_sim: bool) -> None:
         f"- distinct material families: {len(families)} ({', '.join(families)})",
     ]
     if not no_sim and cracked_values:
+        verdict_values = [str(row.get("fragment_release_verdict", "")) for row in rows]
+        fail_count = sum(1 for value in verdict_values if value == "FAIL")
         lines.extend([
             f"- cracked_count range: {_fmt(min(cracked_values), 0)} to {_fmt(max(cracked_values), 0)}",
             f"- c_max range: {_fmt(min(cmax_values))} to {_fmt(max(cmax_values))}",
+            f"- fragment release verdicts: {len(rows) - fail_count} pass / {fail_count} fail",
         ])
         morphology_changed = (
             (max(cracked_values) - min(cracked_values) >= 25.0)
@@ -370,6 +531,15 @@ def _runtime_fracture_params(config, material_prior, scaled):
         **manifold_cfg,
         "Gc": float(cfg.material.Gc),
         "l0": float(cfg.material.l0),
+    }
+
+
+def _runtime_release_row(params: dict) -> dict:
+    return {
+        "runtime_crack_connected_release_only": bool(params.get("crack_connected_release_only", False)),
+        "runtime_strict_closure_max_released_ratio": float(params.get("strict_closure_max_released_ratio", 0.0)),
+        "runtime_open_crack_release_enable": bool(params.get("open_crack_release_enable", True)),
+        "runtime_impact_release_gain": float(params.get("impact_release_gain", 1.0)),
     }
 
 
@@ -483,6 +653,148 @@ def _front_topology_metrics(crack_front, count: int, device: torch.device) -> di
     }
 
 
+def _branch_angle_metrics(crack_front, positions: torch.Tensor, count: int) -> dict:
+    if (
+        crack_front is None
+        or getattr(crack_front, "visited_mask", None) is None
+        or getattr(crack_front, "parent_index", None) is None
+    ):
+        return {
+            "branch_angle_count": 0,
+            "branch_angle_mean_deg": 0.0,
+            "branch_angle_std_deg": 0.0,
+        }
+
+    visited = crack_front.visited_mask[:count]
+    parent = crack_front.parent_index[:count]
+    valid_child = visited & (parent >= 0) & (parent < count)
+    if not bool(valid_child.any()):
+        return {
+            "branch_angle_count": 0,
+            "branch_angle_mean_deg": 0.0,
+            "branch_angle_std_deg": 0.0,
+        }
+
+    child_indices = torch.where(valid_child)[0]
+    angles = []
+    for p_t in torch.unique(parent[valid_child]).tolist():
+        p = int(p_t)
+        children = child_indices[parent[child_indices] == p]
+        if children.numel() < 2:
+            continue
+        vec = positions[children] - positions[p].unsqueeze(0)
+        vec = vec / vec.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        cos = (vec @ vec.T).clamp(-1.0, 1.0)
+        upper = torch.triu(torch.ones_like(cos, dtype=torch.bool), diagonal=1)
+        if bool(upper.any()):
+            angles.append(torch.rad2deg(torch.acos(cos[upper])))
+
+    if not angles:
+        return {
+            "branch_angle_count": 0,
+            "branch_angle_mean_deg": 0.0,
+            "branch_angle_std_deg": 0.0,
+        }
+    all_angles = torch.cat(angles)
+    return {
+        "branch_angle_count": int(all_angles.numel()),
+        "branch_angle_mean_deg": float(all_angles.mean().item()),
+        "branch_angle_std_deg": (
+            float(all_angles.std(unbiased=False).item()) if all_angles.numel() > 1 else 0.0
+        ),
+    }
+
+
+def _tip_event_metrics(events: list[dict]) -> dict:
+    if not events:
+        return {
+            "tip_event_count": 0,
+            "seed_event_count": 0,
+            "advance_event_count": 0,
+            "branch_event_count": 0,
+            "tip_event_frame_span": 0,
+            "branch_event_frame_count": 0,
+            "branch_event_angle_mean_deg": 0.0,
+            "branch_event_angle_std_deg": 0.0,
+            "branch_event_closure_max": 0.0,
+        }
+
+    kinds = [str(event.get("kind", "")) for event in events]
+    frames = [int(event.get("frame", 0)) for event in events]
+    branch_angles = [
+        float(event.get("branch_angle_deg", 0.0))
+        for event in events
+        if str(event.get("kind", "")) == "branch"
+    ]
+    branch_closure = [
+        float(event.get("closure_score", 0.0))
+        for event in events
+        if str(event.get("kind", "")) == "branch"
+    ]
+    angle_np = np.asarray(branch_angles, dtype=np.float64)
+    return {
+        "tip_event_count": int(len(events)),
+        "seed_event_count": int(sum(kind == "seed" for kind in kinds)),
+        "advance_event_count": int(sum(kind == "advance" for kind in kinds)),
+        "branch_event_count": int(sum(kind == "branch" for kind in kinds)),
+        "tip_event_frame_span": int(max(frames) - min(frames)) if frames else 0,
+        "branch_event_frame_count": int(len({
+            frame for frame, kind in zip(frames, kinds) if kind == "branch"
+        })),
+        "branch_event_angle_mean_deg": float(angle_np.mean()) if angle_np.size else 0.0,
+        "branch_event_angle_std_deg": float(angle_np.std()) if angle_np.size > 1 else 0.0,
+        "branch_event_closure_max": float(max(branch_closure)) if branch_closure else 0.0,
+    }
+
+
+def _fragment_label_metrics(fragment_ids: torch.Tensor | None, count: int) -> dict:
+    if fragment_ids is None:
+        return {
+            "final_fragment_label_count": 1,
+            "final_nonbase_fragment_count": 0,
+            "final_released_node_ratio": 0.0,
+            "final_largest_fragment_ratio": 1.0,
+            "final_fragment_entropy": 0.0,
+            "final_nonbase_fragment_min_size": 0,
+            "final_nonbase_fragment_mean_size": 0.0,
+        }
+
+    labels = fragment_ids[:count].detach().long()
+    if labels.numel() == 0:
+        return {
+            "final_fragment_label_count": 1,
+            "final_nonbase_fragment_count": 0,
+            "final_released_node_ratio": 0.0,
+            "final_largest_fragment_ratio": 1.0,
+            "final_fragment_entropy": 0.0,
+            "final_nonbase_fragment_min_size": 0,
+            "final_nonbase_fragment_mean_size": 0.0,
+        }
+
+    unique, counts = labels.unique(sorted=True, return_counts=True)
+    total = float(labels.numel())
+    released = float((labels > 0).sum().item()) / max(total, 1.0)
+    probs = counts.float() / max(total, 1.0)
+    entropy = 0.0
+    if probs.numel() > 1:
+        entropy_t = -(probs * probs.clamp(min=1e-8).log()).sum()
+        entropy = float((entropy_t / torch.log(torch.tensor(float(probs.numel()), device=labels.device))).item())
+    nonbase_counts = counts[unique > 0]
+    return {
+        "final_fragment_label_count": int(unique.numel()),
+        "final_nonbase_fragment_count": int((unique > 0).sum().item()),
+        "final_released_node_ratio": released,
+        "final_largest_fragment_ratio": float(counts.max().item() / max(total, 1.0)),
+        "final_fragment_entropy": entropy,
+        "final_nonbase_fragment_min_size": (
+            int(nonbase_counts.min().item()) if nonbase_counts.numel() > 0 else 0
+        ),
+        "final_nonbase_fragment_mean_size": (
+            float(nonbase_counts.float().mean().item()) if nonbase_counts.numel() > 0 else 0.0
+        ),
+    }
+
+
 @torch.no_grad()
 def simulate_prompt_metrics(
     positions_np: np.ndarray,
@@ -493,6 +805,7 @@ def simulate_prompt_metrics(
     fragment_every: int,
     plot_path: Path | None = None,
     plot_title: str | None = None,
+    event_log_path: Path | None = None,
 ) -> dict:
     positions = torch.from_numpy(positions_np).float().to(device)
     normals = torch.from_numpy(normals_np).float().to(device)
@@ -526,10 +839,6 @@ def simulate_prompt_metrics(
     max_closure = 0
     max_open_release_patches = 0
     max_open_release_nodes = 0
-    max_catastrophic_release_patches = 0
-    max_catastrophic_release_nodes = 0
-    max_secondary_shatter_patches = 0
-    max_secondary_shatter_nodes = 0
     max_n_frags = 1
 
     for frame in range(int(frames)):
@@ -571,22 +880,6 @@ def simulate_prompt_metrics(
                 max_open_release_nodes,
                 int(getattr(fragment_manager, "last_open_release_nodes", 0)),
             )
-            max_catastrophic_release_patches = max(
-                max_catastrophic_release_patches,
-                int(getattr(fragment_manager, "last_catastrophic_release_patches", 0)),
-            )
-            max_catastrophic_release_nodes = max(
-                max_catastrophic_release_nodes,
-                int(getattr(fragment_manager, "last_catastrophic_release_nodes", 0)),
-            )
-            max_secondary_shatter_patches = max(
-                max_secondary_shatter_patches,
-                int(getattr(fragment_manager, "last_secondary_shatter_patches", 0)),
-            )
-            max_secondary_shatter_nodes = max(
-                max_secondary_shatter_nodes,
-                int(getattr(fragment_manager, "last_secondary_shatter_nodes", 0)),
-            )
 
     c = fracture_field.c
     opening = fracture_field.a if fracture_field.a is not None else torch.zeros_like(c)
@@ -618,24 +911,33 @@ def simulate_prompt_metrics(
         "max_closure_candidates": int(max_closure),
         "max_open_release_patches": int(max_open_release_patches),
         "max_open_release_nodes": int(max_open_release_nodes),
-        "max_catastrophic_release_patches": int(max_catastrophic_release_patches),
-        "max_catastrophic_release_nodes": int(max_catastrophic_release_nodes),
-        "max_secondary_shatter_patches": int(max_secondary_shatter_patches),
-        "max_secondary_shatter_nodes": int(max_secondary_shatter_nodes),
         "branchiness": float(tips.sum().item() / max(int(visited.sum().item()), 1)),
     }
     metrics.update(_front_topology_metrics(crack_front, int(c.shape[0]), positions.device))
+    metrics.update(_branch_angle_metrics(crack_front, positions, int(c.shape[0])))
+    tip_events = (
+        crack_front.export_event_log()
+        if crack_front is not None and hasattr(crack_front, "export_event_log")
+        else []
+    )
+    metrics.update(_tip_event_metrics(tip_events))
+    if event_log_path is not None:
+        event_log_path = Path(event_log_path)
+        event_log_path.parent.mkdir(parents=True, exist_ok=True)
+        event_log_path.write_text(json.dumps(tip_events, indent=2), encoding="utf-8")
     metrics.update(_bbox_metrics(positions, cracked, "cracked"))
     metrics.update(_bbox_metrics(positions, visited, "visited"))
     metrics.update(_angular_metrics(positions, cracked, seed_center, "cracked"))
     metrics.update(_angular_metrics(positions, visited, seed_center, "visited"))
 
+    fragment_ids = (
+        fragment_manager.fragment_ids
+        if fragment_manager is not None and fragment_manager.fragment_ids is not None
+        else None
+    )
+    metrics.update(_fragment_label_metrics(fragment_ids, int(c.shape[0])))
+
     if plot_path is not None:
-        fragment_ids = (
-            fragment_manager.fragment_ids
-            if fragment_manager is not None and fragment_manager.fragment_ids is not None
-            else None
-        )
         _save_final_crack_plot(
             positions=positions,
             damage=c,
@@ -644,6 +946,8 @@ def simulate_prompt_metrics(
             out_path=Path(plot_path),
             title=plot_title or "final crack morphology",
             fragment_ids=fragment_ids,
+            parent_index=crack_front.parent_index if crack_front is not None else None,
+            activation_step=crack_front.activation_step if crack_front is not None else None,
         )
     return metrics
 
@@ -715,10 +1019,11 @@ def main():
     for prompt in prompts:
         raw = predictor.predict(prompt)
         topk_entries = [predictor.db.get_entry_by_name(name) for name in raw["top_k_names"]]
-        material_prior = adapter.build_material_prior(topk_entries, raw["top_k_scores"])
+        material_prior = adapter.build_material_prior(topk_entries, raw["top_k_scores"], text=prompt)
         material_prior = adapter.apply_sentence_style(material_prior, prompt)
         scaled = adapter.scale_physics_to_mpm(
             material_prior["physics"],
+            family=material_prior["family"],
             base_density=float(config.material.density),
         )
 
@@ -748,6 +1053,7 @@ def main():
             "branching_bias": material_prior["fracture"]["branching_bias"],
             "anisotropy_strength": material_prior["fracture"]["anisotropy_strength"],
         }
+        row.update(_runtime_release_row(fracture_params))
 
         if not args.no_sim:
             print(f"\n[validate] {prompt!r} -> family={row['family']} top1={row['top1']}")
@@ -755,6 +1061,8 @@ def main():
             if args.plot_final:
                 plot_path = out_dir / "final_plots" / f"{len(rows):02d}_{_slug(prompt)}.png"
                 row["final_plot"] = str(plot_path)
+            event_log_path = out_dir / "event_logs" / f"{len(rows):02d}_{_slug(prompt)}.json"
+            row["tip_event_log"] = str(event_log_path)
             metrics = simulate_prompt_metrics(
                 positions_np,
                 normals_np,
@@ -764,9 +1072,13 @@ def main():
                 fragment_every=int(args.fragment_every),
                 plot_path=plot_path,
                 plot_title=f"{prompt} | {row['family']} / {row['sentence_style']}",
+                event_log_path=event_log_path,
             )
             row.update(metrics)
 
+        row["expected_release_mode"] = _release_mode_for_row(row)
+        if not args.no_sim:
+            _, row["fragment_release_verdict"] = _release_verdict_for_row(row)
         rows.append(row)
 
     json_path = out_dir / "sentence_material_validation.json"
@@ -790,12 +1102,13 @@ def main():
     for row in rows:
         sim_text = ""
         if "c_max" in row:
-            sim_text = (
-                f" c_max={row['c_max']:.3f}"
-                f" cracked={row['cracked_count']}"
-                f" frags={row['max_n_frags']}"
-                f" cut={row['max_cut_edges']}"
-            )
+                sim_text = (
+                    f" c_max={row['c_max']:.3f}"
+                    f" cracked={row['cracked_count']}"
+                    f" frags={row['max_n_frags']}"
+                    f" branch_events={row.get('branch_event_count', 0)}"
+                    f" cut={row['max_cut_edges']}"
+                )
         print(
             f"- {row['prompt']} -> {row['family']} / {row['top1']} "
             f"E={row['E_raw']:.2e} Gc={row['Gc_raw']:.1f}{sim_text}"

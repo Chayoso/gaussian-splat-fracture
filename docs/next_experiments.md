@@ -1,14 +1,376 @@
 # Next Experiments
 
-Date: 2026-04-26
+Date: 2026-04-28
+
+## 2026-04-27 Revert To V1
+
+The experimental replacement branch has been removed from the active code path.
+The current baseline is again the v1 Gaussian surface-graph pipeline:
+
+```text
+CLIP/material prior
+-> MPM gravity/contact
+-> PhysicsProjector
+-> tip-based GaussianFractureField
+-> GraphFragmentManager
+-> Gaussian visualization / Y-Z validation
+```
+
+Use the sections below as the active v1 baseline notes.
+
+## 2026-04-28 Phase-Approved Birth Baseline
+
+The current active baseline is v1.5: keep the v1 surface-manifold crack graph,
+but require local narrow-band phase/volume evidence before a proposed crack
+closure patch becomes a detached fragment.
+
+Resolved bottlenecks in this pass:
+
+- Surface closure is no longer allowed to create fragments by itself.  The
+  fragment manager now filters explicit crack/closure patches through a local
+  phase approval score using surface volume proxy, phase cut gate, crack
+  opening, and cut-boundary support.
+- Phase-field is no longer just a stress-side background field.  The simulator
+  builds an immediate surface volume damage proxy from `fracture_field.c`,
+  phase cut gate, crack-front visited/tip state, opening norm, and saved
+  detached masks, then passes it into fragment detection.
+- Fragment birth is now measured per post-impact frame, while PNG snapshots are
+  still written only at the configured cadence.  This fixes the previous report
+  bug where a fragment born between 5-frame snapshots could show phase score
+  `0`.
+- The final raw sweep uses 10 snapshots per prompt and exports Y-Z montage/mp4.
+- Control prompts stay blocked: rubber and steel produce no crack-connected
+  fragments and no phase-approved birth.
+
+Current validation:
+
+- Output: `output/phase_approved_birth_sweep_50k_v3`
+- Report: `output/phase_approved_birth_sweep_50k_v3/progression_sweep_report.md`
+- Y-Z montage: `output/phase_approved_birth_sweep_50k_v3/yz_media/yz_sentence_result_montage.png`
+- Y-Z MP4: `output/phase_approved_birth_sweep_50k_v3/yz_media/yz_sentence_result.mp4`
+- MP4 check: 10 frames at 1 fps, 1240x1622.
+- Particle/grid setting: 50K surface particles, 64 grid, 52 frames,
+  3 physics substeps, fragment check every frame.
+
+| prompt class | expected mode | verdict | snapshots | first birth | final fragments | released ratio | bcut | phase birth |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| glass radial | crack-connected fragment | PASS | 11 | 0 | 552 | 0.594 | 0.544 | 0.908 |
+| glass spiderweb | crack-connected fragment | PASS | 11 | 0 | 47 | 0.123 | 0.708 | 0.906 |
+| ceramic single crack | crack split/no detach | PASS | 11 | -1 | 0 | 0.000 | 0.000 | 0.000 |
+| concrete chunks | crack-connected fragment | PASS | 11 | 2 | 12 | 0.072 | 0.795 | 0.966 |
+| ice radial | crack-connected fragment | PASS | 11 | 0 | 539 | 0.608 | 0.572 | 0.908 |
+| rubber no fracture | no fragment | PASS | 11 | -1 | 0 | 0.000 | 0.000 | 0.000 |
+| steel denting | no fragment | PASS | 11 | -1 | 0 | 0.000 | 0.000 | 0.000 |
+
+50K readout:
+
+- The previous 50K `cusolverDnXsyevBatched_bufferSize` failure is fixed by
+  chunked symmetric eigensolve with a diagonal fallback for invalid chunks.
+- The apparent `phase birth = 0` issue in the first 50K pass was a per-frame
+  reporting bug: fracture burst runs multiple fragment detections in one
+  visible frame, and the final detect overwrote the earlier birth stats.  The
+  simulator now accumulates frame-level birth/approval stats.
+- Targeted 50K spiderweb/concrete rerun confirmed the fix before the full
+  sweep: spiderweb birth `0.919` at impact+0, concrete birth `0.937` at
+  impact+1.
+- Full 50K v3 preserves the desired material ordering: radial glass/ice
+  immediate high fragmentation, spiderweb lower release, concrete delayed
+  chunks, ceramic crack-only, rubber/steel no fragment.
+
+## 2026-04-28 Modularization Pass
+
+The active v1.5 algorithm is unchanged in this pass.  The goal was to remove
+the 2000+ line simulator/fragment files as active bottlenecks so later
+material/style contrast work can be reviewed and modified locally.
+
+Module split:
+
+- `src/core/manifold_simulator.py` now keeps orchestration, initialization, and
+  per-frame flow.  Helper responsibilities moved to:
+  `src/core/simulator_mixins/surface_binding.py`,
+  `fragment_event_stats.py`, `fragment_physics.py`,
+  `runtime_profiles.py`, `fracture_drive.py`, and `render_fragments.py`.
+- `src/fracture/graph_fragment_manager.py` now keeps fragment-manager state and
+  `detect_fragments`.  Helper responsibilities moved to:
+  `fragment_phase_approval.py`, `fragment_cut_field.py`,
+  `fragment_closure_patches.py`, `fragment_release_patches.py`,
+  `fragment_component_analysis.py`, and `fragment_manager_utils.py`.
+- Raw matplotlib crack/fragment plotting moved from
+  `scripts/inspect_gravity_crack_progression.py` to
+  `src/diagnostics/raw_graph_plot.py`.
+
+Line-count result:
+
+| file | before | after active file | extracted modules |
+| --- | ---: | ---: | ---: |
+| `src/core/manifold_simulator.py` | 3174 | 1858 | 1404 |
+| `src/fracture/graph_fragment_manager.py` | 4933 | 1230 | 3816 |
+| `scripts/inspect_gravity_crack_progression.py` | 1515 | 939 | 587 |
+
+Verification:
+
+- Broad compile passed:
+  `python -m py_compile src/core/manifold_simulator.py src/core/simulator_mixins/*.py src/fracture/*.py src/diagnostics/*.py scripts/inspect_gravity_crack_progression.py scripts/build_yz_progression_media.py scripts/validate_sentence_materials.py scripts/validate_material_sentence_gravity.py smoke_test.py`
+- Impact smoke passed:
+  `output/refactor_modularization_impact_smoke_2k/progression_report.md`
+  with glass radial `PASS`, first birth impact+`0`, final labels `58`,
+  released ratio `0.431`, birth phase score `0.910`, and
+  `non-causal release = 0/0/0`.
+- `git diff --check` passed.
+
+Dead release fallback cleanup:
+
+- Removed the two unused non-causal fallback release code paths from
+  `GraphFragmentManager`, fragment patch extraction, simulator metrics, CLIP
+  runtime presets, and validation reports.
+- Renamed the remaining active impact-time crack corridor helper to
+  `impact_closure_*` so it is clearly a crack-connected closure path, not a
+  visual release fallback.
+- Verification output:
+  `output/siggraph_teaser_no_dead_release_smoke2k_v1/evidence_report.md`.
+- String audit passed for the removed fallback names across `src/`, `scripts/`,
+  `docs/`, `configs/`, and the new smoke output.
+
+Next material/style contrast target:
+
+- Do not tune the solver broadly.  Use the cleaner module boundaries to change
+  material-local controls only:
+  crack-front style presets in `MaterialPriorAdapter`,
+  phase/birth thresholds in `fragment_phase_approval.py`,
+  closure topology in `fragment_closure_patches.py`, and
+  post-fragment material motion in `fragment_physics.py`.
+- Evidence should compare matched prompts, not isolated single outputs:
+  same mesh/impact/seed with different sentence style, then same style with
+  different material.
+
+## 2026-04-29 V1.5 Freeze Snapshot
+
+Freeze target:
+
+- Active algorithm: v1 surface-manifold crack graph plus narrow-band
+  phase-approved fragment birth.
+- Scope claim: phase-field-approved surface-manifold fracture surrogate, not
+  full volumetric PFF-MPM/NACC.
+- Frozen validation reference: `output/phase_approved_birth_sweep_50k_v3`
+  metrics in the phase-approved birth table above.
+- Large-particle tuning and one-off render runners are excluded
+  from the baseline snapshot.
+
+Allowed post-freeze changes:
+
+- Evidence harness, prompt/config matrices, reports, montage/mp4 generation,
+  and local material/style contrast edits in the documented module boundaries.
+
+Disallowed post-freeze changes:
+
+- Full solver rewrites, new non-causal release fallbacks, arbitrary
+  prompt-triggered fragment birth, or high-particle-count tuning patches that
+  change the v1.5 baseline without a separate branch.
+
+## 2026-04-28 SIGGRAPH Asia Evidence Plan
+
+The next work is not a solver rewrite.  The realistic paper direction is to
+make controllability and visual causality obvious:
+
+```text
+sentence/material prompt
+-> material/style prior
+-> crack-tip motion and branching
+-> phase-approved closure
+-> fragment birth
+-> material-conditioned post-fragment motion
+```
+
+Paper risk:
+
+- If outputs look like prompt presets, the system is weak.
+- If outputs look physically exact, but the method is only surface-manifold
+  plus narrow-band approval, the claim is too strong.
+- The strongest current position is: language-conditioned Gaussian-splat
+  fracture control with an explicit crack-front causal graph and phase-approved
+  fragment birth.
+
+Required evidence set:
+
+1. **Same object, same impact, different sentence**
+   - Use the same mesh, gravity, seed, and camera.
+   - Change only sentence style:
+     radial shatter, spiderweb branching, single smooth crack, chunky crumble,
+     diffuse/no visible fracture.
+   - Required readout: crack path, branch event timeline, first birth frame,
+     fragment count, release ratio, post-motion spread.
+
+2. **Same sentence style, different material**
+   - Keep the fracture wording fixed and change material tokens:
+     glass, ceramic, concrete, rubber, steel, ice.
+   - Required readout: different phase gates, crack onset time, branch density,
+     closure rate, fragment birth/no-birth, bulk motion.
+
+3. **Crack style interpolation**
+   - Sweep style weight or prompt wording from single crack to spiderweb to
+     radial shatter.
+   - Required readout: monotonic or interpretable changes in branch count,
+     branch angle variance, closure patches, and fragment topology.
+
+4. **Material-conditioned post-fragment motion**
+   - Glass/ice: fast local separation, many light pieces, high lateral spread.
+   - Spiderweb glass: connected local cracks, lower release than radial.
+   - Ceramic: clean crack/split, few or no detached fragments unless closure.
+   - Concrete: delayed heavy chunk fall, lower lateral throw, rougher damage
+     bands, persistent support loss.
+   - Rubber: squash/rebound without crack-connected fragments.
+   - Steel: dent/tilt/settle without crack-connected fragments.
+
+5. **Ablations**
+   - no phase approval: closure-only fragments should look less causal.
+   - no CLIP material prior: material ordering should collapse or weaken.
+   - no crack-front branching: spiderweb/radial fragmentation should degrade.
+   - no narrow-band volume feedback: cracks should paint the surface but fail
+     to produce convincing phase-approved fragment birth.
+
+6. **Mesh generalization**
+   - Validate at least three meshes with the same prompt set:
+     bunny, simple sphere/block, and one thin/anisotropic object.
+   - Required readout: same qualitative material ordering across meshes.
+
+7. **High-quality render bridge**
+   - Current raw plots prove causality; final paper figures need Gaussian render
+     frames or videos from the same 50K runs.
+   - The raw Y-Z montage remains the diagnostic evidence; render videos are the
+     visual result, not the only validation.
+   - Renderer dependency note, 2026-04-29: use the `diff_gauss` module in the
+     `diffmpm_v2.3.0` conda environment.  It resolves from
+     `/home/chayo/Desktop/Shape-morphing-binder/gaussian-splatting/submodules/diff-gaussian-rasterization/diff_gauss`.
+     Do not use the older `scene.gaussian_model` / `gaussian_renderer` direct
+     imports for new work in this checkout; route photorealistic rendering
+     through `src/renderer/core/renderer.py` (`GSRenderer3DGS`) or a local
+     fallback only for debugging.
+
+Near-term implementation checks:
+
+- Add a material/style contrast report that compares matched prompt groups in
+  one table: onset, branch count, branch angle std, birth frame, phase score,
+  fragment count, released ratio, lateral release, drop, angular speed, squash.
+- Strengthen post-fragment motion only where the metric table shows weak
+  contrast.  Do not tune crack birth thresholds unless the causality metrics
+  regress.
+- Keep 50K/64-grid as the main validation tier.  Use 10K only for fast probes
+  and 128 grid only after visual causality is accepted at 50K.
+
+## 2026-04-28 SIGGRAPH Evidence Runs
+
+The evidence harness is now `scripts/run_siggraph_evidence.py`.  It wraps
+`scripts/inspect_gravity_crack_progression.py`, writes per-suite prompt/config
+files, supports runtime ablation overrides, builds Y-Z montage/mp4 media, and
+stores an `evidence_report.md` for each run.
+
+Completed quick/smoke evidence:
+
+| suite | output | tier | readout |
+|---|---|---|---|
+| same object, same impact, different sentence | `output/siggraph_evidence_sentence_style_quick10k_v1` | 10K/64 | sentence alone spans no-fracture, single crack, spiderweb, and radial shatter |
+| same sentence, different material | `output/siggraph_evidence_material_radial_quick10k_v1` | 10K/64 | glass/ice shatter, ceramic/concrete chunk weakly, rubber/steel stay no-fragment |
+| crack style interpolation | `output/siggraph_evidence_style_interpolation_quick10k_v1` | 10K/64 | single -> branch -> spiderweb -> radial increases release and fragment count |
+| mesh generalization | `output/siggraph_evidence_mesh_repro_smoke2k_v2` | 2K/32 smoke | bunny/spot/truck preserve glass > concrete > rubber ordering |
+| ablation | `output/siggraph_evidence_ablation_quick10k_v1` | 10K/64 | no-branch and no-CLIP fail; no-volume weakens; no-phase is inconclusive on easy glass radial |
+| phase gate stress ablation | `output/siggraph_evidence_phase_gate_stress_quick10k_v4` | 10K/64 | controlled concrete stress case: strict phase approval blocks surface-only birth, bypass creates fragments |
+
+Key numeric results:
+
+- Sentence control at 10K:
+  `diffuse_microcrack` gives `0` fragments, `single_smooth` gives `10`,
+  spiderweb variants give `47-48`, and radial shatter gives `241`.
+- Material control at 10K with the same radial wording:
+  glass/ice give `249/268` fragments and about `0.64` release, ceramic/concrete
+  give `1/2` delayed chunks, rubber/steel give `0` fragments.
+- Style interpolation at 10K:
+  single crack gives `5` fragments and `0.032` release, branching gives
+  `47-48` fragments and `0.156-0.167` release, radial gives `251` fragments
+  and `0.639` release.
+- Mesh repro smoke:
+  bunny/spot/truck glass gives `80/83/66` fragments, concrete gives
+  `32/24/7`, and rubber gives `0/0/0`.
+- Ablation at 10K:
+  baseline gives `247` fragments and `0.648` release; no crack-front branching
+  drops to `170` fragments and `0.365` release; no CLIP/material prior drops
+  to `0` fragments; no narrow-band feedback weakens to `204` fragments and
+  `0.561` release; no phase approval remains close to baseline on this easy
+  glass radial case.
+- Phase gate stress ablation at 10K:
+  with intentionally weakened narrow-band volume support and a stricter phase
+  threshold, the same rough concrete prompt gives `0` fragments with phase
+  approval enabled, but gives `12` fragments at impact+1 with phase approval
+  bypassed.  This is a controlled hack/stress-test, not a normal concrete
+  quality run; it isolates that surface closure alone can be rejected by the
+  phase gate.
+
+Current interpretation:
+
+- The pipeline now has credible controllability evidence: sentence/style and
+  material tokens change crack-front morphology, closure, fragment birth, and
+  post-fragment release in measurable ways.
+- The mesh smoke run supports generalization qualitatively, but final figures
+  should rerun selected mesh cases at 10K or 50K before being used as paper
+  evidence.
+- The first quick10K ablation supports crack-front branching and CLIP/material
+  prior as essential controls.  The easy glass radial no-phase row remains
+  inconclusive, but the concrete phase-gate stress ablation now isolates the
+  approval gate: strict phase support blocks fragment birth, while bypassing
+  the gate lets the same surface crack closure detach.
+- This remains a surface-manifold plus narrow-band phase approval method.  The
+  paper claim should emphasize explicit controllable crack-front causality, not
+  full volumetric PFF-MPM.
+
+Previous 10K validation:
+
+- Output: `output/phase_approved_birth_sweep_10k_v2`
+- Report: `output/phase_approved_birth_sweep_10k_v2/progression_sweep_report.md`
+- Y-Z montage: `output/phase_approved_birth_sweep_10k_v2/yz_media/yz_sentence_result_montage.png`
+- Y-Z MP4: `output/phase_approved_birth_sweep_10k_v2/yz_media/yz_sentence_result.mp4`
+- MP4 check: 10 frames at 1 fps.
+
+| prompt class | expected mode | verdict | snapshots | first birth | final fragments | released ratio | bcut | phase birth |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| glass radial | crack-connected fragment | PASS | 10 | 0 | 244 | 0.644 | 0.574 | 0.951 |
+| glass spiderweb | crack-connected fragment | PASS | 10 | 0 | 44 | 0.161 | 0.758 | 0.834 |
+| ceramic single crack | crack split/no detach | PASS | 10 | -1 | 0 | 0.000 | 0.000 | 0.000 |
+| concrete chunks | crack-connected fragment | PASS | 10 | 1 | 14 | 0.090 | 0.789 | 0.896 |
+| ice radial | crack-connected fragment | PASS | 10 | 0 | 232 | 0.642 | 0.589 | 0.873 |
+| rubber no fracture | no fragment | PASS | 10 | -1 | 0 | 0.000 | 0.000 | 0.000 |
+| steel denting | no fragment | PASS | 10 | -1 | 0 | 0.000 | 0.000 | 0.000 |
+
+Interpretation:
+
+- Within the v1 surface-manifold scope, the main bottleneck is resolved: crack
+  propagation/closure proposes fragments, and phase/volume evidence approves
+  detach.  Fragment labels are no longer accepted from arbitrary visual graph
+  closure alone.
+- This is still not full volumetric PFF-MPM. The remaining research risk is
+  physical rigor: true volumetric topology, NACC-style projection, and real
+  per-fragment rigid-body dynamics are still outside this baseline.
+- 50K/64-grid robustness is now passed.  Do not try 128 grid until the current
+  50K media has been visually reviewed; parameter tuning should stay minimal
+  unless the review exposes a specific morphology failure.
 
 ## Current retained outputs
 
 Only the useful comparison outputs are kept under `output/`:
 
-- `secondary_shatter_gravity_50k_probe`: latest gravity-drop validation with staged secondary shatter.
-- `secondary_shatter_surface_50k_probe`: latest 50K surface sentence probe.
-- `material_sentence_validation_50k_catastrophic_v1`: pre-secondary-shatter 50K baseline.
+- `phase_approved_birth_sweep_10k_v2`: current accepted 10K/64-grid raw CLIP
+  sweep with 10 Y-Z snapshots and mp4.
+- `phase_approved_birth_sweep_50k_v3`: current accepted 50K/64-grid raw CLIP
+  sweep with 10 Y-Z media frames and mp4.
+- `siggraph_evidence_sentence_style_quick10k_v1`: same object/impact,
+  different sentence style.
+- `siggraph_evidence_material_radial_quick10k_v1`: same radial sentence,
+  different material.
+- `siggraph_evidence_style_interpolation_quick10k_v1`: sentence style
+  interpolation control curve.
+- `siggraph_evidence_mesh_repro_smoke2k_v2`: bunny/spot/truck smoke
+  generalization with completed impact media.
+- `siggraph_evidence_ablation_quick10k_v1`: first 10K ablation suite.
+- `siggraph_evidence_phase_gate_stress_quick10k_v4`: controlled 10K concrete
+  stress ablation with suite-level Y-Z montage/mp4 for phase-gate on/off.
 
 Older smoke/probe/archive outputs were removed to keep the workspace manageable.
 
@@ -16,17 +378,187 @@ Older smoke/probe/archive outputs were removed to keep the workspace manageable.
 
 The surface-first pipeline is now showing the target control signal:
 
-- radial glass: high fragment count and broad surface damage
-- smooth crack: low fragment count and narrow crack path
-- ceramic: limited fracture
-- concrete/chunky: medium fragmentation
-- rubber/diffuse: no fracture release
+- radial glass and radial ice: immediate phase-approved shatter
+- spiderweb glass: lower released ratio than radial glass, but still
+  phase-approved crack-connected fragments
+- ceramic single smooth crack: crack/split behavior without detached fragments
+- concrete/chunky: small delayed chunk release with phase-approved birth
+- rubber/diffuse and steel/denting: no fragment release
 
-The latest 50K gravity probe moved glass from the previous tens-of-fragments range to roughly 160 fragments while keeping rubber at 1 fragment.
+## 2026-04-27 Crack-Connected Fragment Correction
+
+Problem:
+
+- The previous `complete_shatter` target was physically wrong for this project. It produced many released labels and then made particles/patches fly apart, which reads as artificial particle separation rather than crack-driven fragmentation.
+- The desired behavior is local: cracks originate from one or more impact neighborhoods, propagate as time-ordered crack tips, branch at intermediate frames with slightly randomized directions, and create a fragment only when crack paths connect or meet.
+- A brittle sentence/material should not pass validation just because the surface has high damage or because a non-causal release fallback created patches. It must show:
+  `impact/external force -> seed tips -> per-frame tip propagation -> branch-tip creation -> crack connection/meeting -> fragment label`.
+
+Design decision:
+
+- Add a strict `crack_connected_release_only` mode for brittle radial/spiderweb styles.
+- In strict mode, non-causal release fallbacks, physical release drift, and fragment separation impulse are disabled.
+- Fragment labels are allowed only from explicit closure patches built from connected crack corridors; previously detached explicit fragments may persist through hysteresis, but new arbitrary patch release is blocked.
+- Crack-front validation must export a time-axis event log with `seed`, `advance`, and `branch` events. Each event records frame, parent tip, child tip, positions, direction, branch angle, drive score, branch score, and closure score.
+- The validation pass/fail target for strict brittle runs is now crack-connected fragmentation, not high released-node ratio or large physical detach/drop.
+
+Validation gate:
+
+| Check | Expected |
+|---|---|
+| Faiss kNN | Graph/MPM projection now require Faiss and fail loudly if the environment is wrong. |
+| Tip events | Branch events occur across multiple frames, not only at the final perimeter. |
+| Branch direction | New branch tips have nonzero branch-angle mean/std and roughly follow the main energy direction with jitter. |
+| Fragment source | Fragment labels come from crack-connected closure/cascade patches with phase approval. |
+| Fragment labels | At least one non-base fragment appears only after crack-connection closure candidates exist. |
+| Motion | Strict mode has no separation impulse or artificial physical release drift. |
+
+Implemented in code:
+
+- `CrackFront` now exports per-frame tip events as JSON: `seed`, `advance`, and `branch`.
+- `GraphFragmentManager` now supports `crack_connected_release_only`.
+- Strict mode blocks non-causal release fallbacks, support-loss promotion, separation impulse, and physical release drift.
+- Strict mode adds local closure patches around crack-connection candidates so fragment labels come from connected crack corridors rather than arbitrary patch release.
+- kNN paths now use `src.utils.knn.knn_search`, which requires Faiss instead of silently changing backend.
+- Gravity validation now reads strict/open/impact-closure runtime state from the live simulator/fragment manager, not only from returned material params.
+- Refactor pass removed the dead cKDTree graph builder path, the dense/torch kNN fallback path, the silent zero-stress projection fallback, and the manual union-find connected-component fallback.
+
+Validation completed:
+
+- Surface 10K, 40 frames: `output/crack_connected_surface_10k_brittle_v1/sentence_material_validation.md`
+  - `crack_connected_fragment` PASS.
+  - Faiss graph kNN confirmed.
+  - `max_n_frags=13`, released-node ratio `0.1018`, largest-fragment ratio `0.8982`.
+  - `branch_event_count=1279` over `39` branch frames; branch-angle mean/std `70.79/9.49` degrees.
+  - `non-causal release` release patches all `0`.
+- Gravity 10K, 64 grid, 56 frames: `output/crack_connected_gravity_10k_brittle_v3/gravity_material_validation.md`
+  - `crack_connected_fragment` PASS.
+  - Impact frame `33`.
+  - `max/final_n_fragments=8/8`, released-node ratio `0.2249`, largest-fragment ratio `0.7751`.
+  - `final_branch_event_count=764` over `18` branch frames; branch-angle mean/std `71.72/9.88` degrees.
+  - `non-causal release` release patches all `0`.
+  - Physical fragment labels are filtered to cohesive chunks: physical non-base min size `186`.
+
+Refactor verification:
+
+- Surface 10K, 40 frames after Faiss-only/strict cleanup: `output/refactor_crack_connected_surface_10k_brittle_v1/sentence_material_validation.md`
+  - `crack_connected_fragment` PASS.
+  - `max_n_frags=14`, released-node ratio `0.096`, largest-fragment ratio `0.904`.
+  - `branch_event_count=1240`, tip event count `14497`.
+  - `non-causal release` release patches all `0`.
+- Gravity 10K, 64 grid, 56 frames after refactor: `output/refactor_crack_connected_gravity_10k_brittle_v1/gravity_material_validation.md`
+  - `crack_connected_fragment` PASS, strict mode `Y`.
+  - Impact frame `33`.
+  - `max/final_n_fragments=10/10`, released-node ratio `0.229`, largest-fragment ratio `0.771`.
+  - `final_branch_event_count=741`, tip event count `8744`.
+  - `non-causal release` release patches all `0`.
+
+Output cleanup snapshot:
+
+- Preserved outputs after cleanup:
+  - `output/refactor_crack_connected_surface_10k_brittle_v1`
+  - `output/refactor_crack_connected_gravity_10k_brittle_v1`
+  - `output/gravity_crack_progression_10k_brittle_v1`
+- Removed outputs are superseded by the trend below:
+
+| Stage | Representative outputs | Result trend |
+|---|---|---|
+| Branch/tip design probes | `branch_design_*`, `branch_angle_*`, `branch_guided_*`, `branch_target_*`, `branch_pathlimit_*` | Branching and tip-angle control improved, but these runs did not validate crack-connected fragment creation. |
+| Old complete-shatter baseline | `fragment_release_surface_10k_v1`, `fragment_release_gravity_10k_v1`, `fragment_release_gravity_50k_v1` | Produced many fragments and high released-node ratios (`0.948-0.977` for radial glass), but this was rejected because it relied on artificial release/physical separation. |
+| Crack-connected 2K probes | `crack_connected_surface_2k_probe*` | v1/v2 failed with branch events but no fragments; v3 passed after strict local closure patches (`max_n_frags=15`, released ratio `0.165`, nonclosure releases `0`). |
+| Crack-connected 10K pre-refactor | `crack_connected_surface_10k_brittle_v1`, `crack_connected_gravity_10k_brittle_v1/v2/v3` | Surface passed (`max_n_frags=13`, released `0.102`, branch events `1279`). Gravity v1 still used the old verdict mode; v2/v3 passed strict mode, with v3 at `8/8` fragments, released `0.225`, branch events `764`. |
+| Post-refactor final | `refactor_crack_connected_surface_10k_brittle_v1`, `refactor_crack_connected_gravity_10k_brittle_v1` | Faiss-only/strict cleanup preserved behavior. Surface: `max_n_frags=14`, released `0.096`, branch events `1240`. Gravity: `10/10` fragments, released `0.229`, branch events `741`. Non-causal release release patches stayed `0`. |
+
+Progression inspection:
+
+- Dedicated 10K gravity crack progression run: `output/gravity_crack_progression_10k_brittle_v1/progression_report.md`
+- Prompt: `thin glass bottle shattering into localized connected radial cracks`.
+- Snapshot cadence: impact frame and every 5 loop frames after impact, plus final frame.
+- Timeline:
+
+| loop frame | impact+ | crack step | fragments | released ratio | new branch events | total branch events | closure score | nonclosure releases |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 33 | 0 | 0 | 0 label state | 0.000 | 0 | 0 | 0.000 | 0 |
+| 38 | 5 | 8 | 2 | 0.098 | 148 | 148 | 0.769 | 0 |
+| 43 | 10 | 28 | 4 | 0.204 | 198 | 346 | 0.760 | 0 |
+| 48 | 15 | 48 | 6 | 0.215 | 122 | 468 | 0.838 | 0 |
+| 53 | 20 | 68 | 6 | 0.179 | 137 | 605 | 0.844 | 0 |
+| 55 | 22 | 76 | 6 | 0.228 | 53 | 658 | 0.842 | 0 |
+
+Interpretation:
+
+- This run supports the desired temporal behavior better than the old final-ring-only failure mode: branch tips are created throughout propagation, with new branch events in every 5-frame interval after impact.
+- Fragment labels start at impact+5 after closure/cut evidence appears, then grow from 2 to 6 fragments as crack steps progress.
+- `non-causal release` release patches remain zero for every snapshot, so these fragments are coming from strict crack-connected closure logic.
+- The visual snapshots still show some large loop/ring-like paths later in propagation, but they are not created only at the terminal perimeter; they emerge after earlier branch tips and closure candidates have already formed near the impact region.
+
+## 2026-04-27 Fragment Release Gate Update (Superseded Baseline)
+
+This section is retained as historical context. The crack-connected correction above supersedes the old `complete_shatter` pass criteria because those criteria rewarded high released-node ratio and visible physical detach, which is now considered the wrong behavior for localized crack-driven fragmentation.
+
+Problem:
+
+- Gravity/external-force tests could show visible crack damage while still leaving most damaged nodes attached to the base surface label.
+- For brittle shattering prompts, the validation target is not only crack creation. The sequence must be:
+  `impact or external force -> crack growth -> fragment labels -> physical detach/drop`.
+- A prompt that implies complete brittle shatter should not pass if it only paints cracks on the surface.
+
+Implemented changes:
+
+- `GraphFragmentManager` now has an `impact_release_gain` runtime input. Gravity impact speed and configured external-force magnitude raise non-causal release probability, patch budget, and release threshold only for fragment-capable material families.
+- `ManifoldSimulator` writes gravity impact speed into `impact_release_gain` at contact and forwards it before fragment detection. External-force initialization does the same from impact magnitude.
+- Sentence/style presets now separate release modes more explicitly:
+  - `sharp_brittle + radial_shatter`: complete shatter, high released-node ratio, many fragments.
+  - `sharp_brittle + spiderweb_branching`: fragmented web, not necessarily full destruction but must release visible fragments.
+  - `rough_quasi_brittle + chunky_crumble`: chunk release.
+  - `single_smooth`: crack/split only, bounded fragment count.
+  - `diffuse_damage`: no fragment release.
+- Validation reports now include:
+  - `expected_release_mode`
+  - `fragment_release_verdict`
+  - `final_released_node_ratio`
+  - `final_largest_fragment_ratio`
+  - `final_fragment_entropy`
+  - gravity `impact_release_gain`
+
+Pass criteria:
+
+| Mode | Required behavior |
+|---|---|
+| `complete_shatter` | many fragments, released-node ratio >= 0.40, largest-fragment ratio <= 0.70, nonzero physical detach/drop in gravity |
+| `fragmented_web` | medium/high fragment count, released-node ratio >= 0.12, largest-fragment ratio <= 0.88 |
+| `chunk_release` | chunk fragments, released-node ratio >= 0.08, largest-fragment ratio <= 0.92 |
+| `crack_split` | bounded fragment count, one dominant body allowed |
+| `no_fragment` | one fragment, zero released nodes, zero physical detach/drop |
+
+Validation completed:
+
+- Surface 10K, 28 frames: `output/fragment_release_surface_10k_v1/sentence_material_validation.md`
+  - 5/5 pass.
+  - Radial glass: `188` max fragments, released-node ratio `0.948`, largest-fragment ratio `0.052`.
+  - Spiderweb glass: `58` max fragments, released-node ratio `0.260`, largest-fragment ratio `0.740`.
+  - Rough concrete crumble: `48` max fragments, released-node ratio `0.303`, largest-fragment ratio `0.697`.
+  - Rubber: `1` fragment, zero release.
+- Gravity 10K, 64 grid, 64 frames: `output/fragment_release_gravity_10k_v1/gravity_material_validation.md`
+  - 4/4 pass.
+  - Radial glass: `197/196` fragments, released-node ratio `0.977`, largest-fragment ratio `0.060`, detach `0.3686`.
+  - Rough concrete crumble: `31/31` fragments, released-node ratio `0.297`, detach `0.1776`.
+  - Rubber: `1/1` fragment, zero release.
+- Gravity 50K, 64 grid, 100 frames: `output/fragment_release_gravity_50k_v1/gravity_material_validation.md`
+  - 3/3 pass.
+  - Radial glass complete shatter: `190/187` fragments, released-node ratio `0.949`, largest-fragment ratio `0.052`, drop/detach `0.3321/0.4869`.
+  - Rough concrete chunk release: `44/44` fragments, released-node ratio `0.187`, largest-fragment ratio `0.813`, drop/detach `0.1600/0.1622`.
+  - Rubber control: `1/1` fragment, zero release.
+
+Next checks:
+
+1. Run a 50K gravity sentence-style sweep that includes `single_smooth` and `spiderweb_branching` together with radial/rubber controls.
+2. Inspect final matplotlib plots for over-fragmented sector artifacts in complete shatter.
+3. After matplotlib passes, render one radial glass and one rough concrete final frame to verify fragment visibility in Gaussian splats.
 
 ## Next implementation work
 
-1. Stabilize secondary shatter labels.
+1. Stabilize non-causal split fallback labels.
    - Remove tiny one-node artifacts from sector/band splitting.
    - Add a minimum visible fragment area rule separate from internal labels.
    - Keep radial glass high-fragment, but make fragment size distribution less uniform.
@@ -34,7 +566,7 @@ The latest 50K gravity probe moved glass from the previous tens-of-fragments ran
 2. Improve fragment motion after release.
    - Increase visual separation for fully shattered glass.
    - Add per-fragment angular scatter and slight spin-like displacement.
-   - Keep ceramic/concrete motion less explosive than glass.
+   - Keep ceramic/concrete motion less energetic than glass.
 
 3. Connect fracture surfaces to rendering.
    - Verify internal cut-surface normals.
@@ -50,8 +582,8 @@ The latest 50K gravity probe moved glass from the previous tens-of-fragments ran
 ## Next validation work
 
 1. Regression table:
-   - Compare baseline catastrophic vs secondary shatter.
-   - Track `max_n_fragments`, `max_secondary_shatter_nodes`, `max_physical_fragment_drop`, and `cracked_count`.
+   - Compare closure-only settings across material/style prompts.
+   - Track `max_n_fragments`, `max_impact_closure_nodes`, `max_physical_fragment_drop`, and `cracked_count`.
 
 2. Visual morphology check:
    - Inspect final matplotlib PNGs for radial, smooth, chunky, diffuse.
@@ -83,3 +615,406 @@ C:\Users\ok429\anaconda3\envs\crack_py11\python.exe scripts\validate_sentence_ma
             "concrete block crumbling into rough granular chunks" `
             "vulcanized rubber ball deforming without visible fracture"
 ```
+
+## 2026-04-27 strict closure diagnosis
+
+Observation:
+
+- In `output/gravity_crack_progression_10k_brittle_v1`, impact+22 already had strong crack closure diagnostics:
+  - `c_max = 0.727`
+  - `closure_score_max = 0.842`
+  - `closure_candidate_nodes = 2252`
+  - `n_fragments = 6`
+  - `released_node_ratio = 0.228`
+- That means stress/damage and crack-connected fragment detection were firing. The missing part was not "no fracture label"; it was visible/localized opening after closure.
+
+Cause:
+
+- Strict crack-connected mode intentionally disabled separation impulse, physical release velocity, non-causal split fallback, and non-causal release fallback to avoid the previous particle explosion behavior.
+- The 5-frame matplotlib progression plotted raw MPM surface positions. It did not show the persistent render validation offsets, so fragments could be labeled but still look glued in the diagnostic PNG.
+- Existing `physical_detached_distance` was mostly a COM distance between labeled regions, not a direct measure of new opening after a fragment was registered.
+
+Current fix:
+
+- Strict mode now allows a small closure-gated physical gap for fragments with high closure/release score. It still keeps impulse, shard spawning, and debris motion disabled.
+- Radial and spiderweb strict sentence presets now set small `fragment_physical_gap_scale` values with zero release velocity:
+  - spiderweb: `0.00024`, 18 frames
+  - radial: `0.00034`, 20 frames
+- The progression script is now raw-only. Render-validation snapshots are disabled for algorithm validation.
+- Each snapshot writes one combined graph PNG:
+  - top row: crack propagation graph with parent-child crack-tip edges, tips, and damage only
+  - bottom row: mesh-like fragment surface patches with filled triangulated component surfaces and outlines
+- New diagnostics:
+  - `physical_release_displacement`
+  - final/max physical release displacement in gravity summaries
+- Render metrics are no longer part of the progression report.
+
+Validation rerun:
+
+- `output/gravity_crack_progression_10k_brittle_v5_raw_surface/progression_report.md`
+- Prompt: `thin glass bottle shattering into localized connected radial cracks`
+- Final snapshot: loop `55`, impact+`23`, crack step `77`
+- Result:
+  - `final_n_fragments = 9`
+  - `final_released_node_ratio = 0.2382`
+  - `final_largest_fragment_ratio = 0.7618`
+  - `final_physical_release_displacement = 0.0795`
+  - `non-causal release = 0/0/0`
+  - branch events over snapshots: `202 -> 398 -> 398 -> 601 -> 750`
+  - final graph PNG: `output/gravity_crack_progression_10k_brittle_v5_raw_surface/snapshots/frame_0055_impact_023_raw_graph.png`
+- Readout:
+  - Stress/damage is not the blocker. Crack closure and labels are being created.
+  - The previous visibility issue came from missing local opening in strict mode and from raw-only matplotlib plots.
+  - The current output shows nonzero local opening without reintroducing non-causal release or particle-spray style shatter.
+
+### Persistent Detached Boundary Validation
+
+Problem found after raw-surface validation:
+
+- Fragment surfaces were visually richer than the top-row crack graph.
+- The previous crack graph showed crack-tip parent edges and damage, but it did not preserve the crack/cut boundary that originally created each detached patch.
+- Once a patch detached, strict mode removed its nodes from later graph/corridor processing. That is correct for simulation, but it also made later diagnostics lose the birth-time crack boundary, so the causal relation looked weaker than the actual patch creation path.
+
+Current fix:
+
+- `GraphFragmentManager` now keeps persistent detached state:
+  - `detached_node_mask`: nodes already released from the active main mesh.
+  - `detached_fragment_ids`: stable labels for detached patches.
+  - `detached_boundary_mask`: saved birth-time closure/cut boundary edges for detached patches.
+- New patch creation excludes `detached_node_mask`; already detached patches keep their labels and are not reused as candidates for later patch creation.
+- Strict closure has a release budget (`strict_closure_max_released_ratio`, default `0.54`) so radial brittle validation can fragment strongly without drifting into particle-spray complete separation.
+- Strict local closure patch gating was tightened:
+  - boundary cut ratio floor raised to `max(0.38, 0.95 * fallback_cut_ratio)`;
+  - sharp-brittle strict local patch budget reduced from `10` to `7` per detection pass.
+- The progression PNG top row now overlays:
+  - faint red current cut corridor;
+  - black unsupported fragment-label boundary;
+  - red causal/saved fragment boundary;
+  - yellow current closure boundary.
+- New timeline metric:
+  - `bcut`: fraction of fragment-label boundary edges supported by current cut, current closure, or saved birth-time detached boundary edges.
+
+Validation rerun:
+
+- `output/gravity_crack_progression_10k_brittle_v9_persistent_boundary/progression_report.md`
+- Prompt: `thin glass bottle shattering into localized connected radial cracks`
+- Final snapshot: loop `55`, impact+`22`, crack step `76`
+- Result:
+  - verdict: `PASS`
+  - `final_n_fragments = 36`
+  - `final_released_node_ratio = 0.5363`
+  - `final_largest_fragment_ratio = 0.4637`
+  - `final_hard_detached_nodes = 5363`
+  - `non-causal release = 0/0/0`
+  - `bcut`: `0.423 -> 0.297 -> 0.299 -> 0.255 -> 0.248`
+  - final graph PNG: `output/gravity_crack_progression_10k_brittle_v9_persistent_boundary/snapshots/frame_0055_impact_022_raw_graph.png`
+
+Readout:
+
+- The detached patch lifecycle is now explicit: generated patch -> saved boundary -> removed from active main mesh -> future patches are created only on the remaining active mesh.
+- The crack/fragment causal relation is more visible because saved release boundaries persist in the top graph after the fragment has detached.
+- Residual issue: final `bcut` is around `0.25`, so fragment surfaces are still richer than the saved crack boundary. This is acceptable for the current baseline but should be tightened if the next target is one-to-one visual correspondence between crack paths and fragment outlines.
+
+### CLIP-Gated Closure-Only Fragment Rule
+
+Design decision:
+
+- CLIP and sentence style select material family, crack growth style, branch density, closure thresholds, and post-fragment scatter parameters.
+- Fragment birth is no longer selected directly by prompt/style. For every fragment-capable material, a fragment label must come from propagated cracks forming a local closure/ring/cut boundary.
+- Non-causal fragment paths have been removed from the active pipeline; separation impulse, debris motion, and shard spawning stay disabled for evidence runs.
+- After a closure-born fragment is labeled, material/style may apply bounded physical release drift (`fragment_physical_*`) so fragments separate without particle-spray shatter.
+- Diffuse/no-fracture materials are allowed to deform without fragment birth.
+
+Implementation update:
+
+- `MaterialPriorAdapter` now enforces crack-connected fragment runtime overrides after CLIP family/style selection.
+- `ManifoldSimulator` defaults non-diffuse materials to `crack_connected_release_only`.
+- Gravity validation reports strict mode, `bcut`, hard-detached nodes, saved detached boundary edges, and post-fragment scatter displacement.
+- Validation prompt file: `configs/prompts/clip_localized_closure_sweep_10k.txt`
+
+Validation sweep:
+
+- Command:
+  - `conda run -n diffmpm_v2.3.0 python scripts/validate_material_sentence_gravity.py --skip-surface --gravity-prompts-file configs/prompts/clip_localized_closure_sweep_10k.txt --gravity-particles 10000 --gravity-frames 56 --gravity-grids 64 --physics-substeps 3 --fragment-every 1 --out output/clip_localized_closure_sweep_10k_v1`
+- Report:
+  - `output/clip_localized_closure_sweep_10k_v1/gravity_material_validation.md`
+- Montage:
+  - `output/clip_localized_closure_sweep_10k_v1/final_plots/gravity_material_validation_montage.png`
+
+Results:
+
+| prompt class | family/style | verdict | fragments | released | bcut | open/cat/sec | scatter |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| soda-lime glass radial | `sharp_brittle` / `radial_shatter` | PASS | 34 | 0.538 | 0.258 | 0/0/0 | 0.0677 |
+| tempered glass spiderweb | `sharp_brittle` / `spiderweb_branching` | PASS | 14 | 0.255 | 0.214 | 0/0/0 | 0.0195 |
+| ceramic single crack | `brittle_moderate` / `single_smooth` | PASS | 1 | 0.000 | 0.000 | 0/0/0 | 0.0000 |
+| concrete chunks | `rough_quasi_brittle` / `chunky_crumble` | PASS | 8 | 0.178 | 0.276 | 0/0/0 | 0.0193 |
+| ice radial | `sharp_brittle` / `radial_shatter` | PASS | 37 | 0.539 | 0.239 | 0/0/0 | 0.0584 |
+| rubber no fracture | `diffuse_damage` / `material_default` | PASS | 1 | 0.000 | 0.000 | 0/0/0 | 0.0000 |
+| steel denting | `neutral_reference` / `material_default` | PASS | 1 | 0.000 | 0.000 | 0/0/0 | 0.0000 |
+
+Readout:
+
+- Closure-only fragment birth is now the active baseline for brittle and quasi-brittle prompts.
+- The radial/shatter materials reach near-cap localized complete fracture without reintroducing particle spray.
+- Chunky concrete fragments through crack-connected closure, not non-causal release.
+- Rubber and steel no-fracture controls do not create fragments.
+- Remaining quality target: increase `bcut` beyond the current `0.21-0.28` range so final fragment outlines are even more visibly explained by saved crack boundaries.
+
+### Natural Prompt 5-Frame Progression Sweep
+
+Prompt cleanup:
+
+- `localized connected` should not be required in the sentence.
+- The default simulation rule is now localized crack propagation with closure/ring-gated fragment birth.
+- The prompt file now only carries material/style intent:
+  - `thin soda-lime glass bottle shattering into radial cracks`
+  - `tempered glass pane with spiderweb branching cracks`
+  - `porcelain ceramic mug with one long smooth crack`
+  - `rough concrete block crumbling into irregular chunks`
+  - `clear ice sphere shattering into radial cracks`
+  - `vulcanized rubber ball deforming without visible fracture`
+  - `structural steel block denting without visible fracture`
+
+Command:
+
+- `conda run -n diffmpm_v2.3.0 python scripts/inspect_gravity_crack_progression.py --prompts-file configs/prompts/clip_localized_closure_sweep_10k.txt --gravity-particles 10000 --gravity-frames 56 --gravity-grids 64 --physics-substeps 3 --fragment-every 1 --snapshot-stride 5 --out output/clip_style_closure_progression_10k_v1`
+
+Outputs:
+
+- Sweep report: `output/clip_style_closure_progression_10k_v1/progression_sweep_report.md`
+- Per-prompt snapshot PNGs: `output/clip_style_closure_progression_10k_v1/*/snapshots/frame_####_impact_###_raw_graph.png`
+- Y-Z sentence montage: `output/clip_style_closure_progression_10k_v1/yz_media/yz_sentence_result_montage.png`
+- Y-Z MP4: `output/clip_style_closure_progression_10k_v1/yz_media/yz_sentence_result.mp4`
+
+Results:
+
+| prompt class | family/style | verdict | snapshots | fragments | released | bcut | open/cat/sec |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| soda-lime glass radial | `sharp_brittle` / `radial_shatter` | PASS | 6 | 35 | 0.537 | 0.248 | 0/0/0 |
+| tempered glass spiderweb | `sharp_brittle` / `spiderweb_branching` | PASS | 6 | 14 | 0.222 | 0.221 | 0/0/0 |
+| ceramic single crack | `brittle_moderate` / `single_smooth` | PASS | 6 | 1 | 0.000 | 0.000 | 0/0/0 |
+| concrete chunks | `rough_quasi_brittle` / `chunky_crumble` | PASS | 6 | 6 | 0.132 | 0.373 | 0/0/0 |
+| ice radial | `sharp_brittle` / `radial_shatter` | PASS | 6 | 37 | 0.538 | 0.241 | 0/0/0 |
+| rubber no fracture | `diffuse_damage` / `diffuse_microcrack` | PASS | 6 | 1 | 0.000 | 0.000 | 0/0/0 |
+| steel denting | `neutral_reference` / `diffuse_microcrack` | PASS | 6 | 0 | 0.000 | 0.000 | 0/0/0 |
+
+Readout:
+
+- Natural prompts are sufficient; the algorithm no longer needs `localized connected` wording.
+- Every fragmenting material keeps non-causal release release at zero.
+- Glass/ice radial cases reach near-cap localized fracture.
+- Spiderweb and concrete produce smaller localized fragment sets with distinct branch density.
+- Single-smooth ceramic remains crack-only, and no-fracture rubber/steel controls stay unfragmented.
+- The Y-Z montage/video is the current best visual check for time-causal crack growth and fragment surface creation across all sentences.
+
+### 2026-04-28 Impact-Time Closure Shatter And Motion Gate
+
+Problem:
+
+- Brittle glass was fragmenting only after too many visible frames, even though crack tips and cut evidence were already present.
+- The full pipeline target is still closure-only:
+  `CLIP/style -> phase/stress gate -> crack-front propagation -> cut/closure evidence -> fragment labels -> bounded physical release motion`.
+- The fix must not reintroduce old `non-causal release` particle-spray shatter.
+
+Implementation:
+
+- `MaterialPriorAdapter` maps sentence crack style through a declarative weighted token table.  Shard/shatter/starburst wording is a high-priority `radial_shatter` token group, not a separate hard-coded branch.
+- `ManifoldSimulator` runs an early impact fracture burst for sharp brittle materials and enables a strict impact-shatter flag only for `sharp_brittle` radial/spiderweb prompts during the first impact frames.
+- `GraphFragmentManager` adds strict impact closure-shatter patches. These patches are seeded only from current crack/cut corridor edges plus saved detached boundaries, count as strict closure patches, and keep `open/cat/sec = 0/0/0`.
+- Progression reports now include:
+  - phase seed/advance/cut gate maxima
+  - `impact_closure_patches`
+  - physical release displacement, lateral release displacement, and drop
+  - updated strict radial-shatter verdict thresholds for near-cap localized fracture.
+
+Validation:
+
+| prompt | family/style | verdict | impact birth | fragments | released | largest | bcut | impact/open/cat/sec | physical total/lat/drop |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `thin soda-lime glass bottle dropped on concrete, brittle sharp branching cracks and detached shards` | `sharp_brittle` / `radial_shatter` | PASS | 0 | 221 | 0.640 | 0.360 | 0.707 | 26/0/0/0 | 0.0457/0.0402/0.1663 |
+| `soft rubber ball dropped on concrete, elastic deformation without visible fracture` | `diffuse_damage` / `diffuse_microcrack` | PASS | -1 | 0 | 0.000 | 1.000 | 0.000 | 0/0/0/0 | 0.0000/0.0000/0.0000 |
+| `solid steel ball dropped on concrete, denting without visible fracture` | `rough_quasi_brittle` / `diffuse_microcrack` | PASS | -1 | 0 | 0.000 | 1.000 | 0.000 | 0/0/0/0 | 0.0000/0.0000/0.0000 |
+
+Outputs:
+
+- Glass: `output/glass_clip_impact_closure_motion_10k_v2/progression_report.md`
+- Rubber: `output/rubber_clip_impact_closure_gate_10k/progression_report.md`
+- Steel/denting: `output/steel_clip_no_fracture_motion_10k/progression_report.md`
+
+Readout:
+
+- The immediate brittle-fragment birth bottleneck is mostly resolved for radial glass: first detach occurs at impact+0 and reaches the strict release cap by impact+1 without non-closure release paths.
+- Phase/stress gates are now reported alongside fracture and motion, so future validation can catch cases where phase-field motion and graph fracture diverge.
+- Rubber and no-fracture denting controls still suppress fragment birth even when phase gate values rise after impact.
+- Remaining bottlenecks:
+  - CLIP top-k can still mix material families for ambiguous prompts such as steel on concrete.
+  - Fragment motion is a bounded release-drift proxy, not a full rigid-body contact solver per fragment.
+  - True volume fracture is still approximated by surface graph plus narrow damage feedback.
+
+### 2026-04-28 Bottleneck Resolution Sweep
+
+Goal:
+
+- Resolve the three active v1 bottlenecks without returning to the old
+  non-causal release particle-spray paths:
+  - CLIP top-k ambiguity for prompts such as steel on concrete.
+  - Fragment motion looking like a purely visual offset.
+  - Surface graph closure not feeding phase/volume damage strongly enough,
+    especially for rough concrete chunks.
+
+Implementation:
+
+- `MaterialPriorAdapter` now applies declarative material hint logits after CLIP
+  retrieval.  The hint query is extracted from the object/material phrase rather
+  than from the whole sentence, so `structural steel block denting without
+  visible fracture` stays in the metal family instead of being pulled toward the
+  concrete contact phrase.
+- Fragment motion remains bounded, but now has material/style controlled
+  lateral release direction, small spin-like velocity, and a speed cap.  This
+  keeps fragments separating from crack-born patches without random particle
+  spray.
+- Crack-to-volume coupling now has immediate narrow-band feedback after impact:
+  crack-front visited/tip state, opening, cut masks, closure candidates, and
+  detached labels raise volumetric damage locally before the delayed stress
+  feedback ramp finishes.
+- Rough quasi-brittle `chunky_crumble` gained a strict phase-supported crack
+  cascade path.  It can create chunks from dense propagated crack/cut corridors
+  once the phase/damage field is high, without using non-causal release fallbacks.
+- Fixed the progression sweep markdown birth column so impact+0 births are
+  reported as `0`, not `-1`.
+
+Validation sweep:
+
+- Command:
+  - Superseded by the phase-approved birth command recorded above:
+    `conda run -n diffmpm_v2.3.0 python scripts/inspect_gravity_crack_progression.py --prompts-file configs/prompts/clip_localized_closure_sweep_10k.txt --out output/phase_approved_birth_sweep_10k_v2 --gravity-particles 10000 --gravity-frames 52 --gravity-grids 64 --physics-substeps 3 --fragment-every 1 --snapshot-stride 2 --drop-center-z 0.42 --gravity-z -3500`
+- Sweep report:
+  - `output/phase_approved_birth_sweep_10k_v2/progression_sweep_report.md`
+- Y-Z media:
+  - `output/phase_approved_birth_sweep_10k_v2/yz_media/yz_sentence_result_montage.png`
+  - `output/phase_approved_birth_sweep_10k_v2/yz_media/yz_sentence_result.mp4`
+
+Results:
+
+| prompt class | family/style | verdict | birth | fragments | released | largest | bcut | cvol max | motion total/lat | top material |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| soda-lime glass radial | `sharp_brittle` / `radial_shatter` | PASS | 0 | 248 | 0.646 | 0.354 | 0.617 | 1.000 | 0.0524/0.0413 | soda-lime glass |
+| tempered glass spiderweb | `sharp_brittle` / `spiderweb_branching` | PASS | 0 | 47 | 0.159 | 0.841 | 0.779 | 1.000 | 0.0208/0.0102 | tempered glass |
+| ceramic single crack | `brittle_moderate` / `single_smooth` | PASS | -1 | 0 | 0.000 | 1.000 | 0.000 | 0.700 | 0.0000/0.0000 | stoneware ceramic |
+| concrete chunks | `rough_quasi_brittle` / `chunky_crumble` | PASS | 5 | 11 | 0.079 | 0.922 | 0.744 | 0.980 | 0.0209/0.0086 | mortar/concrete blend |
+| ice radial | `sharp_brittle` / `radial_shatter` | PASS | 0 | 233 | 0.642 | 0.358 | 0.611 | 1.000 | 0.0586/0.0465 | ice |
+| rubber no fracture | `diffuse_damage` / `diffuse_microcrack` | PASS | -1 | 0 | 0.000 | 1.000 | 0.000 | 0.103 | 0.0000/0.0000 | rubber vulcanized |
+| steel denting | `neutral_reference` / `diffuse_microcrack` | PASS | -1 | 0 | 0.000 | 1.000 | 0.000 | 0.161 | 0.0000/0.0000 | structural steel |
+
+Readout:
+
+- CLIP ambiguity is materially better: steel is now metal-dominant
+  (`structural steel`, `cast iron`, `aluminum`) with concrete essentially
+  zero-weight in the top-k blend.
+- Glass and ice now fracture immediately at impact+0 and reach near-cap
+  localized shatter with high causal boundary support.
+- Concrete no longer fails the surface-only closure bottleneck: first fragment
+  birth occurs at impact+5, after branch/cut evidence accumulates, with
+  `bcut=0.744` and no non-closure release paths.
+- Rubber and steel remain no-fragment controls despite nonzero phase/stress
+  response.
+- Residual limitation: this is still v1 narrow-band/surface-proxy fracture, not
+  a full volumetric PFF-MPM plus rigid-body fragment solver.  The current result
+  is coherent for raw validation, but physical rigor would still require a true
+  volume crack surface and per-fragment rigid contact integration.
+
+### 2026-04-28 Current Bottlenecks And Next Plan
+
+Output cleanup:
+
+- Previous smoke/probe/superseded output directories were removed.
+- The only retained result directory is
+  `output/phase_approved_birth_sweep_10k_v2`.
+
+Current bottlenecks:
+
+1. **Algorithm identity / physical claim**
+   - Current code is not full volumetric PFF-MPM.
+   - It is a PFF-MPM-inspired surface-manifold fracture surrogate with
+     narrow-band volumetric feedback.
+   - This is acceptable for raw Gaussian/manifold validation, but we should not
+     claim that crack paths are generated by a full volumetric phase-field PDE.
+
+2. **Fragment birth ownership**
+   - Surface graph closure/cut evidence still creates fragments.
+   - Phase-field/narrow-band damage now feeds stress degradation and helps
+     concrete chunk birth, but it is not yet a hard co-owner of fragment birth
+     for every fragment-capable material.
+   - Next target: fragment birth should require both:
+     `surface closure/cut evidence` and `local narrow-band phase damage approval`.
+
+3. **Volume/thickness approximation**
+   - Current validation uses surface particles, so the "volume" response is a
+     narrow-band proxy projected from surface nodes.
+   - This can approximate through-thickness weakening visually, but cannot prove
+     internal crack surfaces or volumetric connectivity.
+
+4. **Fragment dynamics**
+   - Motion is bounded release drift plus shape matching/contact.
+   - It is good enough to avoid particle spray and show plausible separation,
+     but not a true rigid-body solver with per-fragment mass, inertia, impulses,
+     and contact constraints.
+
+5. **Material contrast**
+   - CLIP/material priors now classify the tested prompts correctly.
+   - The remaining risk is not top-k classification but whether material
+     parameters visibly control:
+     crack onset time, branch density, closure rate, damage width, and fragment
+     motion.
+
+Completed plan:
+
+1. **Add phase-approved fragment birth**
+   - For every strict fragment patch, compute local narrow-band approval:
+     max/mean `c_vol`, surface `phase_cut_gate`, opening, and structural cut
+     floor around the candidate boundary.
+   - Reject fragment birth if the closure exists visually but phase/volume
+     damage has not crossed a material-dependent threshold.
+   - Report `birth_phase_score`, `birth_cvol_max`, and
+     `birth_phase_approved` in progression summaries.
+
+2. **Make phase feedback bidirectional but bounded**
+   - Keep surface crack-front propagation as the path proposal.
+   - Let phase/stress gates control whether a proposed tip can advance and
+     whether its closed patch can detach.
+   - Do not add arbitrary phase-only patch release; that would recreate the old
+     particle-spray problem in another form.
+
+3. **Improve narrow-band thickness proxy**
+   - Add a configurable pseudo-thickness support band from surface anchors.
+   - Store per-fragment support mass from the band so motion and release score
+     are less purely surface-area based.
+   - Keep this as v1.5, not a full volumetric rewrite.
+
+4. **Upgrade fragment motion proxy only after birth approval**
+   - Add per-fragment mass/COM/inertia estimates from surface plus thickness
+     proxy.
+   - Apply bounded rigid-like release velocity and angular drift from patch
+     normal, impact direction, and support loss.
+   - Keep rubber and steel with zero fragment birth and no release drift.
+
+5. **Validation sequence**
+   - First run targeted 10K/64-grid cases:
+     glass radial, concrete chunks, rubber no-fracture, steel no-fracture.
+   - Then run the seven-prompt sweep currently in
+     `configs/prompts/clip_localized_closure_sweep_10k.txt`.
+   - Required pass criteria:
+     - glass/ice: impact+0 or impact+1 birth, high phase approval, high bcut;
+     - concrete: delayed but nonzero chunk birth with phase approval;
+     - ceramic single crack: no detached fragment unless closure and phase
+       approval both appear;
+     - rubber/steel: no fragment and low/no release motion.
+
+Decision gate outcome:
+
+- v1.5 phase-approved birth passed the seven-prompt 10K/64-grid sweep, so do
+  not implement full volumetric PFF-MPM yet.
+- If 50K/64-grid robustness fails or fragment birth still looks arbitrary at
+  higher resolution, then the next step is a true narrow-band volumetric
+  phase-field solver or full PFF-MPM branch.

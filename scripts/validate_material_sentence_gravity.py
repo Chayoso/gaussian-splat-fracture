@@ -24,12 +24,18 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.validate_sentence_materials import (  # noqa: E402
     _angular_metrics,
+    _branch_angle_metrics,
     _flatten_for_csv,
+    _fragment_label_metrics,
     _front_topology_metrics,
+    _release_mode_for_row,
+    _release_verdict_for_row,
     _runtime_fracture_params,
+    _runtime_release_row,
     _save_final_crack_plot,
     _slug,
     _surface_points,
+    _tip_event_metrics,
     _write_markdown_report,
     simulate_prompt_metrics,
 )
@@ -103,10 +109,11 @@ def _predict_row(
 ) -> tuple[dict, dict, dict]:
     raw = predictor.predict(prompt)
     topk_entries = [predictor.db.get_entry_by_name(name) for name in raw["top_k_names"]]
-    material_prior = adapter.build_material_prior(topk_entries, raw["top_k_scores"])
+    material_prior = adapter.build_material_prior(topk_entries, raw["top_k_scores"], text=prompt)
     material_prior = adapter.apply_sentence_style(material_prior, prompt)
     scaled = adapter.scale_physics_to_mpm(
         material_prior["physics"],
+        family=material_prior["family"],
         base_density=float(config.material.density),
     )
     row = {
@@ -137,22 +144,6 @@ def _predict_row(
     return row, material_prior, scaled
 
 
-def _release_param_row(params: dict) -> dict:
-    return {
-        "runtime_catastrophic_release_enable": bool(params.get("catastrophic_release_enable", False)),
-        "runtime_catastrophic_release_fragility": float(params.get("catastrophic_release_fragility", 0.0)),
-        "runtime_catastrophic_release_threshold": float(params.get("catastrophic_release_threshold", 0.0)),
-        "runtime_catastrophic_release_min_threshold": float(params.get("catastrophic_release_min_threshold", 0.0)),
-        "runtime_catastrophic_release_patches_per_step": int(params.get("catastrophic_release_patches_per_step", 0)),
-        "runtime_catastrophic_release_patch_radius": float(params.get("catastrophic_release_patch_radius", 0.0)),
-        "runtime_catastrophic_release_max_released_ratio": float(params.get("catastrophic_release_max_released_ratio", 0.0)),
-        "runtime_secondary_shatter_enable": bool(params.get("secondary_shatter_enable", False)),
-        "runtime_secondary_shatter_max_patches": int(params.get("secondary_shatter_max_patches", 0)),
-        "runtime_secondary_shatter_threshold": float(params.get("secondary_shatter_threshold", 0.0)),
-        "runtime_secondary_shatter_max_released_ratio": float(params.get("secondary_shatter_max_released_ratio", 0.0)),
-    }
-
-
 @torch.no_grad()
 def run_surface_sweep(
     prompts: list[str],
@@ -181,12 +172,14 @@ def run_surface_sweep(
     for idx, prompt in enumerate(prompts):
         row, material_prior, scaled = _predict_row(prompt, predictor, adapter, config)
         fracture_params = _runtime_fracture_params(config, material_prior, scaled)
-        row.update(_release_param_row(fracture_params))
+        row.update(_runtime_release_row(fracture_params))
         print(f"[surface:{prefix}] {prompt!r} -> {row['family']} / {row['top1']}", flush=True)
         plot_path = None
         if bool(getattr(args, "plot_final", True)):
             plot_path = out_dir / "final_plots" / prefix / f"{idx:02d}_{_slug(prompt)}.png"
             row["final_plot"] = str(plot_path)
+        event_log_path = out_dir / "event_logs" / prefix / f"{idx:02d}_{_slug(prompt)}.json"
+        row["tip_event_log"] = str(event_log_path)
         metrics = simulate_prompt_metrics(
             positions_np,
             normals_np,
@@ -196,8 +189,10 @@ def run_surface_sweep(
             fragment_every=int(args.fragment_every),
             plot_path=plot_path,
             plot_title=f"{prefix}: {prompt} | {row['family']} / {row['sentence_style']}",
+            event_log_path=event_log_path,
         )
         row.update(metrics)
+        row["expected_release_mode"], row["fragment_release_verdict"] = _release_verdict_for_row(row)
         rows.append(row)
 
     _write_rows(rows, prefix, out_dir)
@@ -255,21 +250,74 @@ def _summarize_history(history: list[dict]) -> dict:
         "max_cut_edges": int(max(int(row.get("cut_edges", 0)) for row in history)),
         "max_broken_edges": int(max(int(row.get("broken_edges", 0)) for row in history)),
         "max_release_candidates": int(max(int(row.get("release_candidate_count", 0)) for row in history)),
+        "max_hard_detached_nodes": int(max(int(row.get("hard_detached_nodes", 0)) for row in history)),
+        "final_hard_detached_nodes": int(final.get("hard_detached_nodes", 0)),
+        "max_detached_boundary_edges": int(max(int(row.get("detached_boundary_edges", 0)) for row in history)),
+        "final_detached_boundary_edges": int(final.get("detached_boundary_edges", 0)),
         "max_open_release_patches": int(max(int(row.get("open_release_patches", 0)) for row in history)),
         "max_open_release_nodes": int(max(int(row.get("open_release_nodes", 0)) for row in history)),
         "max_open_release_score": max_row("open_release_score_max"),
-        "max_catastrophic_release_patches": int(max(int(row.get("catastrophic_release_patches", 0)) for row in history)),
-        "max_catastrophic_release_nodes": int(max(int(row.get("catastrophic_release_nodes", 0)) for row in history)),
-        "max_catastrophic_release_score": max_row("catastrophic_release_score_max"),
-        "max_secondary_shatter_patches": int(max(int(row.get("secondary_shatter_patches", 0)) for row in history)),
-        "max_secondary_shatter_nodes": int(max(int(row.get("secondary_shatter_nodes", 0)) for row in history)),
-        "max_secondary_shatter_score": max_row("secondary_shatter_score_max"),
+        "max_impact_closure_patches": int(max(int(row.get("impact_closure_patches", 0)) for row in history)),
+        "max_impact_closure_nodes": int(max(int(row.get("impact_closure_nodes", 0)) for row in history)),
+        "max_impact_closure_score": max_row("impact_closure_score_max"),
         "max_physical_fragment_drop": max_row("physical_fragment_drop"),
         "max_physical_detached_distance": max_row("physical_detached_distance"),
+        "max_physical_release_displacement": max_row("physical_release_displacement"),
+        "max_physical_lateral_release_displacement": max_row("physical_lateral_release_displacement"),
+        "max_physical_fragment_lateral_spread": max_row("physical_fragment_lateral_spread"),
+        "max_volumetric_damage": max_row("volumetric_damage_max"),
+        "final_volumetric_damage": float(final.get("volumetric_damage_max", 0.0)),
         "max_detached_distance": max_row("detached_distance"),
         "final_z_min": float(final.get("z_min", 0.0)),
         "final_z_com": float(final.get("z_com", 0.0)),
         "final_v_com_z": float(final.get("v_com_z", 0.0)),
+        "impact_release_gain": max_row("impact_release_gain", 1.0),
+    }
+
+
+def _fragment_boundary_support_metrics(simulator, fragment_ids: torch.Tensor | None, n: int) -> dict:
+    """Measure whether final fragment label boundaries have crack/cut support."""
+    if simulator is None or fragment_ids is None:
+        return {
+            "final_fragment_boundary_edges": 0,
+            "final_causal_supported_fragment_boundary_edges": 0,
+            "final_fragment_boundary_support_ratio": 0.0,
+            "final_detached_boundary_edges": 0,
+        }
+    graph = getattr(simulator, "graph", None)
+    manager = getattr(simulator, "fragment_manager", None)
+    knn_idx = getattr(graph, "knn_idx", None) if graph is not None else None
+    if knn_idx is None:
+        return {
+            "final_fragment_boundary_edges": 0,
+            "final_causal_supported_fragment_boundary_edges": 0,
+            "final_fragment_boundary_support_ratio": 0.0,
+            "final_detached_boundary_edges": int(getattr(manager, "last_detached_boundary_edges", 0)) if manager is not None else 0,
+        }
+
+    n = min(int(n), int(fragment_ids.shape[0]), int(knn_idx.shape[0]))
+    frag = fragment_ids[:n].detach().long()
+    knn = knn_idx[:n].detach().long()
+    valid = (knn >= 0) & (knn < n)
+    frag_i = frag.unsqueeze(1).expand_as(knn)
+    frag_j = torch.zeros_like(knn)
+    frag_j[valid] = frag[knn[valid]]
+    boundary = valid & (frag_i != frag_j) & ((frag_i > 0) | (frag_j > 0))
+
+    causal = torch.zeros_like(boundary)
+    if manager is not None:
+        for attr in ("last_cut_edge_mask", "last_closure_boundary_mask", "detached_boundary_mask"):
+            edge_mask = getattr(manager, attr, None)
+            if edge_mask is not None and edge_mask.shape == knn_idx.shape:
+                causal |= edge_mask.detach().bool()[:n] & valid
+    supported = boundary & causal
+    boundary_edges = int(boundary.sum().item())
+    supported_edges = int(supported.sum().item())
+    return {
+        "final_fragment_boundary_edges": boundary_edges,
+        "final_causal_supported_fragment_boundary_edges": supported_edges,
+        "final_fragment_boundary_support_ratio": supported_edges / max(boundary_edges, 1),
+        "final_detached_boundary_edges": int(getattr(manager, "last_detached_boundary_edges", 0)) if manager is not None else 0,
     }
 
 
@@ -302,6 +350,7 @@ def _final_simulator_crack_metrics(
     simulator,
     plot_path: Path | None = None,
     plot_title: str | None = None,
+    event_log_path: Path | None = None,
 ) -> dict:
     """Read final crack-front metrics directly from the no-render simulator."""
     ff = getattr(simulator, "fracture_field", None)
@@ -350,6 +399,24 @@ def _final_simulator_crack_metrics(
         f"final_{key}": value
         for key, value in _front_topology_metrics(front, int(c.shape[0]), positions.device).items()
     })
+    metrics.update({
+        f"final_{key}": value
+        for key, value in _branch_angle_metrics(front, positions, int(c.shape[0])).items()
+    })
+    tip_events = (
+        front.export_event_log()
+        if front is not None and hasattr(front, "export_event_log")
+        else []
+    )
+    event_metrics = _tip_event_metrics(tip_events)
+    metrics.update({
+        f"final_{key}": value
+        for key, value in event_metrics.items()
+    })
+    if event_log_path is not None:
+        event_log_path = Path(event_log_path)
+        event_log_path.parent.mkdir(parents=True, exist_ok=True)
+        event_log_path.write_text(json.dumps(tip_events, indent=2), encoding="utf-8")
     metrics.update(_bbox_metrics_tensor(positions, cracked, "final_cracked"))
     metrics.update(_bbox_metrics_tensor(positions, visited, "final_visited"))
     center = positions.mean(dim=0)
@@ -361,11 +428,24 @@ def _final_simulator_crack_metrics(
             center = positions.mean(dim=0)
     metrics.update(_angular_metrics(positions, cracked, center, "final_cracked"))
     metrics.update(_angular_metrics(positions, visited, center, "final_visited"))
+
+    manager = getattr(simulator, "fragment_manager", None)
+    fragment_ids = None
+    if manager is not None and getattr(manager, "fragment_ids", None) is not None:
+        fragment_ids = manager.fragment_ids.detach()
+    physical_labels = getattr(simulator, "_physical_fragment_labels", None)
+    surface_indices = getattr(simulator, "_surface_indices", None)
+    if physical_labels is not None and surface_indices is not None:
+        surf_phys = physical_labels[surface_indices][:n].detach()
+        if bool((surf_phys > 0).any()):
+            metrics.update({
+                f"physical_{key}": value
+                for key, value in _fragment_label_metrics(surf_phys, int(surf_phys.shape[0])).items()
+            })
+    metrics.update(_fragment_label_metrics(fragment_ids, int(c.shape[0])))
+    metrics.update(_fragment_boundary_support_metrics(simulator, fragment_ids, int(c.shape[0])))
+
     if plot_path is not None:
-        fragment_ids = None
-        manager = getattr(simulator, "fragment_manager", None)
-        if manager is not None and getattr(manager, "fragment_ids", None) is not None:
-            fragment_ids = manager.fragment_ids.detach()
         _save_final_crack_plot(
             positions=positions,
             damage=c,
@@ -374,6 +454,8 @@ def _final_simulator_crack_metrics(
             out_path=Path(plot_path),
             title=plot_title or "gravity final crack morphology",
             fragment_ids=fragment_ids,
+            parent_index=front.parent_index if front is not None else None,
+            activation_step=front.activation_step if front is not None else None,
         )
     return metrics
 
@@ -384,47 +466,60 @@ def _write_gravity_report(rows: list[dict], out_dir: Path) -> None:
         "",
         "No-render gravity-drop run. CLIP predicts material priors, then the object falls under gravity and reports crack/fragment metrics.",
         "",
-        "| prompt | family | style | top1 | impact | frags max/final | cracked max/final | visited | tips | branch | c_max | cut_edges | open p/n | cat p/n | sec p/n | drop | detach |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| prompt | family | style | mode | verdict | strict | top1 | impact | frags max/final | rel | largest | bcut | hard det | saved boundary | cracked max/final | visited | tips | tip events | branch events | junction | max child | angle mean/std | branch | c_max | cut_edges | open p/n | impact closure p/n | gain | scatter |",
+        "| --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
         if row.get("error"):
             lines.append(
-                "| {prompt} | ERROR |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |".format(
+                "| {prompt} | ERROR |  |  | FAIL |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |".format(
                     prompt=str(row.get("prompt", ""))[:46],
                 )
             )
             continue
         lines.append(
-            "| {prompt} | {family} | {style} | {top1} | {impact} | {maxf}/{finalf} | "
-            "{maxc}/{finalc} | {visited} | {tips} | {branch:.3f} | "
-            "{cmax:.3f} | {cut} | {openp}/{openn} | {catp}/{catn} | {secp}/{secn} | {drop:.4f} | {detach:.4f} |".format(
+            "| {prompt} | {family} | {style} | {mode} | {verdict} | {strict} | {top1} | {impact} | {maxf}/{finalf} | "
+            "{rel:.3f} | {largest:.3f} | {bcut:.3f} | {hard_det} | {saved_boundary} | {maxc}/{finalc} | {visited} | {tips} | {events} | {branches} | {junction} | {maxchildren} | "
+            "{angle_mean:.1f}/{angle_std:.1f} | {branch:.3f} | {cmax:.3f} | {cut} | {openp}/{openn} | "
+            "{impactp}/{impactn} | {gain:.2f} | {scatter:.4f} |".format(
                 prompt=row["prompt"][:46],
                 family=row["family"],
                 style=row.get("sentence_style", "material_default"),
+                mode=row.get("expected_release_mode", _release_mode_for_row(row)),
+                verdict=row.get("fragment_release_verdict", ""),
+                strict="Y" if bool(row.get("runtime_crack_connected_release_only", False)) else "",
                 top1=row["top1"],
                 impact="" if row.get("impact_frame") is None else row["impact_frame"],
                 maxf=row.get("max_n_fragments", 0),
                 finalf=row.get("final_n_fragments", 0),
+                rel=float(row.get("final_released_node_ratio", 0.0)),
+                largest=float(row.get("final_largest_fragment_ratio", 1.0)),
+                bcut=float(row.get("final_fragment_boundary_support_ratio", 0.0)),
+                hard_det=row.get("final_hard_detached_nodes", 0),
+                saved_boundary=row.get("final_detached_boundary_edges", 0),
                 maxc=row.get("max_n_cracked", 0),
                 finalc=row.get("final_n_cracked", 0),
                 visited=row.get("final_visited_count", 0),
                 tips=row.get("final_tip_count", 0),
+                events=row.get("final_tip_event_count", 0),
+                branches=row.get("final_branch_event_count", 0),
+                junction=row.get("final_junction_count", 0),
+                maxchildren=row.get("final_max_children", 0),
+                angle_mean=float(row.get("final_branch_angle_mean_deg", 0.0)),
+                angle_std=float(row.get("final_branch_angle_std_deg", 0.0)),
                 branch=float(row.get("final_branchiness", 0.0)),
                 cmax=float(row.get("max_c_max", 0.0)),
                 cut=row.get("max_cut_edges", 0),
                 openp=row.get("max_open_release_patches", 0),
                 openn=row.get("max_open_release_nodes", 0),
-                catp=row.get("max_catastrophic_release_patches", 0),
-                catn=row.get("max_catastrophic_release_nodes", 0),
-                secp=row.get("max_secondary_shatter_patches", 0),
-                secn=row.get("max_secondary_shatter_nodes", 0),
-                drop=float(row.get("max_physical_fragment_drop", 0.0)),
-                detach=float(row.get("max_physical_detached_distance", 0.0)),
+                impactp=row.get("max_impact_closure_patches", 0),
+                impactn=row.get("max_impact_closure_nodes", 0),
+                gain=float(row.get("impact_release_gain", 1.0)),
+                scatter=float(row.get("max_physical_release_displacement", 0.0)),
             )
         )
     lines.append("")
-    lines.append("Interpretation: rubber/polymer should keep fragment counts near one, while brittle and rough quasi-brittle prompts should produce higher crack and fragment metrics after impact.")
+    lines.append("Interpretation: CLIP chooses material/style parameters. Fragment birth should stay crack-connected; `bcut` should be nonzero when fragments appear. `scatter` is post-fragment physical release displacement.")
     (out_dir / "gravity_material_validation.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -455,6 +550,7 @@ def run_gravity_sweep(
                     "rendering.render_frames": [],
                     "output.make_video": False,
                     "simulation.save_checkpoint": False,
+                    "manifold.fragment_detect_every": max(int(args.fragment_every), 1),
                 },
             )
         except Exception as exc:
@@ -486,17 +582,28 @@ def run_gravity_sweep(
             "density_mpm": result["params"]["density"],
             "elapsed_sec": time.time() - t0,
         }
-        row.update(_release_param_row(result["params"]))
+        row.update(_runtime_release_row(result["params"]))
         row.update(_summarize_history(history))
+        simulator = getattr(pipeline.engine, "last_simulator", None)
+        manager = getattr(simulator, "fragment_manager", None) if simulator is not None else None
+        if manager is not None:
+            row.update({
+                "runtime_crack_connected_release_only": bool(getattr(manager, "crack_connected_release_only", False)),
+                "runtime_open_crack_release_enable": bool(getattr(manager, "open_crack_release_enable", True)),
+            })
         plot_path = None
         if bool(getattr(args, "plot_final", True)):
             plot_path = out_dir / "final_plots" / "gravity_material_validation" / f"{idx:02d}_{_slug(prompt)}.png"
             row["final_plot"] = str(plot_path)
+        event_log_path = out_dir / "event_logs" / "gravity_material_validation" / f"{idx:02d}_{_slug(prompt)}.json"
+        row["tip_event_log"] = str(event_log_path)
         row.update(_final_simulator_crack_metrics(
-            getattr(pipeline.engine, "last_simulator", None),
+            simulator,
             plot_path=plot_path,
             plot_title=f"gravity: {prompt} | {row['family']} / {row['sentence_style']}",
+            event_log_path=event_log_path,
         ))
+        row["expected_release_mode"], row["fragment_release_verdict"] = _release_verdict_for_row(row)
         rows.append(row)
         _write_rows(rows, "gravity_material_validation", out_dir)
         _write_gravity_report(rows, out_dir)

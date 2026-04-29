@@ -1,504 +1,313 @@
-# Surface-Manifold Gaussian Crack Implementation
+# Gaussian-Manifold Fracture V1 Baseline
 
-## 1. Direction
+Date: 2026-04-28
 
-The project should move toward a surface-first fracture simulator:
+The active implementation is back to the v1 Gaussian surface-graph fracture
+pipeline. The experimental replacement branch has been removed from active code.
 
-```text
-text prompt
--> material / fracture-family prior
--> surface Gaussian graph
--> crack-front propagation on the graph
--> edge cut and connected components
--> matplotlib validation
--> Gaussian / 3DGS rendering
-```
+## Goal
 
-This is not a strict volumetric AT2 phase-field solver. It is a phase-field-inspired, sentence-conditioned fracture model whose state lives on the Gaussian surface manifold.
+Run CLIP/material/sentence-conditioned fracture experiments before Gaussian
+rendering using raw matplotlib/Y-Z validation. The current baseline keeps crack
+state on the Gaussian surface graph and uses MPM only as the driving physics
+source.
 
-The current approach is preferred over a traditional volumetric method because the final representation is Gaussian/surface-centric, and the desired output is visually convincing material-specific fracture rather than exact bulk fracture mechanics.
-
-## 2. Current Confirmed Base
-
-The existing `GaussianFractureField` already stores fracture state on surface Gaussian nodes:
-
-- `c`: surface damage
-- `H`: irreversible history / accumulated drive
-- `n`: crack normal
-- `a`: crack opening
-- `f`: fragment label
-
-The current `phase_field` config values are passed into `ManifoldSimulator`, then used by `GaussianFractureField`. The field is initialized with `N_surf = surface_mask.sum()`, not with a volumetric grid.
-
-So the current implementation is already close to the desired core:
+## Active Pipeline
 
 ```text
-surface graph + tip-based propagation + phase-field-like damage band
+sentence
+-> CLIP material prior
+-> scaled MPM material parameters and v1 runtime overrides
+-> gravity/drop or external-force MPM step
+-> PhysicsProjector maps tensile drive/stress cues to Gaussian surface nodes
+-> CrackFront advances tip-based cracks on the surface graph
+-> GaussianFractureField updates surface damage/opening
+-> crack/opening/cut/closure state feeds immediate narrow-band volumetric damage
+-> GraphFragmentManager detects graph-connected fragments
+-> bounded physical release drift separates closure-born fragments
+-> GaussianCrackVisualizer / matplotlib validation writes outputs
 ```
 
-The next step is to stop treating volume MPM as mandatory for fracture and make it an optional driver.
+## Active Code
 
-## 3. Target Architecture
+- `src/core/manifold_simulator.py`: v1 runtime simulator.
+- `src/fracture/crack_front.py`: explicit crack-tip propagation.
+- `src/fracture/tip_based_fracture_field.py`: surface damage/opening field.
+- `src/fracture/graph_fragment_manager.py`: graph fragment labeling.
+- `scripts/validate_material_sentence_gravity.py`: CLIP/material gravity sweep.
+- `scripts/validate_sentence_materials.py`: surface sentence/material validation.
+- `scripts/inspect_gravity_crack_progression.py`: frame-wise crack/fragment inspection.
+- `scripts/build_yz_progression_media.py`: Y-Z snapshot and mp4 media generation.
 
-### Required Core
+## Current Rule
 
-- `MaterialPriorAdapter`
-  - converts text/CLIP retrieval into fracture family and behavior parameters.
+Fragments are v1 graph fragments. They are detected by graph connectivity and
+damage/cut support on the Gaussian surface graph. This is the accepted baseline
+for the current experiments even though it is less physical than a true
+volume-coupled phase-field fracture method.
 
-- `GaussianGraph`
-  - stores surface adjacency and edge weights.
-
-- `GaussianFractureField`
-  - evolves crack tips, damage, history, normals, and opening on the surface graph.
-
-- `GraphFragmentManager`
-  - turns damaged/cut graph edges into components and fragment labels.
-
-- `SurfaceCrackDriver` (new)
-  - produces surface drive without requiring volume particles.
-
-- `smoke_test.py`
-  - validates crack propagation, cut edges, fragments, and opening using matplotlib first.
-
-### Optional Backend
-
-- MPM remains useful for impact/deformation experiments, but it should not be required for the default fracture loop.
+Strict brittle shatter is now phase-approved closure-only.  During impact,
+surface crack/cut/closure logic can propose a fragment patch, but the patch is
+accepted only when the local narrow-band phase/volume proxy also supports
+detachment.  The accepted sequence is:
 
 ```text
-default: text -> surface driver -> surface fracture -> matplotlib
-optional: MPM -> projected drive -> surface fracture -> render
+impact/contact
+-> phase/contact gate raises local crack drive
+-> crack tips seed, advance, and branch on the surface graph
+-> crack/cut corridors propose a closure patch
+-> narrow-band phase/volume proxy approves the patch
+-> fragment label is born and receives bounded release motion
 ```
 
-## 4. Surface-Only Fracture Rule
+The old non-causal release fallbacks have been removed from the active code.
+Accepted strict validation runs now use crack-connected closure/cascade patches
+plus narrow-band phase approval for fragment birth.
 
-Fracture should be decided on the surface graph:
+Rough quasi-brittle `chunky_crumble` uses the same strict rule. It promotes
+phase-supported crack-cascade patches once propagated crack/cut corridors and
+local narrow-band damage are strong enough. This is the current v1.5 answer to
+the concrete bottleneck: fragments are still born from crack/cut evidence, while
+phase-field damage weakens the local volume proxy so chunks can detach instead
+of remaining as painted cracks on the surface.
+
+CLIP material selection is still top-k blending, but object/material phrase
+hints now reweight the top-k list before physics scaling.  This prevents
+contact/context words such as concrete ground from dominating prompts whose
+object is steel, rubber, glass, or ice.
+
+## Known Limitations
+
+- The phase-field constitutive model degrades stress and now feeds immediate
+  narrow-band volume damage from crack/opening/cut/closure state, but
+  crack/fragment birth is still controlled by the surface graph fracture
+  manager.
+- This is not full volumetric PFF-MPM. It is a surface-manifold approximation
+  where narrow-band phase/volume damage approves surface crack closure instead
+  of solving a full volume fracture topology.
+- Crack-to-fragment causality must be judged from crack-front event logs,
+  graph cut masks, per-frame `progression_metrics`, and Y-Z validation plots.
+- Fragment motion is bounded release drift plus shape-matching/contact response
+  with material/style lateral bias and small spin-like velocity.  It is not a
+  full per-fragment rigid-body dynamics solver.
+- Rubber and other diffuse materials should avoid brittle fragment release.
+- Brittle prompts should show crack propagation, branch events, and fragment
+  labels in gravity validation.
+- Gravity validation should always report phase seed/advance/cut gates together
+  with fragment labels and physical total/lateral/drop motion.
+
+## Validation Target
+
+Run 10K to 50K particle sweeps at 64 grid first. Use 128 grid only after the v1
+baseline behavior is stable enough to justify the extra cost.
+
+Current 50K/64-grid raw validation:
+
+- Report: `output/phase_approved_birth_sweep_50k_v3/progression_sweep_report.md`
+- Y-Z montage: `output/phase_approved_birth_sweep_50k_v3/yz_media/yz_sentence_result_montage.png`
+- Y-Z MP4: `output/phase_approved_birth_sweep_50k_v3/yz_media/yz_sentence_result.mp4`
+- MP4 verification: 10 frames at 1 fps, 1240x1622.
+- All seven prompt classes pass:
+  glass radial, glass spiderweb, ceramic single crack, concrete chunks, ice
+  radial, rubber no-fracture, and steel no-fracture.
+
+Validation summary:
+
+| prompt class | expected mode | result | first birth | final fragments | released ratio | phase birth |
+|---|---|---|---:|---:|---:|---:|
+| glass radial | crack-connected fragment | PASS | 0 | 552 | 0.594 | 0.908 |
+| glass spiderweb | crack-connected fragment | PASS | 0 | 47 | 0.123 | 0.906 |
+| ceramic single crack | crack split/no detach | PASS | -1 | 0 | 0.000 | 0.000 |
+| concrete chunks | crack-connected fragment | PASS | 2 | 12 | 0.072 | 0.966 |
+| ice radial | crack-connected fragment | PASS | 0 | 539 | 0.608 | 0.908 |
+| rubber no fracture | no fragment | PASS | -1 | 0 | 0.000 | 0.000 |
+| steel denting | no fragment | PASS | -1 | 0 | 0.000 | 0.000 |
+
+Additional 50K checks:
+
+- Chunked symmetric eigensolve keeps the stress projection stable at 50K.
+- Fragment birth/phase approval stats are accumulated across all fracture-burst
+  detections in a visible frame, so impact+0 births retain their causal phase
+  score instead of being overwritten by a later same-frame no-birth detect.
+- The v3 50K ordering matches the intended material behavior: radial glass/ice
+  shatter immediately, spiderweb glass releases less, concrete chunks later,
+  ceramic stays crack-only, and rubber/steel suppress fragments.
+
+## Material And Style Control Points
+
+The active pipeline already has multiple material/style control points.  The
+next validation task is to prove that these controls produce visible,
+measurable differences rather than only different parameter tables.
 
 ```text
-node damage c_i >= threshold -> cracked node
-edge cut score d_ij >= threshold -> broken edge
-connected components after broken edges -> fragments
+CLIP top-k + lexical material hints
+-> material family and physical MPM scaling
+-> sentence style runtime override
+-> phase seed/advance/cut gates
+-> crack-front seed, advance, branching, and closure
+-> phase-approved fragment birth
+-> shape matching, contact, and bounded release drift
 ```
 
-Important: a visible crack does not always imply a fragment.
+Current control mechanisms:
 
-Correct interpretation:
+- `MaterialPriorAdapter` maps material words to a family:
+  `sharp_brittle`, `brittle_moderate`, `rough_quasi_brittle`,
+  `diffuse_damage`, or `neutral_reference`.
+- Sentence style rules choose crack morphology:
+  `radial_shatter`, `spiderweb_branching`, `chunky_crumble`,
+  `single_smooth`, or `diffuse_microcrack`.
+- Family/style runtime presets change crack onset, front speed, branch density,
+  cut/closure thresholds, phase feedback floors, fragment release caps, and
+  post-fragment motion coefficients.
+- `ManifoldSimulator` uses material-dependent phase gates and impact burst
+  steps, then accumulates frame-level phase-approved birth metrics.
+- Post-fragment motion is material-aware through physical release drift,
+  lateral bias, spin gain, shape matching, contact restitution/friction, and
+  soft squash/rebound for diffuse materials.
 
-| Surface crack topology | Result |
-|---|---|
-| short open crack | crack only |
-| boundary-to-boundary crack | split candidate |
-| closed loop crack | detachable island |
-| long high-confidence open crack in brittle material | local support-loss flake / chip |
-| broad damaged region | chunk / shard candidate |
+Expected visual deltas by material:
 
-This is good. It allows ceramic to remain crack-only while glass/concrete can split when topology supports it.
-For the surface-only backend, stiffness loss does not automatically collapse geometry because there is no volumetric mass solve. Ring-free collapse is therefore modeled explicitly as a material-gated support-loss release near a strong crack corridor.
+| material class | crack motion | fragment birth | post-motion target |
+|---|---|---|---|
+| sharp brittle glass/ice | fast impact-local radial growth, many branch tips | immediate phase-approved shatter | many light pieces, visible lateral separation, low rebound |
+| spiderweb glass | connected local branch network, lower extent than radial | immediate but lower released ratio | local separation, smaller spread than radial |
+| brittle ceramic | one dominant smooth crack, low branch density | no detach unless closure is complete | crack/split readout, little scatter |
+| rough concrete | slower, thicker, noisy crack/cut band | delayed small chunk birth | heavy chunks, downward/support-loss motion, low lateral throw |
+| rubber/diffuse | no crack-front propagation, broad damage only | no crack-connected fragment | squash and rebound, no detached labels |
+| steel/neutral denting | suppressed crack motion, high threshold | no crack-connected fragment | dent/tilt/settle, minimal damage visualization |
 
-## 5. Material-Family Targets
+Evidence metrics to report with every matched visual:
 
-| Family | Target |
-|---|---|
-| `sharp_brittle` | narrow crack, strong cross-edge cut, clean split |
-| `brittle_moderate` | visible crack/opening, split optional or delayed |
-| `rough_quasi_brittle` | rough network, chunk release, stable fragments |
-| `diffuse_damage` | no explicit crack path, no fragment detach |
+- crack motion: crack step, visited count, tip count, branch event count,
+  branch event frame span, branch angle mean/std;
+- fragment causality: first birth frame, birth phase score, birth cvol max,
+  causal boundary support ratio, closure candidate count;
+- topology: final fragment count, released ratio, largest fragment ratio;
+- post-motion: physical release displacement, lateral release displacement,
+  fragment drop, lateral spread, rigid angular speed, soft squash/rebound stats;
+- controls: CLIP top-k, material family, sentence style, runtime release mode.
 
-The text prompt should control style through family parameters:
+SIGGRAPH Asia positioning:
 
-- `tau_init`
-- `growth_gain`
-- `band_width`
-- `open_gain`
-- `branching_bias`
-- `anisotropy_strength`
-- `cut_vote_strength`
-- `fragment_threshold`
-- `detach_tendency`
+- Claim controllable, language-conditioned fracture behavior for Gaussian
+  Splats, backed by explicit crack-front causality and phase-approved fragment
+  birth.
+- Do not claim full volumetric PFF-MPM or exact rigid-body fragment dynamics.
+- Use raw matplotlib/Y-Z plots as causal evidence and high-quality Gaussian
+  renders as the presentation layer.
 
-## 6. Implementation Plan
+Renderer dependency note, 2026-04-29:
 
-### Phase 1. Consolidate Surface Driver
+- In the active `diffmpm_v2.3.0` conda environment, the available Gaussian
+  rasterizer module is `diff_gauss`.
+- `diff_gauss` resolves from
+  `/home/chayo/Desktop/Shape-morphing-binder/gaussian-splatting/submodules/diff-gaussian-rasterization/diff_gauss`.
+- The old direct 3DGS imports `scene.gaussian_model` and `gaussian_renderer`
+  are not available in this checkout/environment and should not be used for
+  new render work.
+- Photorealistic render integration should go through
+  `src/renderer/core/renderer.py` (`GSRenderer3DGS`), which wraps
+  `diff_gauss`, or through a local fallback splat renderer only when debugging
+  simulation output without the rasterizer.
 
-Add a surface-only driver that produces:
+## Current Module Layout
 
-```python
-init_score: Tensor[N]
-growth_drive: Tensor[N]
-growth_dir: Tensor[N, 3]
-opening_hint: Tensor[N]
-```
-
-Initial driver can be procedural:
-
-- impact center on surface
-- radial propagation
-- normal/tangent-aware direction
-- material-family noise / branching
-- optional user prompt style modifiers
-
-This lets smoke tests run without full volume MPM.
-
-### Phase 2. Keep `GaussianFractureField`
-
-Do not rewrite the current crack model yet. Reuse it as the canonical surface phase-field-like model.
-
-Change only the source of `init_score`, `growth_drive`, and `growth_dir`.
-
-### Phase 3. Fragment by Surface Graph
-
-Use `GraphFragmentManager` as the topology layer:
-
-- cut core
-- side-aware cross-edge cuts
-- authoritative cut memory
-- closure candidate detection
-- connected components
-
-Fragment creation should come from graph separation, not volume particles.
-
-### Phase 4. Matplotlib Validation First
-
-Before 3DGS rendering, every material run should save:
-
-- damage scatter
-- crack-front scatter
-- cut-edge overlay
-- fragment label scatter
-- opening map
-- closure candidate overlay
-
-This is the primary development loop.
-
-### Phase 5. Rendering Only After Debug Pass
-
-Only run Gaussian/3DGS rendering after matplotlib confirms:
-
-- crack path is plausible
-- cut edges exist where expected
-- fragment labels are stable
-- rubber remains no-split
-
-## 7. Validation Particle Budget
-
-Use tiered particle budgets. Do not use one particle count for every decision.
-
-Recommended schedule:
+The active implementation is modularized around the current v1.5 pipeline:
 
 ```text
-L0 prior check:       no simulation
-L1 smoke:            1k-2k surface nodes, no render
-L2 default validate: 10k surface nodes, matplotlib / CSV
-L3 final validate:   50k surface nodes, selected prompts only
-L4 pre-render:       50k-150k, selected successful cases only
+CLIP/material prior
+-> MPM gravity/contact
+-> PhysicsProjector
+-> ManifoldSimulator frame orchestration
+-> GaussianFractureField + CrackFront
+-> GraphFragmentManager
+-> raw diagnostics / Gaussian rendering
 ```
 
-Interpretation:
-
-- 1k-2k is only a directional smoke test. Small shards may be under-counted.
-- 10k is the default material/sentence behavior validation budget.
-- 50k is the first serious topology and fragment-count check.
-- 150k is not an iteration budget. Use it only after 50k passes.
-
-For surface-first mode, the important budget is surface node count, not volume particle count. If the run uses `surface_ratio: 1.0`, then particle count is effectively surface graph resolution.
-
-## 8. Validation Protocol
-
-Validation should answer four separate questions:
-
-```text
-1. Did CLIP / text select the intended material family?
-2. Did sentence wording change crack morphology?
-3. Did gravity impact produce the expected damage and fragment release?
-4. Are the released fragments renderable and visually stable?
-```
-
-Do not move to rendering until questions 1-3 pass by CSV/MD metrics.
-
-### L0. Material Prior Check
-
-Purpose:
-
-- verify CLIP top-k retrieval
-- verify material family assignment
-- verify sentence style classification
-- catch obvious prompt/material mismatch before running simulation
-
-Metrics:
-
-- `family`
-- `sentence_style`
-- `top1`
-- `top1_weight`
-- `family_scores`
-- `E_raw`, `Gc_raw`, `nu_raw`, `density_raw`
-- `tau_init`, `growth_gain`, `band_width`, `open_gain`, `edge_break_rate`, `branching_bias`
-
-Pass criteria:
-
-- glass / ice / crystal -> `sharp_brittle`
-- porcelain / ceramic -> `brittle_moderate`
-- concrete / stone / mortar -> `rough_quasi_brittle`
-- rubber / elastomer -> `diffuse_damage`
-- radial / shatter wording -> `radial_shatter`
-- one long / clean split wording -> `single_smooth`
-- scratch / shallow / diffuse wording -> `diffuse_microcrack`
-- crumble / granular / chunks wording -> `chunky_crumble`
-
-### L1. Surface Morphology Smoke
-
-Purpose:
-
-- validate crack-front behavior without gravity or rendering
-- compare sentence styles cheaply
-- catch broken graph/front/fragment code before MPM
-
-Budget:
-
-```text
-particles:       2k-10k
-frames:          24-40
-fragment_every:  2-4
-render:          off
-```
-
-Metrics:
-
-- `c_max`, `c_mean`
-- `cracked_count`, `weak_count`
-- `visited_count`, `tip_count`
-- `branchiness`
-- `cracked_span_*`, `visited_span_*`
-- `max_cut_edges`
-- `max_closure_candidates`
-- `max_n_frags`
-
-Expected behavior:
-
-| Prompt type | Expected surface result |
-|---|---|
-| glass radial shatter | many visited nodes, many tips, high cut edges |
-| glass single smooth | low tip count, narrow crack path, optional 1-4 fragments |
-| glass diffuse scratch | low damage, no fragment release |
-| concrete crumble | broad damage, many tips, rough crack network |
-| rubber no fracture | near-zero explicit crack, no fragments |
-
-### L2. Gravity Impact Validation
-
-Purpose:
-
-- validate material + gravity + sentence style coupling
-- check whether damage turns into physical fragment release
-- avoid rendering while tuning fracture behavior
-
-Budget:
-
-```text
-smoke:    1k-2k particles, 44-56 frames, grids 32-40
-default:  10k particles, 64-80 frames, grids 64
-final:    50k particles, selected prompts, grids tuned by memory
-```
-
-Metrics:
-
-- `impact_frame`
-- `max_n_fragments`, `final_n_fragments`
-- `max_n_cracked`, `final_n_cracked`
-- `final_visited_count`, `final_tip_count`, `final_branchiness`
-- `max_c_max`, `final_c_mean`
-- `max_cut_edges`, `max_broken_edges`
-- `max_release_candidates`
-- `max_open_release_patches`, `max_open_release_nodes`
-- `max_physical_fragment_drop`
-- `max_physical_detached_distance`
-- `elapsed_sec`
-
-Pass criteria by prompt:
-
-| Prompt | Required outcome |
-|---|---|
-| glass bottle shattering into many sharp radial cracks | high crack coverage, high tip count, clear fragment release |
-| glass bottle with one long smooth crack | narrow split, low tip count, 1-4 large fragments or crack-only at low resolution |
-| glass bottle with diffuse tiny surface scratches | low damage, `final_n_fragments == 1`, no open release |
-| concrete block crumbling into rough granular chunks | broad damage and rough tips; chunk release should appear at 2k+ and improve at 10k/50k |
-| rubber ball deforming without visible fracture | `final_n_fragments == 1`, no explicit crack, no open release |
-
-Known resolution caveat:
-
-- 1k smoke can under-count fragments because shard sizes fall below graph/physical fragment minimums.
-- A 1k result is allowed to fail fragment-count targets if crack morphology separates correctly.
-- 2k and above should start showing brittle/radial release.
-- 50k is the first budget where fragment count should be treated seriously.
-
-### L3. Render Readiness Gate
-
-A case is render-ready only if:
-
-- `impact_frame` is non-null for gravity tests
-- `c_max` and crack coverage match the prompt
-- fragment count matches the target material/style
-- `max_physical_fragment_drop` or `max_physical_detached_distance` is non-zero for released-fragment prompts
-- diffuse/rubber controls remain no-split
-- runtime is acceptable at the intended particle budget
-
-### L4. Gaussian Render Validation
-
-Rendering should verify only visual quality, not core fracture semantics.
-
-Check:
-
-- all expected Gaussians are visible
-- detached fragments are visible after release
-- interior/cut surfaces are visible when exposed
-- interior normals face the camera correctly enough for splat rendering
-- rubber/diffuse prompts do not show false fracture
-- no severe opacity holes, flicker, or fragment overlap artifacts
-
-## 9. Canonical Prompt Suites
-
-Use three prompt files per validation run:
-
-```text
-material_prompts.txt
-sentence_prompts.txt
-gravity_prompts.txt
-```
-
-Material prompts should test material retrieval:
-
-```text
-thin soda-lime glass bottle shattering into sharp clean cracks
-porcelain ceramic mug cracking into a few brittle splits
-rough concrete block crumbling into irregular chunks
-vulcanized rubber ball deforming without visible fracture
-clear ice sphere cracking with radial brittle fractures
-hardwood oak block splitting along the grain
-structural steel block denting without brittle fracture
-```
-
-Sentence prompts should hold material mostly fixed and vary crack style:
-
-```text
-glass bottle with one long smooth crack
-glass bottle with spiderweb branching cracks
-glass bottle shattering into many sharp radial cracks
-glass bottle with diffuse tiny surface scratches
-concrete block splitting with one clean fracture line
-concrete block crumbling into rough granular chunks
-concrete block with wide branching cracks
-concrete block with shallow diffuse microcracks
-rubber ball deforming without visible fracture
-```
-
-Gravity prompts should be a smaller, high-signal subset:
-
-```text
-glass bottle shattering into many sharp radial cracks
-glass bottle with one long smooth crack
-glass bottle with diffuse tiny surface scratches
-concrete block crumbling into rough granular chunks
-rubber ball deforming without visible fracture
-```
-
-## 10. Recommended Commands
-
-Prior-only check:
-
-```text
-python scripts/validate_sentence_materials.py --no-sim --prompts-file output/material_sentence_validation_20260425/sentence_prompts.txt --out output/prior_check
-```
-
-Full material/sentence validation at default scale:
-
-```text
-conda run -n crack_py11 --no-capture-output python scripts/validate_material_sentence_gravity.py --out output/material_sentence_validation_YYYYMMDD --surface-particles 10000 --surface-frames 24 --gravity-particles 10000 --gravity-frames 64 --gravity-grids 64 --physics-substeps 3
-```
-
-Fast gravity smoke:
-
-```text
-conda run -n crack_py11 --no-capture-output python scripts/validate_material_sentence_gravity.py --skip-surface --gravity-prompts-file output/material_sentence_validation_20260425/gravity_prompts.txt --out output/gravity_smoke_2k --gravity-particles 2000 --gravity-frames 56 --gravity-grids 40 --physics-substeps 2 --drop-center-z 0.31 --gravity-z -4200
-```
-
-Final 50k selected validation:
-
-```text
-conda run -n crack_py11 --no-capture-output python scripts/validate_material_sentence_gravity.py --skip-surface --gravity-prompts-file output/material_sentence_validation_20260425/gravity_prompts.txt --out output/gravity_final_50k --gravity-particles 50000 --gravity-frames 80 --gravity-grids 80 --physics-substeps 2 --drop-center-z 0.31 --gravity-z -4200
-```
-
-## 11. Output Review Checklist
-
-For every run, inspect:
-
-```text
-gravity_material_validation.md
-gravity_material_validation.csv
-surface_material_validation.csv
-surface_sentence_validation.csv
-manifest.json
-```
-
-Do not accept a run based on a single metric. Required checks:
-
-1. Material family matches prompt.
-2. Sentence style matches wording.
-3. Crack morphology differs across sentence variants.
-4. Fragment release differs across material/style variants.
-5. Rubber/diffuse controls remain stable.
-6. Runtime is recorded and acceptable.
-7. The output directory name records budget and purpose.
-
-## 12. First Experiments
-
-Run these first:
-
-```text
-glass / 50k / matplotlib
-concrete / 50k / matplotlib
-ceramic / 50k / matplotlib
-rubber / 50k / matplotlib
-```
-
-Success criteria:
-
-- glass: narrow crack and cut-edge split candidate
-- concrete: rough crack network and stable components
-- ceramic: visible crack/opening, split optional
-- rubber: no explicit crack path, no fragments
-
-Then repeat selected successful cases at 100k or 150k.
-
-## 13. Immediate Code Tasks
-
-1. `src/fracture/surface_crack_driver.py` provides procedural, material-family-conditioned surface drive.
-2. `smoke_test.py --surface-only` runs fracture directly on surface graph nodes and skips MPM.
-3. In surface-only mode, the particle budget is treated as surface node budget, not surface+volume budget.
-4. `GaussianGraph` uses compact KD-tree kNN for large surfaces, avoiding dense all-pairs distance matrices at 50k+ nodes.
-5. Fragment connected-components detection runs at a configurable cadence so crack propagation can be checked cheaply between topology passes.
-6. Ring-free fragment creation is allowed only for brittle/rough families through local crack-corridor support loss. `neutral_reference` remains crack-only by default.
-7. Matplotlib damage/opening/cut/closure overlays are the validation gate before Gaussian rendering.
-8. Keep MPM path working as optional regression path.
-
-Useful commands:
-
-```text
-python smoke_test.py --surface-only --frames 80 --particles 50000 --out output/surface_50k
-python smoke_test.py --surface-only --family rough_quasi_brittle --frames 30 --particles 50000 --plot-every 10 --fragment-every 2 --out output/surface_fragment_rough_50k
-python smoke_test.py --surface-only --frames 80 --particles 100000 --plot-every 10 --out output/surface_100k
-python smoke_test.py --surface-only --frames 80 --particles 150000 --plot-every 10 --fragment-every 4 --out output/surface_150k
-```
-
-## 14. Final Positioning
-
-The system should be described as:
-
-```text
-sentence-conditioned surface-manifold fracture for Gaussian splats
-```
-
-not as:
-
-```text
-full volumetric physical fracture simulation
-```
-
-This is the better technical and research framing for the current project.
+Key code boundaries:
+
+- `src/core/manifold_simulator.py`
+  - Owns simulator initialization and frame orchestration.
+  - Mixins under `src/core/simulator_mixins/` own surface binding,
+    frame-level fragment stats, fracture-drive construction, runtime profiles,
+    render-fragment offsets, and post-fragment physics.
+- `src/fracture/graph_fragment_manager.py`
+  - Owns manager state and `detect_fragments`.
+  - Fragment mixins own phase approval, cut-field construction, strict closure
+    patch extraction, open/release patch extraction, component/support
+    analysis, and connected-component/impulse utilities.
+- `src/diagnostics/raw_graph_plot.py`
+  - Owns raw matplotlib crack/fragment PNG generation.
+  - The progression script now focuses on running prompts and collecting
+    metrics instead of embedding all plotting code.
+
+The refactor preserves the current algorithm: fragment birth is still proposed
+by crack/cut closure and approved by local narrow-band phase/volume evidence.
+It does not introduce full volumetric PFF-MPM or per-fragment rigid-body
+dynamics.
+
+Refactor verification:
+
+- Compile passed across core, fracture, diagnostics, validation scripts, and
+  smoke test.
+- 2K impact smoke passed through CLIP, gravity/contact, crack propagation,
+  phase-approved fragment birth, fragment-manager mixins, and raw plotting:
+  `output/refactor_modularization_impact_smoke_2k/progression_report.md`.
+
+Previous 10K/64-grid raw validation:
+
+- Report: `output/phase_approved_birth_sweep_10k_v2/progression_sweep_report.md`
+- Y-Z montage: `output/phase_approved_birth_sweep_10k_v2/yz_media/yz_sentence_result_montage.png`
+- Y-Z MP4: `output/phase_approved_birth_sweep_10k_v2/yz_media/yz_sentence_result.mp4`
+- MP4 verification: 10 frames at 1 fps.
+- All seven prompt classes pass:
+  glass radial, glass spiderweb, ceramic single crack, concrete chunks, ice
+  radial, rubber no-fracture, and steel no-fracture.
+
+Validation summary:
+
+| prompt class | expected mode | result | first birth | final fragments | released ratio | phase birth |
+|---|---|---|---:|---:|---:|---:|
+| glass radial | crack-connected fragment | PASS | 0 | 244 | 0.644 | 0.951 |
+| glass spiderweb | crack-connected fragment | PASS | 0 | 44 | 0.161 | 0.834 |
+| ceramic single crack | crack split/no detach | PASS | -1 | 0 | 0.000 | 0.000 |
+| concrete chunks | crack-connected fragment | PASS | 1 | 14 | 0.090 | 0.896 |
+| ice radial | crack-connected fragment | PASS | 0 | 232 | 0.642 | 0.873 |
+| rubber no fracture | no fragment | PASS | -1 | 0 | 0.000 | 0.000 |
+| steel denting | no fragment | PASS | -1 | 0 | 0.000 | 0.000 |
+
+SIGGRAPH evidence harness:
+
+- `scripts/run_siggraph_evidence.py` now standardizes matched prompt suites,
+  runtime override ablations, mesh/config copies, Y-Z montage generation, and
+  suite-level `evidence_report.md` files.
+- Completed 10K evidence supports the current paper direction:
+  sentence/style control, same radial sentence across materials, and crack
+  style interpolation all produce measurable fragment/release differences.
+- Completed smoke mesh repro on bunny/spot/truck preserves the intended
+  material ordering: glass radial shatter > concrete chunks > rubber no
+  fragment.
+- Ablation support exists through `--override-json`, including no phase
+  approval, no crack-front branching, no narrow-band volume feedback, and no
+  CLIP material prior.  The first quick10K ablation shows no-branch and
+  no-CLIP clearly degrade the result; no narrow-band feedback weakens release;
+  no phase approval is inconclusive on easy glass radial.
+- A separate controlled phase-gate stress ablation tightens the runtime phase
+  approval threshold and weakens volume feedback for a rough concrete prompt.
+  With phase approval enabled it rejects surface-only closure (`0` fragments);
+  with the gate bypassed it births `12` fragments at impact+1.  This is a
+  causal stress test for the gate, not a normal quality sweep.
+
+Current retained outputs:
+
+- `output/phase_approved_birth_sweep_10k_v2` is the accepted 10K reference.
+- `output/phase_approved_birth_sweep_50k_v3` is the accepted 50K reference.
+- `output/siggraph_evidence_sentence_style_quick10k_v1`
+- `output/siggraph_evidence_material_radial_quick10k_v1`
+- `output/siggraph_evidence_style_interpolation_quick10k_v1`
+- `output/siggraph_evidence_mesh_repro_smoke2k_v2`
+- `output/siggraph_evidence_ablation_quick10k_v1`
+- `output/siggraph_evidence_phase_gate_stress_quick10k_v4`
+- Older smoke/probe/superseded output directories were deleted after the
+  phase-approved-birth sweep.

@@ -97,6 +97,7 @@ class ForwardEngine:
                  save_frames: bool = False, return_frames: bool = True,
                  material_tint: tuple = None,
                  material_texture: str = None,
+                 diagnostic_callback=None,
                  **kwargs) -> List[torch.Tensor]:
         """
         Run a forward simulation with given material parameters.
@@ -128,6 +129,14 @@ class ForwardEngine:
         if not save_frames:
             OmegaConf.update(config, "simulation.save_frames", False)
 
+        render_frames_cfg = config.rendering.get('render_frames', None)
+        no_render_mode = (
+            not save_frames
+            and not return_frames
+            and render_frames_cfg is not None
+            and len(list(render_frames_cfg)) == 0
+        )
+
         # Parameter-dependent setup
         self.last_simulator = None
         self.last_stats_history = []
@@ -135,7 +144,7 @@ class ForwardEngine:
         mpm_model = create_mpm_model(config, self._volume_pcd, self.device)
         loading_params = configure_loading(config, mpm_model, self.device)
         elasticity = create_elasticity_model(config, self.device)
-        gaussians = self._create_gaussians(config)
+        gaussians = self._create_gaussians(config, no_render_mode=no_render_mode)
 
         simulator = self._create_simulator(config, mpm_model, gaussians,
                                             elasticity, loading_params)
@@ -159,25 +168,27 @@ class ForwardEngine:
         simulator.initialize(
             torch.from_numpy(self._volume_points_np).float().to(self.device))
 
-        # Pass surface normals for manifold-aware graph (ManifoldSimulator only)
+        # Pass surface normals for graph-aware fracture simulators.
         if self._volume_normals_np is not None and hasattr(simulator, 'set_surface_normals'):
             all_normals = torch.from_numpy(self._volume_normals_np).float().to(self.device)
             simulator.set_surface_normals(all_normals)
 
         apply_loading_transforms(config, simulator, loading_params, self.device)
 
-        # Setup camera
-        camera = self._setup_camera(config)
+        # Setup camera only when a render pass is requested.
+        camera = None if no_render_mode else self._setup_camera(config)
 
         # Pass camera position for back-face normal flipping
-        simulator._camera_pos = camera.camera_center
+        simulator._camera_pos = camera.camera_center if camera is not None else None
 
         # Run simulation and collect frames
         frames = self._run_loop(config, simulator, camera,
                                 save_frames=save_frames,
                                 return_frames=return_frames,
                                 material_tint=material_tint,
-                                material_props=self._material_props)
+                                material_props=self._material_props,
+                                diagnostic_callback=diagnostic_callback,
+                                no_render_mode=no_render_mode)
         return frames
 
     def render_from_checkpoint(self, checkpoint_path: str, num_frames: int = 50,
@@ -230,8 +241,11 @@ class ForwardEngine:
                                 start_frame=simulator.frame_count)
         return frames
 
-    def _create_gaussians(self, config):
+    def _create_gaussians(self, config, no_render_mode: bool = False):
         """Create GaussianModel from cached surface point cloud."""
+        if no_render_mode:
+            return self._create_dummy_gaussians(config)
+
         # Import here to avoid top-level dependency on gaussian-splatting
         from scene.gaussian_model import GaussianModel
 
@@ -279,6 +293,29 @@ class ForwardEngine:
                 fov_x=cam_fov,
             )
 
+        return gaussians
+
+    def _create_dummy_gaussians(self, config):
+        """Minimal Gaussian container for no-render physics validation."""
+        n = int(np.asarray(self._surface_pcd.points).shape[0])
+        sh_degree = int(config.gaussian_splatting.get("sh_degree", 3))
+        rest_dim = max((sh_degree + 1) ** 2 - 1, 0)
+        device = self.device
+
+        class DummyGaussians:
+            pass
+
+        gaussians = DummyGaussians()
+        gaussians._xyz = torch.nn.Parameter(torch.zeros(n, 3, device=device))
+        gaussians._features_dc = torch.nn.Parameter(torch.zeros(n, 1, 3, device=device))
+        gaussians._features_rest = torch.nn.Parameter(torch.zeros(n, rest_dim, 3, device=device))
+        gaussians._opacity = torch.nn.Parameter(torch.zeros(n, 1, device=device))
+        gaussians._scaling = torch.nn.Parameter(torch.zeros(n, 3, device=device))
+        gaussians._rotation = torch.nn.Parameter(
+            torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device)
+            .expand(n, 4)
+            .clone()
+        )
         return gaussians
 
     def _create_simulator(self, config, mpm_model, gaussians, elasticity, loading_params):
@@ -343,7 +380,6 @@ class ForwardEngine:
 
         surface_mask = torch.from_numpy(self._surface_mask_np).bool().to(self.device)
 
-        # Choose simulator based on config
         use_manifold = config.simulation.get('use_manifold', False)
 
         if use_manifold:
@@ -447,10 +483,10 @@ class ForwardEngine:
     def _run_loop(self, config, simulator, camera,
                   save_frames=False, return_frames=True,
                   start_frame=0, material_tint=None,
-                  material_props=None) -> List[torch.Tensor]:
+                  material_props=None,
+                  diagnostic_callback=None,
+                  no_render_mode: bool = False) -> List[torch.Tensor]:
         """Execute simulation loop and optionally collect rendered frames."""
-        from gaussian_renderer import render
-
         device = self.device
         bg_color = torch.tensor(config.rendering.background_color, device=device)
         pipe = type('obj', (object,), {
@@ -515,8 +551,9 @@ class ForwardEngine:
         save_ckpts = bool(config.simulation.get('save_checkpoint', False))
         ckpt_interval = int(config.simulation.get('checkpoint_interval', 0) or 0)
 
-        # Auto-checkpoint: pre-impact baseline
-        ckpt_frames = {40}
+        # Auto-checkpoint: pre-impact baseline. No-render validation sweeps
+        # should not write heavy checkpoints unless explicitly requested.
+        ckpt_frames = set() if no_render_mode else {40}
         _impact_ckpts_added = False
         # Match run.py diagnostic settings
         simulator._save_diagnostics = False
@@ -534,11 +571,18 @@ class ForwardEngine:
                 stats["loop_frame"] = int(frame)
                 stats_history.append(stats)
                 self.last_stats_history = stats_history
+                if diagnostic_callback is not None:
+                    diagnostic_callback(
+                        frame=int(frame),
+                        simulator=simulator,
+                        stats=stats,
+                    )
 
             # Auto-detect impact frame for checkpointing
             if (hasattr(simulator, '_gravity_drop_contacted')
                     and simulator._gravity_drop_contacted
-                    and not _impact_ckpts_added):
+                    and not _impact_ckpts_added
+                    and not no_render_mode):
                 _impact_ckpts_added = True
                 impact_frame = frame
                 ckpt_frames.update({impact_frame, impact_frame + 1,
@@ -564,6 +608,7 @@ class ForwardEngine:
                 continue
 
             # Render only on selected output frames.
+            from gaussian_renderer import render
             rendering = render(camera, simulator.gaussians, pipe, bg_color)
             image = rendering["render"]
             depth_map = rendering["depth"]

@@ -157,10 +157,10 @@ class SurfaceCrackDriver:
         elif style == "spiderweb_branching":
             spoke = (0.5 + 0.5 * torch.cos(9.0 * theta + 0.25)).clamp(0.0, 1.0).pow(2.0)
             ring = (0.5 + 0.5 * torch.cos(30.0 * r_norm + 0.35)).clamp(0.0, 1.0).pow(2.2)
-            web = torch.maximum(0.88 * spoke, 0.82 * ring) * (0.16 + 0.84 * r_norm)
+            web = (0.92 * spoke + 0.08 * ring) * (0.16 + 0.84 * r_norm)
             near = torch.exp(-0.5 * (planar_r / (0.16 * diag)).pow(2.0))
             init_score = torch.maximum(init_score, 0.48 * near * (0.45 + 0.55 * spoke))
-            growth_drive = torch.maximum(growth_drive, 0.76 * web.clamp(0.0, 1.0))
+            growth_drive = torch.maximum(growth_drive, 0.70 * web.clamp(0.0, 1.0))
             tangent_sign = torch.sign(torch.sin(9.0 * theta + 0.25))
             tangent_sign = torch.where(
                 tangent_sign.abs() > 0,
@@ -168,11 +168,11 @@ class SurfaceCrackDriver:
                 torch.ones_like(tangent_sign),
             )
             tangent = tangent * tangent_sign.unsqueeze(1)
-            ring_mix = (0.25 + 0.75 * ring).unsqueeze(1)
+            ring_mix = (0.06 + 0.34 * ring).unsqueeze(1)
             spoke_mix = (0.35 + 0.65 * spoke).unsqueeze(1)
             growth_dir = self._safe_normalize(
-                0.78 * spoke_mix * radial
-                + 0.66 * ring_mix * tangent
+                0.92 * spoke_mix * radial
+                + 0.08 * ring_mix * tangent
                 + 0.18 * upward
             )
 

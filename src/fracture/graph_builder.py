@@ -6,10 +6,11 @@ Used for graph-based fracture propagation, fragment detection, and
 Laplacian-like damage diffusion.
 """
 
-import numpy as np
 import torch
 from torch import Tensor
-from typing import Optional, Tuple
+from typing import Optional
+
+from src.utils.knn import knn_search
 
 
 class GaussianGraph:
@@ -98,38 +99,15 @@ class GaussianGraph:
                        and self._normals.shape[0] == N)
         k_fetch = min(self.k * 2 if has_normals else self.k, N - 1)
         k_final = min(self.k, N - 1)
-        device = positions.device
 
-        # Compute kNN. Dense cdist is fast for small smoke tests, but it becomes
-        # memory-bound at 50k+ surface nodes, so large static surfaces use a CPU
-        # KD-tree and keep only the compact (N, K) result on the target device.
-        if N <= 30000:
-            dists = torch.cdist(positions, positions)
-            dists.fill_diagonal_(float('inf'))
-            knn_dist, knn_idx = dists.topk(k_fetch, largest=False, dim=1)
-        else:
-            try:
-                knn_dist_np, knn_idx_np = self._build_knn_ckdtree(
-                    positions,
-                    k_fetch,
-                )
-                knn_idx = torch.from_numpy(knn_idx_np).to(device=device, dtype=torch.long)
-                knn_dist = torch.from_numpy(knn_dist_np).to(device=device, dtype=positions.dtype)
-                if self._build_count == 0:
-                    print(f"[Graph] cKDTree kNN: N={N}, k_fetch={k_fetch}")
-            except Exception as exc:
-                print(f"[Graph] cKDTree kNN failed ({exc}); falling back to chunked cdist")
-                knn_idx = torch.empty(N, k_fetch, dtype=torch.long, device=device)
-                knn_dist = torch.empty(N, k_fetch, dtype=positions.dtype, device=device)
-                chunk_size = 2048
-                for i in range(0, N, chunk_size):
-                    j = min(i + chunk_size, N)
-                    d = torch.cdist(positions[i:j], positions)
-                    for offset in range(j - i):
-                        d[offset, i + offset] = float('inf')
-                    dist_c, idx_c = d.topk(k_fetch, largest=False, dim=1)
-                    knn_idx[i:j] = idx_c
-                    knn_dist[i:j] = dist_c
+        knn_dist, knn_idx = knn_search(
+            positions,
+            positions,
+            k_fetch,
+            exclude_self=True,
+        )
+        if self._build_count == 0:
+            print(f"[Graph] faiss kNN: N={N}, k_fetch={k_fetch}")
 
         # --- Normal compatibility filtering ---
         if has_normals:
@@ -187,40 +165,6 @@ class GaussianGraph:
         self.weights = weights
         self.N = N
         self._build_count += 1
-
-    @staticmethod
-    def _build_knn_ckdtree(positions: Tensor, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        from scipy.spatial import cKDTree
-
-        pos_np = positions.detach().cpu().numpy().astype(np.float32, copy=False)
-        tree = cKDTree(pos_np)
-        query_k = min(k + 1, pos_np.shape[0])
-        dist, idx = tree.query(pos_np, k=query_k, workers=-1)
-        if idx.ndim == 1:
-            idx = idx[:, None]
-            dist = dist[:, None]
-
-        row_ids = np.arange(pos_np.shape[0])[:, None]
-        if idx.shape[1] > k and np.all(idx[:, 0:1] == row_ids):
-            idx = idx[:, 1:k + 1]
-            dist = dist[:, 1:k + 1]
-        else:
-            idx_out = np.empty((pos_np.shape[0], k), dtype=np.int64)
-            dist_out = np.empty((pos_np.shape[0], k), dtype=np.float32)
-            for row in range(pos_np.shape[0]):
-                keep = idx[row] != row
-                row_idx = idx[row, keep][:k]
-                row_dist = dist[row, keep][:k]
-                if row_idx.shape[0] < k:
-                    pad = k - row_idx.shape[0]
-                    row_idx = np.pad(row_idx, (0, pad), mode="edge")
-                    row_dist = np.pad(row_dist, (0, pad), constant_values=np.inf)
-                idx_out[row] = row_idx
-                dist_out[row] = row_dist
-            idx = idx_out
-            dist = dist_out
-
-        return dist.astype(np.float32, copy=False), idx.astype(np.int64, copy=False)
 
     def graph_laplacian(self, values: Tensor) -> Tensor:
         """

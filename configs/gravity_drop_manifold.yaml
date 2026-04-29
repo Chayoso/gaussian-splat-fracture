@@ -6,7 +6,7 @@ simulation:
   name: "gravity_drop_manifold"
   description: "Bunny drop with Gaussian-manifold fracture field"
   mode: "deformation"
-  use_manifold: true                 # <-- KEY: enables ManifoldSimulator
+  use_manifold: true
   output_dir: "output"
   save_frames: true
   save_checkpoint: false
@@ -95,11 +95,11 @@ manifold:
   fragment_persistent_min_size: 8
   fragment_component_hysteresis: 0.34
   fragment_post_split_threshold_scale: 0.90
-  fragment_impulse_strength: 2.40
+  fragment_impulse_strength: 0.00
   fragment_upward_bias: 0.36
   fragment_visual_offset_scale: 0.010
   fragment_visual_ramp_frames: 6
-  fragment_impulse_boost_frames: 4
+  fragment_impulse_boost_frames: 0
   fragment_event_boost: 1.0
   fragment_render_gravity: 0.0026
   fragment_render_damping: 0.985
@@ -126,9 +126,11 @@ manifold:
   support_release_threshold: 0.56
   support_promote_min_size: 6
   support_overlap_threshold: 0.10
-  open_crack_release_enable: true     # Allow local support-loss fragments without a fully closed crack ring
-  open_crack_release_threshold: 0.0   # 0 = material-family default
-  open_crack_release_max_patches: 2
+  crack_connected_release_only: true  # Fragment birth requires propagated crack closure/ring
+  strict_closure_max_released_ratio: 0.35
+  open_crack_release_enable: false    # No arbitrary damage/support-loss patch release
+  open_crack_release_threshold: 1.0
+  open_crack_release_max_patches: 0
   aniso_ratio: 1.0                   # 1.0 = isotropic (no directional bias)
   damage_source_scale: 0.35          # Physics-driven advance at crack front
   damage_spread: 0.36                # Neutral baseline: narrower than rough quasi-brittle

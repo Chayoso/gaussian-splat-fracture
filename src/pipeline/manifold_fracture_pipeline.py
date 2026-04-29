@@ -7,8 +7,8 @@ Two modes:
   2. Config mode (material_source="config"):
      YAML config → (E, Gc, nu) directly → ManifoldSimulator
 
-Both modes use the ManifoldSimulator (Gaussian-manifold fracture field).
-The CLIP mode adds automatic material parameter prediction from text.
+Both modes use the ManifoldSimulator Gaussian-manifold fracture field. The CLIP
+mode adds automatic material parameter prediction from text.
 Config mode is for direct parameter control and simulation verification.
 
 Usage:
@@ -214,6 +214,7 @@ class ManifoldFracturePipeline:
         material_prior = self._prior_adapter.build_material_prior(
             topk_entries,
             raw_params["top_k_scores"],
+            text=text,
         )
         material_prior = self._prior_adapter.apply_sentence_style(
             material_prior,
@@ -267,6 +268,7 @@ class ManifoldFracturePipeline:
         params.update(
             self._prior_adapter.scale_physics_to_mpm(
                 physics_prior,
+                family=material_prior["family"],
                 base_E=MPM_E_BASE,
                 base_Gc=MPM_GC_BASE,
                 base_density=float(self.engine.base_config.material.density),
@@ -331,6 +333,7 @@ class ManifoldFracturePipeline:
         raw_params, material_prior = self._build_material_prior(text)
         scaled = self._prior_adapter.scale_physics_to_mpm(
             material_prior["physics"],
+            family=material_prior["family"],
             base_E=MPM_E_BASE,
             base_Gc=MPM_GC_BASE,
             base_density=float(self.engine.base_config.material.density),

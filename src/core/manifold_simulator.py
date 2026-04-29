@@ -29,9 +29,24 @@ from src.fracture.crack_front import CrackFront
 from src.fracture.tip_based_fracture_field import GaussianFractureField
 from src.fracture.gaussian_splitter import GaussianSplitter
 from src.fracture.graph_fragment_manager import GraphFragmentManager
+from src.core.simulator_mixins import (
+    SurfaceBindingMixin,
+    FragmentEventStatsMixin,
+    FragmentPhysicsMixin,
+    RuntimeProfilesMixin,
+    FractureDriveMixin,
+    RenderFragmentMixin,
+)
 
 
-class ManifoldSimulator:
+class ManifoldSimulator(
+    SurfaceBindingMixin,
+    FragmentEventStatsMixin,
+    FragmentPhysicsMixin,
+    RuntimeProfilesMixin,
+    FractureDriveMixin,
+    RenderFragmentMixin,
+):
     """
     Gaussian-manifold fracture simulator.
 
@@ -158,6 +173,21 @@ class ManifoldSimulator:
             device=device_str,
         )
 
+        self.material_family = str(fp.get('material_family', 'neutral_reference'))
+        self.crack_connected_release_only = bool(
+            fp.get(
+                'crack_connected_release_only',
+                self.material_family != 'diffuse_damage',
+            )
+        )
+        burst_defaults = self._default_impact_fracture_burst(self.material_family)
+        self.impact_fracture_burst_frames = max(
+            int(fp.get('impact_fracture_burst_frames', burst_defaults["frames"])), 0)
+        self.impact_fracture_burst_steps = max(
+            int(fp.get('impact_fracture_burst_steps', burst_defaults["steps"])), 1)
+        self.impact_fracture_burst_front_substeps = max(
+            int(fp.get('impact_fracture_burst_front_substeps', burst_defaults["front_substeps"])), 1)
+        self._fracture_burst_active = False
         frag_enabled = fp.get('fragmentation_enabled', False)
         self.fragment_manager = GraphFragmentManager(
             damage_threshold=fp.get('fragment_damage_threshold', 0.5),
@@ -178,6 +208,7 @@ class ManifoldSimulator:
             min_boundary_edges=fp.get('fragment_min_boundary_edges', 12),
             detached_node_decay=fp.get('fragment_detached_node_decay', 0.95),
             persistent_min_fragment_size=fp.get('fragment_persistent_min_size', 8),
+            persistent_min_fragment_size_ratio=fp.get('fragment_persistent_min_size_ratio', 0.0),
             component_hysteresis=fp.get('fragment_component_hysteresis', 0.35),
             post_split_threshold_scale=fp.get('fragment_post_split_threshold_scale', 0.92),
             cut_surface_enable=fp.get('cut_surface_enable', False),
@@ -197,35 +228,42 @@ class ManifoldSimulator:
             open_crack_release_enable=fp.get('open_crack_release_enable', True),
             open_crack_release_threshold=fp.get('open_crack_release_threshold', 0.0),
             open_crack_release_max_patches=fp.get('open_crack_release_max_patches', 2),
+            crack_connected_release_only=self.crack_connected_release_only,
+            strict_closure_max_released_ratio=fp.get('strict_closure_max_released_ratio', 0.54),
             crack_style=fp.get('sentence_style', fp.get('crack_style', 'material_default')),
             brittle_release_intensity=fp.get('brittle_release_intensity', 1.0),
-            catastrophic_release_enable=fp.get('catastrophic_release_enable', False),
-            catastrophic_release_fragility=fp.get('catastrophic_release_fragility', 0.0),
-            catastrophic_release_threshold=fp.get('catastrophic_release_threshold', 0.36),
-            catastrophic_release_min_threshold=fp.get('catastrophic_release_min_threshold', 0.08),
-            catastrophic_release_threshold_decay=fp.get('catastrophic_release_threshold_decay', 0.010),
-            catastrophic_release_patches_per_step=fp.get('catastrophic_release_patches_per_step', 0),
-            catastrophic_release_patch_radius=fp.get('catastrophic_release_patch_radius', 0.060),
-            catastrophic_release_core_radius=fp.get('catastrophic_release_core_radius', 0.024),
-            catastrophic_release_min_size=fp.get('catastrophic_release_min_size', 16),
-            catastrophic_release_max_size_ratio=fp.get('catastrophic_release_max_size_ratio', 0.040),
-            catastrophic_release_max_released_ratio=fp.get('catastrophic_release_max_released_ratio', 0.55),
-            secondary_shatter_enable=fp.get('secondary_shatter_enable', False),
-            secondary_shatter_start_step=fp.get('secondary_shatter_start_step', 4),
-            secondary_shatter_threshold=fp.get('secondary_shatter_threshold', 0.18),
-            secondary_shatter_floor=fp.get('secondary_shatter_floor', 0.0),
-            secondary_shatter_max_patches=fp.get('secondary_shatter_max_patches', 0),
-            secondary_shatter_sector_count=fp.get('secondary_shatter_sector_count', 24),
-            secondary_shatter_band_count=fp.get('secondary_shatter_band_count', 3),
-            secondary_shatter_height_count=fp.get('secondary_shatter_height_count', 2),
-            secondary_shatter_min_size=fp.get('secondary_shatter_min_size', 8),
-            secondary_shatter_max_size_ratio=fp.get('secondary_shatter_max_size_ratio', 0.012),
-            secondary_shatter_max_released_ratio=fp.get('secondary_shatter_max_released_ratio', 0.70),
+            impact_release_gain=fp.get('impact_release_gain', 1.0),
+            impact_closure_target_ratio=fp.get('impact_closure_target_ratio', -1.0),
+            impact_closure_max_patches=fp.get('impact_closure_max_patches', -1),
+            impact_closure_active_frames=fp.get('impact_closure_active_frames', 2),
+            impact_closure_sector_count=fp.get('impact_closure_sector_count', 0),
+            impact_closure_band_count=fp.get('impact_closure_band_count', 0),
+            impact_closure_layer_count=fp.get('impact_closure_layer_count', 0),
+            impact_closure_min_size_ratio=fp.get('impact_closure_min_size_ratio', 0.0),
+            impact_closure_max_size_ratio=fp.get('impact_closure_max_size_ratio', 0.0),
+            phase_approval_enable=fp.get('phase_approval_enable', True),
+            phase_approval_threshold_scale=fp.get('phase_approval_threshold_scale', 1.0),
+            phase_approval_threshold_offset=fp.get('phase_approval_threshold_offset', 0.0),
             material_family=fp.get('material_family', 'neutral_reference'),
             device=device_str,
         ) if frag_enabled else None
         self.fragmentation_active = False
         self.fragment_detect_every = max(int(fp.get('fragment_detect_every', 2)), 1)
+        phase_defaults = self._default_phase_y_thresholds(self.material_family)
+        self.phase_y_coupling_enabled = bool(
+            fp.get('phase_y_coupling_enabled', True))
+        self.phase_y_seed_threshold = float(
+            fp.get('phase_y_seed_threshold', phase_defaults["seed"]))
+        self.phase_y_advance_threshold = float(
+            fp.get('phase_y_advance_threshold', phase_defaults["advance"]))
+        self.phase_y_cut_threshold = float(
+            fp.get('phase_y_cut_threshold', phase_defaults["cut"]))
+        self.phase_y_gate_width = float(
+            fp.get('phase_y_gate_width', phase_defaults["width"]))
+        self._last_phase_y_gauss: Optional[Tensor] = None
+        self._last_phase_seed_gate: Optional[Tensor] = None
+        self._last_phase_advance_gate: Optional[Tensor] = None
+        self._last_phase_cut_gate: Optional[Tensor] = None
         self.fragment_impulse_strength = float(fp.get('fragment_impulse_strength', 2.8))
         self.fragment_upward_bias = float(fp.get('fragment_upward_bias', 0.45))
         self.fragment_visual_offset_scale = float(fp.get('fragment_visual_offset_scale', 0.012))
@@ -234,7 +272,6 @@ class ManifoldSimulator:
         self.fragment_impulse_decay = float(fp.get('fragment_impulse_decay', 0.75))
         self.fragment_event_boost = float(fp.get('fragment_event_boost', 1.0))
         self._fragment_activation_frame = -1
-        self.material_family = str(fp.get('material_family', 'neutral_reference'))
         self.crack_style = str(fp.get('sentence_style', fp.get('crack_style', 'material_default')))
         self.shard_enable = bool(fp.get('shard_enable', False))
         self.shard_count_scale = float(fp.get('shard_count_scale', 0.0))
@@ -252,6 +289,20 @@ class ManifoldSimulator:
         self.fragment_render_lateral_damping = float(fp.get('fragment_render_lateral_damping', 0.992))
         self.fragment_render_gap_scale = float(fp.get('fragment_render_gap_scale', 1.55))
         self.fragment_render_velocity_scale = float(fp.get('fragment_render_velocity_scale', 0.22))
+        self.fragment_render_strict_motion_boost = float(
+            fp.get('fragment_render_strict_motion_boost', 1.0))
+        self.fragment_render_strict_gap_scale = float(
+            fp.get('fragment_render_strict_gap_scale', 0.68))
+        self.fragment_render_strict_velocity_scale = float(
+            fp.get('fragment_render_strict_velocity_scale', 0.12))
+        self.fragment_render_strict_max_detach = float(
+            fp.get('fragment_render_strict_max_detach', 0.085))
+        self.fragment_render_strict_gravity_scale = float(
+            fp.get('fragment_render_strict_gravity_scale', 0.0))
+        self.fragment_render_strict_damping = float(
+            fp.get('fragment_render_strict_damping', 0.90))
+        self.fragment_render_strict_lateral_damping = float(
+            fp.get('fragment_render_strict_lateral_damping', 0.90))
         self.fragment_render_min_size = max(int(fp.get('fragment_render_min_size', 6)), 1)
         self.fragment_render_overlap_threshold = float(
             fp.get('fragment_render_overlap_threshold', 0.24)
@@ -269,6 +320,7 @@ class ManifoldSimulator:
         self._physical_fragment_labels: Optional[Tensor] = None
         self._physical_fragment_states = {}
         self._next_physical_fragment_id = 1
+        self._reset_frame_fragment_event_stats()
 
         self.damage_feedback_delay_frames = int(
             fp.get('damage_feedback_delay_frames', 8))
@@ -292,6 +344,19 @@ class ManifoldSimulator:
             fp.get('crack_volume_tip_floor', 0.66))
         self.crack_volume_interior_scale = float(
             fp.get('crack_volume_interior_scale', 0.85))
+        immediate_defaults = {
+            "sharp_brittle": 0.72,
+            "brittle_moderate": 0.48,
+            "rough_quasi_brittle": 0.42,
+            "neutral_reference": 0.18,
+            "diffuse_damage": 0.0,
+        }
+        self.crack_volume_immediate_feedback = float(
+            fp.get(
+                'crack_volume_immediate_feedback',
+                immediate_defaults.get(self.material_family, 0.18),
+            )
+        )
         self.fragment_physical_gap_scale = float(
             fp.get('fragment_physical_gap_scale', 0.0))
         self.fragment_physical_release_velocity = float(
@@ -300,6 +365,49 @@ class ManifoldSimulator:
             fp.get('fragment_physical_downward_bias', 0.32))
         self.fragment_physical_release_frames = max(
             int(fp.get('fragment_physical_release_frames', 20)), 0)
+        shape_defaults = self._default_shape_matching_params(self.material_family)
+        self.fragment_physical_lateral_bias = float(
+            fp.get('fragment_physical_lateral_bias', shape_defaults.get("fragment_lateral_bias", 0.0)))
+        self.fragment_physical_spin_gain = float(
+            fp.get('fragment_physical_spin_gain', shape_defaults.get("fragment_spin_gain", 0.0)))
+        self.fragment_physical_max_speed = float(
+            fp.get('fragment_physical_max_speed', shape_defaults.get("fragment_max_speed", 0.35)))
+        self.shape_matching_enabled = bool(
+            fp.get('shape_matching_enabled', True))
+        self.shape_match_strength = float(
+            fp.get('shape_match_strength', shape_defaults["body"]))
+        self.shape_match_fragment_strength = float(
+            fp.get('shape_match_fragment_strength', shape_defaults["fragment"]))
+        self.shape_match_damaged_strength = float(
+            fp.get('shape_match_damaged_strength', shape_defaults["damaged"]))
+        self.shape_match_velocity_blend = float(
+            fp.get('shape_match_velocity_blend', 0.35))
+        self.shape_match_min_particles = max(
+            int(fp.get('shape_match_min_particles', 12)), 1)
+        self.rigid_contact_enabled = bool(
+            fp.get('rigid_contact_enabled', True))
+        self.rigid_contact_restitution = float(
+            fp.get('rigid_contact_restitution', shape_defaults["restitution"]))
+        self.rigid_contact_angular_gain = float(
+            fp.get('rigid_contact_angular_gain', shape_defaults["angular_gain"]))
+        self.rigid_contact_friction = float(
+            fp.get('rigid_contact_friction', shape_defaults["friction"]))
+        self.rigid_contact_band = float(
+            fp.get('rigid_contact_band', 1.5))
+        self.soft_contact_rebound = float(
+            fp.get('soft_contact_rebound', shape_defaults.get("soft_rebound", 0.0)))
+        self.soft_contact_rebound_frames = max(
+            int(fp.get('soft_contact_rebound_frames', shape_defaults.get("soft_rebound_frames", 0))), 0)
+        self.soft_contact_rebound_body_fraction = float(
+            fp.get('soft_contact_rebound_body_fraction', shape_defaults.get("soft_rebound_body_fraction", 0.0)))
+        self.soft_contact_squash = float(
+            fp.get('soft_contact_squash', shape_defaults.get("soft_squash", 0.0)))
+        self.soft_contact_squash_frames = max(
+            int(fp.get('soft_contact_squash_frames', shape_defaults.get("soft_squash_frames", 0))), 0)
+        self._soft_impact_speed = 0.0
+        self._last_rigid_angular_speed_max = 0.0
+        self._last_rigid_angular_speed_mean = 0.0
+        self._shape_match_rest_positions: Optional[Tensor] = None
         self.drive_tension_weight = float(
             fp.get('drive_tension_weight', 1.0))
         self.drive_shear_weight = float(
@@ -323,11 +431,16 @@ class ManifoldSimulator:
         self._gravity_drop_ground_z = 0.1
         self._gravity_drop_contacted = False
         self._v_com = None
+        self._impact_release_gain = float(fp.get('impact_release_gain', 1.0))
 
         self.frame_count = 0
         self._physics_step = 0
         self._last_cfl = 0.0
         self._last_stress = None
+        self._last_volumetric_damage_max = 0.0
+        self._last_volumetric_damage_mean = 0.0
+        self._last_surface_volume_damage_proxy_max = 0.0
+        self._last_surface_volume_damage_proxy_mean = 0.0
         self._surface_indices: Optional[Tensor] = None
         self._interior_indices: Optional[Tensor] = None
         self._particle_to_surface_local: Optional[Tensor] = None
@@ -405,6 +518,8 @@ class ManifoldSimulator:
         self._gravity_drop_ground_z = ground_z
         self._gravity_drop_contacted = False
         self._v_com = torch.zeros(3, device=self.mpm.gravity.device)
+        if self.x_mpm is not None:
+            self._shape_match_rest_positions = self.x_mpm.detach().clone()
         print(f"[GravityDrop] Enabled. Ground at z={ground_z}")
 
     def initialize(self, init_positions: Tensor):
@@ -417,6 +532,7 @@ class ManifoldSimulator:
         self.F = torch.eye(3, device=device).unsqueeze(0).expand(N, 3, 3).clone()
         self.C = torch.zeros((N, 3, 3), device=device)
         self.init_positions = init_positions.clone()
+        self._shape_match_rest_positions = init_positions.clone()
 
         # Initialize fracture field for surface Gaussians
         N_surf = self.surface_mask.sum().item()
@@ -447,181 +563,16 @@ class ManifoldSimulator:
         self._physical_fragment_labels = None
         self._physical_fragment_states = {}
         self._next_physical_fragment_id = 1
+        self._reset_frame_fragment_event_stats()
+        self._last_rigid_angular_speed_max = 0.0
+        self._last_rigid_angular_speed_mean = 0.0
+        self._impact_release_gain = float(self.fracture_cfg.get('impact_release_gain', 1.0))
+        if self.fragment_manager is not None:
+            self.fragment_manager.impact_release_gain = self._impact_release_gain
         self._surface_indices = torch.where(self.surface_mask)[0]
         self._interior_indices = torch.where(~self.surface_mask)[0]
         self._build_rest_surface_binding()
         print(f"[ManifoldSim] Initialized: {N} particles, {N_surf} surface")
-
-    def _build_rest_surface_binding(self, chunk_size: int = 2048) -> None:
-        """Bind each particle to a rest-state nearest surface Gaussian."""
-        if self.init_positions is None:
-            return
-        if self._surface_indices is None:
-            self._surface_indices = torch.where(self.surface_mask)[0]
-        if self._interior_indices is None:
-            self._interior_indices = torch.where(~self.surface_mask)[0]
-
-        surface_indices = self._surface_indices
-        interior_indices = self._interior_indices
-        device = self.init_positions.device
-        n_total = self.init_positions.shape[0]
-        n_surf = int(surface_indices.shape[0])
-        if n_surf <= 0:
-            self._particle_to_surface_local = None
-            self._surface_local_index = None
-            return
-
-        particle_to_surface = torch.full(
-            (n_total,), -1, dtype=torch.long, device=device
-        )
-        surface_local_index = torch.full(
-            (n_total,), -1, dtype=torch.long, device=device
-        )
-        surface_local = torch.arange(n_surf, device=device, dtype=torch.long)
-        particle_to_surface[surface_indices] = surface_local
-        surface_local_index[surface_indices] = surface_local
-
-        if interior_indices.numel() > 0:
-            x_surf = self.init_positions[surface_indices]
-            nearest_chunks = []
-            for start in range(0, interior_indices.shape[0], chunk_size):
-                end = min(start + chunk_size, interior_indices.shape[0])
-                x_chunk = self.init_positions[interior_indices[start:end]]
-                dists = torch.cdist(x_chunk, x_surf)
-                nearest_chunks.append(dists.argmin(dim=1))
-            nearest = torch.cat(nearest_chunks, dim=0)
-            particle_to_surface[interior_indices] = nearest
-
-        self._particle_to_surface_local = particle_to_surface
-        self._surface_local_index = surface_local_index
-        print(
-            f"[ManifoldSim] Rest surface binding built: "
-            f"{n_total} particles -> {n_surf} surface anchors"
-        )
-
-    def _project_surface_scalar_to_particles(
-        self,
-        surface_values: Tensor,
-        interior_scale: float = 1.0,
-    ) -> Tensor:
-        """Project a per-surface scalar field to all particles via rest binding."""
-        out = torch.zeros(
-            self.x_mpm.shape[0],
-            dtype=surface_values.dtype,
-            device=surface_values.device,
-        )
-        if self._surface_indices is None or self._particle_to_surface_local is None:
-            return out
-
-        n_assign = min(surface_values.shape[0], self._surface_indices.shape[0])
-        if n_assign <= 0:
-            return out
-
-        surface_indices = self._surface_indices[:n_assign]
-        out[surface_indices] = surface_values[:n_assign]
-        if self._interior_indices is not None and self._interior_indices.numel() > 0:
-            mapped = self._particle_to_surface_local[self._interior_indices]
-            valid = (mapped >= 0) & (mapped < n_assign)
-            if bool(valid.any()):
-                out[self._interior_indices[valid]] = (
-                    surface_values[mapped[valid]] * interior_scale
-                )
-        return out
-
-    def _map_surface_labels_to_particles(
-        self,
-        surface_labels: Tensor,
-    ) -> Tensor:
-        """Map per-surface fragment labels to all particles via rest binding."""
-        out = torch.zeros(
-            self.x_mpm.shape[0],
-            dtype=torch.long,
-            device=surface_labels.device,
-        )
-        if self._surface_indices is None or self._particle_to_surface_local is None:
-            return out
-
-        n_assign = min(surface_labels.shape[0], self._surface_indices.shape[0])
-        if n_assign <= 0:
-            return out
-
-        surface_indices = self._surface_indices[:n_assign]
-        out[surface_indices] = surface_labels[:n_assign]
-        if self._interior_indices is not None and self._interior_indices.numel() > 0:
-            mapped = self._particle_to_surface_local[self._interior_indices]
-            valid = (mapped >= 0) & (mapped < n_assign)
-            if bool(valid.any()):
-                out[self._interior_indices[valid]] = surface_labels[mapped[valid]]
-        return out
-
-    def _ensure_physical_fragment_registry(self, count: int, device) -> None:
-        if (self._physical_fragment_labels is not None
-                and self._physical_fragment_labels.shape[0] == count
-                and self._physical_fragment_labels.device == device):
-            return
-        self._physical_fragment_labels = torch.zeros(
-            count, dtype=torch.long, device=device
-        )
-        self._physical_fragment_states = {}
-        self._next_physical_fragment_id = 1
-
-    def _update_physical_fragment_registry(self, raw_particle_labels: Tensor) -> Tensor:
-        """Persist released particle chunks even if graph labels later merge back."""
-        self._ensure_physical_fragment_registry(raw_particle_labels.shape[0], raw_particle_labels.device)
-        persistent = self._physical_fragment_labels.clone()
-        active_raw = raw_particle_labels.unique(sorted=True)
-
-        for raw_id in active_raw.tolist():
-            if raw_id <= 0:
-                continue
-            mask = raw_particle_labels == raw_id
-            raw_size = int(mask.sum().item())
-            if raw_size < self.fragment_physical_min_size:
-                continue
-
-            overlap_vals, overlap_counts = persistent[mask].unique(return_counts=True)
-            persistent_label = None
-            if overlap_vals.numel() > 0:
-                overlap_mask = overlap_vals > 0
-                if bool(overlap_mask.any()):
-                    overlap_vals = overlap_vals[overlap_mask]
-                    overlap_counts = overlap_counts[overlap_mask]
-                    best_idx = int(torch.argmax(overlap_counts).item())
-                    best_count = int(overlap_counts[best_idx].item())
-                    if best_count / max(raw_size, 1) >= self.fragment_physical_overlap_threshold:
-                        persistent_label = int(overlap_vals[best_idx].item())
-
-            if persistent_label is None:
-                persistent_label = self._next_physical_fragment_id
-                self._next_physical_fragment_id += 1
-                self._physical_fragment_states[persistent_label] = {
-                    "age": 0,
-                    "release_score": 0.0,
-                    "support_lost": False,
-                }
-
-            persistent[mask] = persistent_label
-            state = self._physical_fragment_states.get(
-                persistent_label,
-                {"age": 0, "release_score": 0.0, "support_lost": False},
-            )
-            release_score = 0.0
-            support_lost = False
-            if (self.fragment_manager is not None
-                    and raw_id < len(self.fragment_manager.fragment_release_scores)):
-                release_score = float(self.fragment_manager.fragment_release_scores[raw_id])
-            if (self.fragment_manager is not None
-                    and raw_id < len(self.fragment_manager.fragment_support_lost)):
-                support_lost = bool(self.fragment_manager.fragment_support_lost[raw_id])
-            state["release_score"] = max(float(state.get("release_score", 0.0)), release_score)
-            state["support_lost"] = bool(state.get("support_lost", False) or support_lost)
-            state["age"] = int(state.get("age", 0)) + 1
-            self._physical_fragment_states[persistent_label] = state
-
-        self._physical_fragment_labels = persistent
-        if bool((persistent > 0).any()):
-            return persistent
-        return raw_particle_labels
 
     def set_surface_normals(self, all_normals: Tensor):
         """Store surface normals and pass to the graph builder.
@@ -636,13 +587,10 @@ class ManifoldSimulator:
         self.graph.set_normals(surf_normals)
         print(f"[ManifoldSim] Surface normals set: {surf_normals.shape[0]} vectors")
 
-    # ================================================================
-    # Main frame update
-    # ================================================================
-
     @torch.no_grad()
     def step_rendering(self) -> bool:
         """Full frame: physics → fracture → rendering."""
+        self._reset_frame_fragment_event_stats()
 
         # --- Physics substeps ---
         dt_base = self.mpm.dt
@@ -670,10 +618,26 @@ class ManifoldSimulator:
         torch.cuda.empty_cache()
 
         # --- Fracture update on Gaussian manifold ---
-        self._step_fracture()
+        burst_iters = self._fracture_iterations_this_frame()
+        fragment_detected_in_burst = False
+        self._fracture_burst_active = burst_iters > 1
+        try:
+            for burst_idx in range(burst_iters):
+                self._step_fracture()
+                if (
+                    burst_iters > 1
+                    and burst_idx >= 1
+                    and self.fragment_manager is not None
+                    and self._gravity_drop_contacted
+                ):
+                    self._detect_fragments()
+                    fragment_detected_in_burst = True
+        finally:
+            self._fracture_burst_active = False
 
         # --- Fragment detection ---
-        if (self.fragment_manager is not None
+        if (not fragment_detected_in_burst
+                and self.fragment_manager is not None
                 and self._gravity_drop_contacted
                 and self.frame_count > 0
                 and self.frame_count % self.fragment_detect_every == 0):
@@ -715,7 +679,11 @@ class ManifoldSimulator:
         # Phase 2: full MPM physics
         if self._gravity_drop and self._gravity_drop_contacted:
             frames_since = getattr(self, '_impact_frame_count', 0)
-            if frames_since < 5:
+            if self.material_family == "diffuse_damage":
+                # Soft elastomers should keep post-impact kinetic energy so
+                # the MPM elasticity can visibly squash and recover.
+                self.mpm.damping = 0.997 if frames_since < 5 else 0.9995
+            elif frames_since < 5:
                 self.mpm.damping = 0.93 + 0.012 * frames_since
             else:
                 self.mpm.damping = 0.999
@@ -724,6 +692,8 @@ class ManifoldSimulator:
 
         # Compute stress with damage degradation
         c_vol = self._get_volumetric_damage()
+        self._last_volumetric_damage_max = float(c_vol.max().item()) if c_vol.numel() else 0.0
+        self._last_volumetric_damage_mean = float(c_vol.mean().item()) if c_vol.numel() else 0.0
         stress = self.elasticity(self.F, c=c_vol)
         E = (torch.exp(self.elasticity.log_E).item()
              if hasattr(self.elasticity, 'log_E') else 1e6)
@@ -738,6 +708,10 @@ class ManifoldSimulator:
         else:
             self.x_mpm, self.v_mpm, self.C, self.F = self.mpm.p2g2p(
                 self.x_mpm, self.v_mpm, self.C, self.F, stress)
+
+        self._apply_soft_elastic_contact_response(dt)
+        self._apply_shape_matching(dt)
+        self._apply_soft_elastic_squash(dt)
 
         # Velocity & F clamping
         v_limit = 0.4 * self.mpm.dx / dt
@@ -792,6 +766,10 @@ class ManifoldSimulator:
                     / float(self.damage_feedback_ramp_frames),
                     1.0,
                 )
+        immediate_feedback = (
+            max(0.0, min(float(self.crack_volume_immediate_feedback), 1.0))
+            if self._gravity_drop_contacted else 0.0
+        )
 
         # Surface particles get direct damage from their Gaussian.
         c_surf = self.fracture_field.c * feedback_scale
@@ -855,10 +833,11 @@ class ManifoldSimulator:
             crack_feedback = torch.maximum(crack_feedback, c_surf[:n_assign])
 
         if bool(crack_feedback.max() > 0.0):
+            crack_feedback_scale = max(feedback_scale, 0.45 * immediate_feedback)
             crack_feedback = (
                 crack_feedback
                 * self.crack_volume_feedback_gain
-                * feedback_scale
+                * crack_feedback_scale
             ).clamp(0.0, 1.0)
             c_vol = torch.maximum(
                 c_vol,
@@ -928,275 +907,79 @@ class ManifoldSimulator:
                 )
 
             if bool(structural_floor.max() > 0.0):
+                structural_feedback_scale = max(feedback_scale, immediate_feedback)
                 c_vol = torch.maximum(
                     c_vol,
                     self._project_surface_scalar_to_particles(
-                        structural_floor * feedback_scale,
+                        structural_floor * structural_feedback_scale,
                         interior_scale=1.0,
                     ),
                 )
 
         return c_vol
 
-    def _step_fragmented_physics(self, stress: Tensor, dt: float):
-        """Per-fragment MPM physics."""
-        # Map Gaussian fragments back to MPM particles
-        surf_frag_ids = self.fragment_manager.fragment_ids
-        raw_mpm_frag_ids = self._map_surface_labels_to_particles(surf_frag_ids)
-        mpm_frag_ids = self._update_physical_fragment_registry(raw_mpm_frag_ids)
+    def _get_surface_volume_damage_proxy(self, n_surf: int) -> Optional[Tensor]:
+        """Current narrow-band damage proxy used to approve surface fragment birth."""
+        if self.fracture_field.c is None or n_surf <= 0:
+            self._last_surface_volume_damage_proxy_max = 0.0
+            self._last_surface_volume_damage_proxy_mean = 0.0
+            return None
 
-        # Per-fragment P2G2P
-        for frag_id in mpm_frag_ids.unique(sorted=True).tolist():
-            frag_mask = mpm_frag_ids == frag_id
-            frag_idx = torch.where(frag_mask)[0]
-            if len(frag_idx) < 10:
-                self.v_mpm[frag_idx] += dt * self.mpm.gravity.unsqueeze(0)
-                self.x_mpm[frag_idx] += self.v_mpm[frag_idx] * dt
-                self.x_mpm[frag_idx] = self.x_mpm[frag_idx].clamp(
-                    self.mpm.clip_bound, 1.0 - self.mpm.clip_bound)
-                continue
-            self.x_mpm, self.v_mpm, self.C, self.F = self.mpm.p2g2p_subset(
-                self.x_mpm, self.v_mpm, self.C, self.F, stress, frag_idx)
+        n = min(int(n_surf), int(self.fracture_field.c.shape[0]))
+        if n <= 0:
+            self._last_surface_volume_damage_proxy_max = 0.0
+            self._last_surface_volume_damage_proxy_mean = 0.0
+            return None
 
-        self._apply_physical_fragment_release_drift(mpm_frag_ids, dt)
-        self.mpm.time += dt
-
-    def _apply_physical_fragment_release_drift(self, mpm_frag_ids: Tensor, dt: float) -> None:
-        """Apply a small physical gap / release drift to support-lost fragments."""
-        if self.fragment_manager is None or self.fragment_manager.n_fragments <= 1:
-            return
-        if self.fragment_physical_release_frames <= 0:
-            return
-        if self.fragment_physical_gap_scale <= 0.0 and self.fragment_physical_release_velocity <= 0.0:
-            return
-        if self._fragment_activation_frame < 0:
-            return
-
-        frames_since = max(self.frame_count - self._fragment_activation_frame, 0)
-        if frames_since > self.fragment_physical_release_frames:
-            return
-        taper = 1.0 - (frames_since / max(float(self.fragment_physical_release_frames), 1.0))
-        base_mask = mpm_frag_ids == 0
-        if not bool(base_mask.any()):
-            return
-        base_com = self.x_mpm[base_mask].mean(dim=0)
-
-        for frag_id in mpm_frag_ids.unique(sorted=True).tolist():
-            if frag_id <= 0:
-                continue
-            mask = mpm_frag_ids == frag_id
-            if int(mask.sum().item()) < 8:
-                continue
-            state = self._physical_fragment_states.get(frag_id, {})
-            release_score = float(state.get("release_score", 0.0))
-            support_lost = bool(state.get("support_lost", False))
-            if not support_lost and release_score < 0.72:
-                continue
-
-            frag_com = self.x_mpm[mask].mean(dim=0)
-            direction = frag_com - base_com
-            direction[2] -= self.fragment_physical_downward_bias * (0.65 + 0.85 * release_score)
-            direction = self._safe_vector_normalize(direction.unsqueeze(0)).squeeze(0)
-            if float(direction.norm().item()) < 1e-8:
-                direction = torch.tensor([0.0, 0.0, -1.0], device=self.x_mpm.device)
-
-            gap_step = self.fragment_physical_gap_scale * taper * (1.0 + 1.25 * release_score)
-            vel_step = self.fragment_physical_release_velocity * taper * (0.55 + 0.95 * release_score)
-            if gap_step > 0.0:
-                self.x_mpm[mask] = self.x_mpm[mask] + direction.unsqueeze(0) * gap_step
-            if vel_step > 0.0:
-                self.v_mpm[mask] = self.v_mpm[mask] + direction.unsqueeze(0) * vel_step
-
-        self.x_mpm = self.x_mpm.clamp(self.mpm.clip_bound, 1.0 - self.mpm.clip_bound)
-
-    # ================================================================
-    # Fracture step (Gaussian manifold)
-    # ================================================================
-
-    @staticmethod
-    def _robust_normalize(values: Tensor, quantile: float = 0.95) -> Tensor:
-        """Normalize a nonnegative field by a robust upper quantile."""
-        q = float(min(max(quantile, 0.5), 0.999))
-        scale = torch.quantile(values.detach(), q).clamp(min=1e-8)
-        return (values / scale).clamp(0.0, 2.0)
-
-    def _build_effective_fracture_drive(
-        self,
-        psi_mpm: Tensor,
-        stress: Optional[Tensor],
-    ) -> Tensor:
-        """
-        Build a fracture drive that is not locked to pure contact tension.
-
-        Mix tensile energy with deviatoric stress, principal tensile stress,
-        and relative kinetic activity so impact waves can continue driving
-        a narrow crack band after the initial contact patch.
-        """
-        drive = self.drive_tension_weight * self._robust_normalize(psi_mpm, 0.90)
-
-        if stress is not None:
-            S = 0.5 * (stress + stress.transpose(1, 2))
-            S = torch.nan_to_num(S, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1e8, 1e8)
-            tr = torch.diagonal(S, dim1=1, dim2=2).sum(dim=1) / 3.0
-            I = torch.eye(3, device=S.device).unsqueeze(0)
-            dev = S - tr.view(-1, 1, 1) * I
-            von_mises = torch.sqrt(
-                torch.clamp(1.5 * (dev ** 2).sum(dim=(1, 2)), min=0.0))
-            try:
-                sigma1 = torch.linalg.eigvalsh(S)[:, -1].clamp(min=0.0)
-            except RuntimeError:
-                sigma1 = torch.diagonal(S, dim1=1, dim2=2).max(dim=1).values.clamp(min=0.0)
-
-            drive = drive + (
-                self.drive_shear_weight
-                * self._robust_normalize(von_mises, 0.92)
-            )
-            drive = drive + (
-                self.drive_principal_weight
-                * self._robust_normalize(sigma1, 0.92)
+        proxy = self.fracture_field.c[:n].clamp(0.0, 1.0).clone()
+        if self._last_phase_cut_gate is not None:
+            proxy = torch.maximum(
+                proxy,
+                0.62 * self._last_phase_cut_gate[:n].clamp(0.0, 1.0),
             )
 
-        if self.v_mpm is not None:
-            v_rel = self.v_mpm - self.v_mpm.mean(dim=0, keepdim=True)
-            speed_rel = v_rel.norm(dim=1)
-            drive = drive + (
-                self.drive_kinetic_weight
-                * self._robust_normalize(speed_rel, 0.95)
-            )
+        crack_front = getattr(self.fracture_field, "crack_front", None)
+        if crack_front is not None:
+            visited = getattr(crack_front, "visited_mask", None)
+            if visited is not None:
+                proxy = torch.maximum(
+                    proxy,
+                    visited[:n].float() * self.crack_volume_visited_floor,
+                )
+            tips = getattr(crack_front, "tip_mask", None)
+            if tips is not None:
+                proxy = torch.maximum(
+                    proxy,
+                    tips[:n].float() * self.crack_volume_tip_floor,
+                )
 
-        return drive
+        if self.fracture_field.a is not None:
+            opening = self.fracture_field.a[:n].clamp(min=0.0)
+            if bool(opening.max() > 0.0):
+                opening_scale = torch.quantile(opening.detach(), 0.85).clamp(min=1e-6)
+                opening_norm = (opening / opening_scale).clamp(0.0, 1.0)
+                proxy = torch.maximum(
+                    proxy,
+                    (
+                        self.fracture_field.c[:n].clamp(0.0, 1.0)
+                        + self.crack_volume_opening_gain * opening_norm
+                    ).clamp(0.0, 1.0),
+                )
 
-    @staticmethod
-    def _safe_vector_normalize(vectors: Tensor) -> Tensor:
-        norm = vectors.norm(dim=1, keepdim=True)
-        return torch.where(
-            norm > 1e-8,
-            vectors / norm.clamp(min=1e-8),
-            torch.zeros_like(vectors),
-        )
+        if self.fragment_manager is not None:
+            for attr, scale in (
+                ("last_authoritative_cut_mask", self.volumetric_auth_damage_floor),
+                ("last_cut_core_mask", 0.78 * self.volumetric_auth_damage_floor),
+                ("last_closure_candidate_mask", 0.86 * self.volumetric_detached_damage_floor),
+            ):
+                mask = getattr(self.fragment_manager, attr, None)
+                if mask is not None and mask.shape[0] >= n:
+                    proxy = torch.maximum(proxy, mask[:n].float() * float(scale))
 
-    def _build_growth_direction(
-        self,
-        stress_dir: Optional[Tensor],
-        x_surf_world: Tensor,
-        impact_center_world: Optional[Tensor],
-    ) -> Tensor:
-        if stress_dir is None:
-            growth_dir = torch.zeros_like(x_surf_world)
-        else:
-            growth_dir = self._safe_vector_normalize(stress_dir)
-
-        if impact_center_world is not None:
-            radial = self._safe_vector_normalize(
-                x_surf_world - impact_center_world.unsqueeze(0))
-            if stress_dir is None:
-                growth_dir = radial
-            else:
-                growth_dir = self._safe_vector_normalize(0.35 * growth_dir + 0.65 * radial)
-
-        return growth_dir
-
-    def _apply_sentence_crack_style_drive(
-        self,
-        x_surf_world: Tensor,
-        init_score: Tensor,
-        growth_drive: Tensor,
-        growth_dir: Tensor,
-        impact_center_world: Optional[Tensor],
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Shape impact drive into sentence-level crack motifs.
-
-        This is a graphics-side controller layered on top of physical stress:
-        it only biases where the surface crack front can run. Material priors
-        still control whether those cracks can detach fragments.
-        """
-        style = self.crack_style
-        if (
-            impact_center_world is None
-            or style in {"material_default", "diffuse_microcrack"}
-            or x_surf_world.numel() == 0
-        ):
-            if style == "diffuse_microcrack":
-                return 0.45 * init_score, 0.38 * growth_drive, growth_dir
-            return init_score, growth_drive, growth_dir
-
-        rel = x_surf_world - impact_center_world.unsqueeze(0)
-        extent = x_surf_world.max(dim=0).values - x_surf_world.min(dim=0).values
-        diag = extent.norm().clamp(min=1e-6)
-        planar = rel[:, :2]
-        planar_r = planar.norm(dim=1).clamp(min=1e-8)
-        r_norm = (planar_r / (0.45 * diag)).clamp(0.0, 1.0)
-        theta = torch.atan2(planar[:, 1], planar[:, 0])
-        radial = torch.zeros_like(rel)
-        radial[:, :2] = planar / planar_r.unsqueeze(1).clamp(min=1e-8)
-        upward = torch.zeros_like(rel)
-        upward[:, 2] = 1.0
-        tangent = torch.zeros_like(rel)
-        tangent[:, 0] = -radial[:, 1]
-        tangent[:, 1] = radial[:, 0]
-
-        if style == "radial_shatter":
-            ray_count = 14.0
-            phase = 0.45
-            ray = (0.5 + 0.5 * torch.cos(ray_count * theta + phase)).clamp(0.0, 1.0)
-            ray = ray.pow(2.3)
-            near = torch.exp(-0.5 * (planar_r / (0.15 * diag)).pow(2.0))
-            far_gain = (0.16 + 0.84 * r_norm).clamp(0.0, 1.0)
-            ray_drive = (ray * far_gain + 0.34 * near).clamp(0.0, 1.0)
-            growth_drive = torch.maximum(growth_drive, 0.94 * ray_drive)
-            init_score = torch.maximum(init_score, 0.74 * near * (0.30 + 0.70 * ray))
-            growth_dir = self._safe_vector_normalize(1.70 * radial + 0.18 * upward)
-        elif style == "spiderweb_branching":
-            ray = (0.5 + 0.5 * torch.cos(9.0 * theta + 0.25)).clamp(0.0, 1.0).pow(2.0)
-            rings = (0.5 + 0.5 * torch.cos(30.0 * r_norm + 0.35)).clamp(0.0, 1.0).pow(2.2)
-            web = torch.maximum(0.88 * ray, 0.82 * rings) * (0.16 + 0.84 * r_norm)
-            near = torch.exp(-0.5 * (planar_r / (0.16 * diag)).pow(2.0))
-            growth_drive = torch.maximum(growth_drive, 0.76 * web.clamp(0.0, 1.0))
-            init_score = torch.maximum(init_score, 0.48 * near * (0.45 + 0.55 * ray))
-            tangent_sign = torch.sign(torch.sin(9.0 * theta + 0.25))
-            tangent_sign = torch.where(
-                tangent_sign.abs() > 0,
-                tangent_sign,
-                torch.ones_like(tangent_sign),
-            )
-            tangent = tangent * tangent_sign.unsqueeze(1)
-            ring_mix = (0.25 + 0.75 * rings).unsqueeze(1)
-            ray_mix = (0.35 + 0.65 * ray).unsqueeze(1)
-            growth_dir = self._safe_vector_normalize(
-                0.78 * ray_mix * radial
-                + 0.66 * ring_mix * tangent
-                + 0.18 * upward
-            )
-        elif style == "single_smooth":
-            angle = torch.tensor(0.35, dtype=x_surf_world.dtype, device=x_surf_world.device)
-            axis = torch.stack([torch.cos(angle), torch.sin(angle)])
-            tangent = planar @ axis
-            cross = planar[:, 0] * axis[1] - planar[:, 1] * axis[0]
-            width = 0.045 * diag
-            line = torch.exp(-0.5 * (cross / width).pow(2.0))
-            forward = (tangent > (-0.10 * diag)).float()
-            line_drive = line * forward * (0.25 + 0.75 * r_norm)
-            growth_drive = torch.maximum(0.38 * growth_drive, 0.70 * line_drive)
-            near = torch.exp(-0.5 * (planar_r / (0.12 * diag)).pow(2.0))
-            init_score = torch.maximum(init_score, 0.36 * near * line)
-            axis3 = torch.zeros_like(rel)
-            axis3[:, 0] = axis[0]
-            axis3[:, 1] = axis[1]
-            growth_dir = self._safe_vector_normalize(axis3 + 0.16 * upward)
-        elif style == "chunky_crumble":
-            noise = torch.sin(
-                31.0 * x_surf_world[:, 0]
-                - 17.0 * x_surf_world[:, 1]
-                + 23.0 * x_surf_world[:, 2]
-            )
-            grain = (0.5 + 0.5 * noise).clamp(0.0, 1.0)
-            broad = torch.exp(-0.5 * (planar_r / (0.26 * diag)).pow(2.0))
-            crumble = (0.45 * broad + 0.55 * grain * (0.25 + 0.75 * r_norm)).clamp(0.0, 1.0)
-            growth_drive = torch.maximum(growth_drive, 0.58 * crumble)
-            init_score = torch.maximum(init_score, 0.28 * broad * (0.55 + 0.45 * grain))
-            growth_dir = self._safe_vector_normalize(0.60 * radial + 0.38 * tangent + 0.18 * upward)
-
-        return init_score.clamp(0.0, 1.0), growth_drive.clamp(0.0, 1.0), growth_dir
+        proxy = proxy.clamp(0.0, 1.0)
+        self._last_surface_volume_damage_proxy_max = float(proxy.max().item()) if proxy.numel() else 0.0
+        self._last_surface_volume_damage_proxy_mean = float(proxy.mean().item()) if proxy.numel() else 0.0
+        return proxy
 
     @torch.no_grad()
     def _step_fracture(self):
@@ -1222,6 +1005,9 @@ class ManifoldSimulator:
         Gc = getattr(self.elasticity, 'Gc', 60000.0)
         l0 = getattr(self.elasticity, 'l0', 0.025)
         psi_mpm = psi_mpm.clamp(0.0, 50.0 * Gc / (2.0 * l0))
+        phase_y_mpm = (
+            2.0 * float(l0) * psi_mpm / max(float(Gc), 1e-8)
+        ).clamp(0.0, 50.0)
         drive_mpm = self._build_effective_fracture_drive(
             psi_mpm, self._last_stress)
 
@@ -1231,6 +1017,28 @@ class ManifoldSimulator:
 
         raw_energy_gauss = self.physics_projector.project_scalar(
             psi_mpm, self.x_mpm, x_surf_mpm, frame=self.frame_count)
+        phase_y_gauss = self.physics_projector.project_scalar(
+            phase_y_mpm, self.x_mpm, x_surf_mpm, frame=self.frame_count)
+        phase_y_gauss = phase_y_gauss.clamp(0.0, 50.0)
+        phase_seed_gate = self._phase_y_gate(
+            phase_y_gauss, self.phase_y_seed_threshold)
+        phase_advance_gate = self._phase_y_gate(
+            phase_y_gauss, self.phase_y_advance_threshold)
+        phase_cut_gate = self._phase_y_gate(
+            phase_y_gauss, self.phase_y_cut_threshold)
+        damage_memory_gate = self._damage_memory_gate(
+            self.fracture_field.c if self.fracture_field is not None else None)
+        if damage_memory_gate.numel() > 0:
+            phase_seed_gate = torch.maximum(phase_seed_gate, damage_memory_gate)
+            phase_advance_gate = torch.maximum(phase_advance_gate, damage_memory_gate)
+            phase_cut_gate = torch.maximum(
+                phase_cut_gate,
+                (0.65 * damage_memory_gate + 0.35 * phase_advance_gate).clamp(0.0, 1.0),
+            )
+        self._last_phase_y_gauss = phase_y_gauss.detach()
+        self._last_phase_seed_gate = phase_seed_gate.detach()
+        self._last_phase_advance_gate = phase_advance_gate.detach()
+        self._last_phase_cut_gate = phase_cut_gate.detach()
         drive_gauss = self.physics_projector.project_scalar(
             drive_mpm, self.x_mpm, x_surf_mpm, frame=self.frame_count)
         growth_drive = self._robust_normalize(drive_gauss, 0.90).clamp(0.0, 1.0)
@@ -1265,20 +1073,32 @@ class ManifoldSimulator:
             growth_dir,
             impact_center_world,
         )
-
         # Deformation gradient on Gaussians
         F_gauss = self.physics_projector.project_matrix(
             self.F, self.x_mpm, x_surf_mpm, frame=self.frame_count)
 
-        # Update fracture field
-        self.fracture_field.update(
-            positions=x_surf_world,
-            init_score=init_score,
-            growth_drive=growth_drive,
-            growth_dir=growth_dir,
-            F_gaussian=F_gauss,
-            impact_center=impact_center_world,
-        )
+        # Update fracture field.  Brittle impact burst uses more internal front
+        # advances per visible frame without changing the external frame count.
+        old_front_substeps = int(getattr(self.fracture_field, "front_substeps", 1))
+        if bool(getattr(self, "_fracture_burst_active", False)):
+            self.fracture_field.front_substeps = max(
+                old_front_substeps,
+                int(self.impact_fracture_burst_front_substeps),
+            )
+        try:
+            self.fracture_field.update(
+                positions=x_surf_world,
+                init_score=init_score,
+                growth_drive=growth_drive,
+                growth_dir=growth_dir,
+                F_gaussian=F_gauss,
+                impact_center=impact_center_world,
+                phase_gate=phase_advance_gate,
+                seed_phase_gate=phase_seed_gate,
+            )
+        finally:
+            if bool(getattr(self, "_fracture_burst_active", False)):
+                self.fracture_field.front_substeps = old_front_substeps
 
     # ================================================================
     # Fragment detection
@@ -1310,6 +1130,7 @@ class ManifoldSimulator:
             return
 
         crack_front = getattr(self.fracture_field, "crack_front", None)
+        self.fragment_manager.impact_release_gain = float(getattr(self, '_impact_release_gain', 1.0))
         tip_mask = crack_front.tip_mask if crack_front is not None else None
         recent_front_mask = None
         family = getattr(self.fragment_manager, 'material_family', 'neutral_reference')
@@ -1327,6 +1148,45 @@ class ManifoldSimulator:
         crack_normal = self.fracture_field.n if self.fracture_field.n is not None else None
         x_surf_world = self.mapper.mpm_to_world(self.x_mpm[self.surface_mask])
         N_surf = min(self.fracture_field.c.shape[0], x_surf_world.shape[0])
+        phase_cut_gate = (
+            self._last_phase_cut_gate[:N_surf]
+            if self._last_phase_cut_gate is not None
+            else None
+        )
+        surface_volume_damage = self._get_surface_volume_damage_proxy(N_surf)
+        frames_since_impact = int(getattr(self, "_impact_frame_count", 10**6))
+        impact_closure_active = bool(
+            self.crack_connected_release_only
+            and self.material_family == "sharp_brittle"
+            and self.crack_style in {
+                "radial_shatter",
+                "spiderweb",
+            }
+            and self._gravity_drop_contacted
+            and frames_since_impact <= int(
+                getattr(self.fragment_manager, "configured_impact_closure_active_frames", 2)
+            )
+        )
+        self.fragment_manager.impact_closure_active = impact_closure_active
+        if impact_closure_active:
+            default_target = 0.64 if self.crack_style == "radial_shatter" else 0.50
+            configured_target = float(
+                getattr(self.fragment_manager, "configured_impact_closure_target_ratio", -1.0)
+            )
+            target = configured_target if configured_target >= 0.0 else default_target
+            default_max_patches = 96 if self.crack_style == "radial_shatter" else 56
+            configured_max_patches = int(
+                getattr(self.fragment_manager, "configured_impact_closure_max_patches", -1)
+            )
+            self.fragment_manager.impact_closure_target_ratio = target
+            self.fragment_manager.impact_closure_max_patches = (
+                configured_max_patches
+                if configured_max_patches >= 0
+                else default_max_patches
+            )
+        else:
+            self.fragment_manager.impact_closure_target_ratio = 0.0
+            self.fragment_manager.impact_closure_max_patches = 0
         n_frags = self.fragment_manager.detect_fragments(
             self.graph,
             self.fracture_field.c,
@@ -1336,7 +1196,10 @@ class ManifoldSimulator:
             recent_front_mask=recent_front_mask,
             crack_normal=crack_normal,
             crack_tangent=crack_tangent,
+            phase_gate=phase_cut_gate,
+            volume_damage=surface_volume_damage,
         )
+        self._accumulate_frame_fragment_event_stats()
 
         if n_frags > 1:
             self.fracture_field.f = self.fragment_manager.fragment_ids.clone()
@@ -1344,12 +1207,12 @@ class ManifoldSimulator:
             if not self.fragmentation_active:
                 self.fragmentation_active = True
                 self._fragment_activation_frame = self.frame_count
-                apply_impulse = True
+                apply_impulse = not self.crack_connected_release_only
             elif (
                 self._fragment_activation_frame >= 0
                 and (self.frame_count - self._fragment_activation_frame) < self.fragment_impulse_boost_frames
             ):
-                apply_impulse = True
+                apply_impulse = not self.crack_connected_release_only
 
             # Apply separation impulse
             if apply_impulse and hasattr(self, '_impact_center'):
@@ -1382,242 +1245,6 @@ class ManifoldSimulator:
     # ================================================================
     # Gaussian update for rendering
     # ================================================================
-
-    def _current_fragment_impulse_strength(self) -> float:
-        if not self.fragmentation_active or self._fragment_activation_frame < 0:
-            return self.fragment_impulse_strength
-        frames_since = max(self.frame_count - self._fragment_activation_frame, 0)
-        if frames_since >= self.fragment_impulse_boost_frames:
-            return self.fragment_impulse_strength
-        decay = self.fragment_impulse_decay ** frames_since
-        return self.fragment_impulse_strength * self.fragment_event_boost * max(decay, 0.45)
-
-    def _current_fragment_visual_boost(self) -> float:
-        if not self.fragmentation_active or self._fragment_activation_frame < 0:
-            return 1.0
-        frames_since = max(self.frame_count - self._fragment_activation_frame, 0)
-        if frames_since >= self.fragment_impulse_boost_frames:
-            return 1.0
-        decay = self.fragment_impulse_decay ** frames_since
-        return 1.0 + (self.fragment_event_boost - 1.0) * max(decay, 0.50)
-
-    def _ensure_render_fragment_registry(self, count: int, device) -> None:
-        if (self._render_fragment_labels is not None
-                and self._render_fragment_labels.shape[0] == count
-                and self._render_fragment_labels.device == device):
-            return
-        self._render_fragment_labels = torch.zeros(
-            count, dtype=torch.long, device=device
-        )
-        self._render_fragment_states = {}
-        self._next_render_fragment_id = 1
-
-    def _advance_render_fragment_states(self) -> None:
-        if not self._render_fragment_states:
-            return
-        gravity_step = float(self.fragment_render_gravity)
-        damp_z = float(self.fragment_render_damping)
-        damp_xy = float(self.fragment_render_lateral_damping)
-        max_detach = 0.45
-        if self.material_family == "rough_quasi_brittle":
-            max_detach = 0.55
-        elif self.material_family == "brittle_moderate":
-            max_detach = 0.40
-        for state in self._render_fragment_states.values():
-            vel = state["velocity"]
-            vel = vel.clone()
-            release_score = float(state.get("release_score", 0.0))
-            support_lost = bool(state.get("support_lost", False))
-            local_gravity = gravity_step * (1.0 + (0.85 * release_score if support_lost else 0.0))
-            local_damp_z = max(0.90, damp_z - (0.05 * release_score if support_lost else 0.0))
-            vel[:2] *= damp_xy
-            vel[2] = vel[2] * local_damp_z - local_gravity
-            state["velocity"] = vel
-            new_offset = state["offset"] + vel
-            offset_norm = float(new_offset.norm().item())
-            if offset_norm > max_detach:
-                new_offset = new_offset * (max_detach / max(offset_norm, 1e-8))
-                vel = vel * 0.55
-                state["velocity"] = vel
-            state["offset"] = new_offset
-            state["age"] = int(state["age"]) + 1
-
-    def _register_render_fragments(
-        self,
-        positions: Tensor,
-        fragment_ids: Optional[Tensor],
-        opening: Optional[Tensor] = None,
-    ) -> None:
-        if fragment_ids is None:
-            return
-        if self._render_fragment_labels is None:
-            self._ensure_render_fragment_registry(positions.shape[0], positions.device)
-
-        active_labels = fragment_ids.unique(sorted=True)
-        impact_center_world = None
-        if hasattr(self, '_impact_center'):
-            impact_center_world = self.mapper.mpm_to_world(
-                self._impact_center.unsqueeze(0)
-            ).squeeze(0)
-        else:
-            impact_center_world = positions.mean(dim=0)
-        base_mask = fragment_ids == 0
-        base_com = positions[base_mask].mean(dim=0) if bool(base_mask.any()) else impact_center_world
-
-        for frag_id in active_labels.tolist():
-            if frag_id <= 0:
-                continue
-            mask = fragment_ids == frag_id
-            frag_size = int(mask.sum().item())
-            if frag_size < self.fragment_render_min_size:
-                continue
-
-            overlap_vals, overlap_counts = self._render_fragment_labels[mask].unique(
-                return_counts=True
-            )
-            persistent_label = None
-            if overlap_vals.numel() > 0:
-                overlap_mask = overlap_vals > 0
-                if bool(overlap_mask.any()):
-                    overlap_vals = overlap_vals[overlap_mask]
-                    overlap_counts = overlap_counts[overlap_mask]
-                    best_idx = int(torch.argmax(overlap_counts).item())
-                    best_count = int(overlap_counts[best_idx].item())
-                    if best_count / max(frag_size, 1) >= self.fragment_render_overlap_threshold:
-                        persistent_label = int(overlap_vals[best_idx].item())
-
-            frag_pos = positions[mask]
-            frag_com = frag_pos.mean(dim=0)
-            release_score = 0.0
-            support_lost = False
-            if (self.fragment_manager is not None
-                    and frag_id < len(self.fragment_manager.fragment_release_scores)):
-                release_score = float(self.fragment_manager.fragment_release_scores[frag_id])
-            if (self.fragment_manager is not None
-                    and frag_id < len(self.fragment_manager.fragment_support_lost)):
-                support_lost = bool(self.fragment_manager.fragment_support_lost[frag_id])
-
-            direction = frag_com - impact_center_world
-            if support_lost:
-                direction = frag_com - base_com
-                direction[2] -= 0.28 + 0.48 * release_score
-            else:
-                direction[2] += 0.22 * self.fragment_upward_bias
-            direction = self._safe_vector_normalize(direction.unsqueeze(0)).squeeze(0)
-            if float(direction.norm().item()) < 1e-8:
-                direction = torch.tensor([0.0, 0.0, -1.0 if support_lost else 1.0], device=positions.device)
-
-            size_ratio = frag_size / max(float(positions.shape[0]), 1.0)
-            size_gain = max(0.85, 1.70 - 10.0 * size_ratio)
-            opening_mag = 0.0
-            if opening is not None:
-                opening_mag = float(opening[mask].mean().item())
-            event_gain = self._current_fragment_visual_boost()
-            base_gap = (
-                self.fragment_visual_offset_scale
-                * self.fragment_offset_gain
-                * self.fragment_render_gap_scale
-                * size_gain
-                * max(event_gain, 1.0)
-                * (1.0 + 4.0 * opening_mag)
-            )
-            vel_mag = (
-                self.fragment_visual_offset_scale
-                * self.fragment_render_velocity_scale
-                * size_gain
-                * (0.55 + 0.35 * max(event_gain - 1.0, 0.0) + 6.0 * opening_mag)
-            )
-            if support_lost:
-                base_gap *= 1.0 + 0.95 * release_score
-                vel_mag *= 1.0 + 1.35 * release_score
-
-            if persistent_label is None:
-                persistent_label = self._next_render_fragment_id
-                self._next_render_fragment_id += 1
-                self._render_fragment_states[persistent_label] = {
-                    "offset": direction * base_gap,
-                    "velocity": direction * vel_mag,
-                    "age": 0,
-                    "release_score": release_score,
-                    "support_lost": support_lost,
-                }
-            else:
-                state = self._render_fragment_states.get(persistent_label)
-                if state is not None:
-                    target_vel = direction * vel_mag
-                    state["velocity"] = 0.72 * state["velocity"] + 0.28 * target_vel
-                    state["offset"] = state["offset"] + direction * (0.20 * base_gap)
-                    state["release_score"] = max(float(state.get("release_score", 0.0)), release_score)
-                    state["support_lost"] = bool(state.get("support_lost", False) or support_lost)
-
-            self._render_fragment_labels[mask] = persistent_label
-
-    def _apply_persistent_fragment_separation(
-        self,
-        positions: Tensor,
-        fragment_ids: Optional[Tensor],
-        opening: Optional[Tensor] = None,
-    ) -> Tensor:
-        self._ensure_render_fragment_registry(positions.shape[0], positions.device)
-        if fragment_ids is not None and bool((fragment_ids > 0).any()):
-            self._register_render_fragments(positions, fragment_ids, opening)
-
-        render_ids = self._render_fragment_labels.clone()
-        out = positions.clone()
-        if self._render_fragment_states:
-            for persistent_label, state in self._render_fragment_states.items():
-                mask = render_ids == persistent_label
-                if not bool(mask.any()):
-                    continue
-                out[mask] = out[mask] + state["offset"].unsqueeze(0)
-        self._advance_render_fragment_states()
-        return out, render_ids
-
-    def _apply_fragment_visual_offset(
-        self,
-        positions: Tensor,
-        frag_ids: Tensor,
-    ) -> Tensor:
-        if self.fragment_visual_offset_scale <= 0.0:
-            return positions
-        if self._fragment_activation_frame < 0:
-            return positions
-        if frag_ids is None or frag_ids.numel() == 0:
-            return positions
-
-        frames_since = max(self.frame_count - self._fragment_activation_frame, 0)
-        ramp = min((frames_since + 1) / float(self.fragment_visual_ramp_frames), 1.0)
-        offset_scale = self.fragment_visual_offset_scale * self.fragment_offset_gain * ramp
-        if frames_since < self.fragment_impulse_boost_frames:
-            offset_scale *= self._current_fragment_visual_boost()
-        if offset_scale <= 0.0:
-            return positions
-
-        out = positions.clone()
-        impact_center_world = None
-        if hasattr(self, '_impact_center'):
-            impact_center_world = self.mapper.mpm_to_world(
-                self._impact_center.unsqueeze(0)).squeeze(0)
-        else:
-            impact_center_world = positions.mean(dim=0)
-
-        unique_ids = frag_ids.unique(sorted=True)
-        total = float(max(frag_ids.shape[0], 1))
-        for frag_id in unique_ids.tolist():
-            if frag_id == 0:
-                continue
-            mask = frag_ids == frag_id
-            if not bool(mask.any()):
-                continue
-            frag_pos = positions[mask]
-            com = frag_pos.mean(dim=0)
-            direction = com - impact_center_world
-            direction[2] += 0.35 * self.fragment_upward_bias
-            norm = direction.norm().clamp(min=1e-8)
-            direction = direction / norm
-            strength = min(mask.sum().item() / total, 0.35)
-            out[mask] = out[mask] + direction.unsqueeze(0) * offset_scale * max(0.6, 1.4 - 2.0 * strength)
-        return out
 
     @torch.no_grad()
     def _update_gaussians(self):
@@ -1769,6 +1396,14 @@ class ManifoldSimulator:
         self._gravity_drop_contacted = True
         self.v_mpm[:] = self._v_com.unsqueeze(0)
         v_impact = self._v_com[2].item()
+        impact_speed = abs(float(v_impact))
+        self._soft_impact_speed = impact_speed
+        self._impact_release_gain = max(
+            0.75,
+            min(2.65, float(self.fracture_cfg.get('impact_release_gain', 1.0)) * (1.0 + 0.18 * impact_speed)),
+        )
+        if self.fragment_manager is not None:
+            self.fragment_manager.impact_release_gain = self._impact_release_gain
         print(f"  [IMPACT] Ground contact! v_impact={v_impact:.3f}")
 
         N = self.F.shape[0]
@@ -1809,15 +1444,16 @@ class ManifoldSimulator:
             H_multiplier=seed_H_multiplier,
         )
         print(f"  [IMPACT] seed_radius={seed_radius:.4f} "
-              f"seed_mag={seed_magnitude:.3f} Hx={seed_H_multiplier:.2f}")
+              f"seed_mag={seed_magnitude:.3f} Hx={seed_H_multiplier:.2f} "
+              f"release_gain={self._impact_release_gain:.2f}")
 
         # Post-impact physics adjustments
         g_vec = self.mpm.gravity.clone()
         g_vec[:] = 0.0
-        g_vec[2] = -400.0
+        g_vec[2] = -220.0 if self.material_family == "diffuse_damage" else -400.0
         self.mpm.gravity = g_vec
-        self.mpm.damping = 0.975
-        print(f"  [POST-IMPACT] gravity→[0,0,-400] damping→0.975")
+        self.mpm.damping = 0.995 if self.material_family == "diffuse_damage" else 0.975
+        print(f"  [POST-IMPACT] gravity→[0,0,{g_vec[2].item():.0f}] damping→{self.mpm.damping:.3f}")
 
     # ================================================================
     # Seismic loading
@@ -1877,6 +1513,12 @@ class ManifoldSimulator:
     ):
         """Apply impact: velocity impulse + damage seed."""
         device = self.x_mpm.device
+        self._impact_release_gain = max(
+            0.75,
+            min(2.65, float(self.fracture_cfg.get('impact_release_gain', 1.0)) * (0.85 + 0.18 * abs(float(impact_energy)))),
+        )
+        if self.fragment_manager is not None:
+            self.fragment_manager.impact_release_gain = self._impact_release_gain
         dists = (self.x_mpm - impact_center_mpm.unsqueeze(0)).norm(dim=1)
         influence = torch.exp(-dists ** 2 / (2 * impact_radius ** 2))
 
@@ -1910,11 +1552,42 @@ class ManifoldSimulator:
         c_max = c.max().item() if c is not None else 0.0
         c_mean = c.mean().item() if c is not None else 0.0
         n_cracked = (c > 0.3).sum().item() if c is not None else 0
+        phase_y_max = (
+            float(self._last_phase_y_gauss.max().item())
+            if self._last_phase_y_gauss is not None else 0.0
+        )
+        phase_y_mean = (
+            float(self._last_phase_y_gauss.mean().item())
+            if self._last_phase_y_gauss is not None else 0.0
+        )
+        phase_seed_gate_max = (
+            float(self._last_phase_seed_gate.max().item())
+            if self._last_phase_seed_gate is not None else 0.0
+        )
+        phase_advance_gate_max = (
+            float(self._last_phase_advance_gate.max().item())
+            if self._last_phase_advance_gate is not None else 0.0
+        )
+        phase_advance_gate_mean = (
+            float(self._last_phase_advance_gate.mean().item())
+            if self._last_phase_advance_gate is not None else 0.0
+        )
+        phase_cut_gate_max = (
+            float(self._last_phase_cut_gate.max().item())
+            if self._last_phase_cut_gate is not None else 0.0
+        )
         detached_distance = 0.0
         mean_detached_distance = 0.0
+        render_offset_distance = 0.0
+        render_mean_offset_distance = 0.0
         physical_detached_distance = 0.0
         physical_mean_detached_distance = 0.0
         physical_fragment_drop = 0.0
+        physical_release_displacement = 0.0
+        physical_mean_release_displacement = 0.0
+        physical_lateral_release_displacement = 0.0
+        physical_mean_lateral_release_displacement = 0.0
+        physical_fragment_lateral_spread = 0.0
         split_event_age = -1
         z_min = 0.0
         z_com = 0.0
@@ -1948,6 +1621,15 @@ class ManifoldSimulator:
                     ]
                     detached_distance = max(distances)
                     mean_detached_distance = sum(distances) / max(len(distances), 1)
+        if self._render_fragment_states:
+            offsets = []
+            for state in self._render_fragment_states.values():
+                offset = state.get("offset")
+                if offset is not None:
+                    offsets.append(float(offset.norm().item()))
+            if offsets:
+                render_offset_distance = max(offsets)
+                render_mean_offset_distance = sum(offsets) / max(len(offsets), 1)
         physical_n_frags = 0
         frag_ids_phys = None
         if (self._physical_fragment_labels is not None
@@ -1977,13 +1659,47 @@ class ManifoldSimulator:
                         float((com - base).norm().item())
                         for frag_id, com in coms[1:]
                     ]
+                    lateral_distances = [
+                        float((com[:2] - base[:2]).norm().item())
+                        for frag_id, com in coms[1:]
+                    ]
                     drops = [
                         max(float(base[2].item() - com[2].item()), 0.0)
                         for frag_id, com in coms[1:]
                     ]
                     physical_detached_distance = max(distances)
                     physical_mean_detached_distance = sum(distances) / max(len(distances), 1)
+                    physical_fragment_lateral_spread = (
+                        max(lateral_distances) if lateral_distances else 0.0
+                    )
                     physical_fragment_drop = max(drops) if drops else 0.0
+                    release_distances = []
+                    lateral_release_distances = []
+                    for frag_id, com in coms[1:]:
+                        state = self._physical_fragment_states.get(int(frag_id), {})
+                        birth_com = state.get("birth_com")
+                        birth_base_com = state.get("birth_base_com")
+                        if birth_com is None or birth_base_com is None:
+                            continue
+                        birth_rel = birth_com.to(com.device) - birth_base_com.to(com.device)
+                        current_rel = com - base
+                        release_distances.append(
+                            float((current_rel - birth_rel).norm().item())
+                        )
+                        lateral_release_distances.append(
+                            float((current_rel[:2] - birth_rel[:2]).norm().item())
+                        )
+                    if release_distances:
+                        physical_release_displacement = max(release_distances)
+                        physical_mean_release_displacement = (
+                            sum(release_distances) / max(len(release_distances), 1)
+                        )
+                    if lateral_release_distances:
+                        physical_lateral_release_displacement = max(lateral_release_distances)
+                        physical_mean_lateral_release_displacement = (
+                            sum(lateral_release_distances)
+                            / max(len(lateral_release_distances), 1)
+                        )
         n_frags_out = max(physical_n_frags, render_n_frags)
 
         return {
@@ -1995,14 +1711,35 @@ class ManifoldSimulator:
             "gravity_drop": bool(self._gravity_drop),
             "gravity_contacted": bool(self._gravity_drop_contacted),
             "gravity_ground_z": float(self._gravity_drop_ground_z),
+            "impact_release_gain": float(getattr(self, '_impact_release_gain', 1.0)),
             "c_max": c_max,
             "c_mean": c_mean,
             "n_cracked": n_cracked,
+            "phase_y_max": phase_y_max,
+            "phase_y_mean": phase_y_mean,
+            "phase_seed_gate_max": phase_seed_gate_max,
+            "phase_advance_gate_max": phase_advance_gate_max,
+            "phase_advance_gate_mean": phase_advance_gate_mean,
+            "phase_cut_gate_max": phase_cut_gate_max,
+            "phase_y_seed_threshold": float(self.phase_y_seed_threshold),
+            "phase_y_advance_threshold": float(self.phase_y_advance_threshold),
+            "phase_y_cut_threshold": float(self.phase_y_cut_threshold),
+            "volumetric_damage_max": float(self._last_volumetric_damage_max),
+            "volumetric_damage_mean": float(self._last_volumetric_damage_mean),
+            "surface_volume_damage_proxy_max": float(self._last_surface_volume_damage_proxy_max),
+            "surface_volume_damage_proxy_mean": float(self._last_surface_volume_damage_proxy_mean),
+            "rigid_angular_speed_max": float(self._last_rigid_angular_speed_max),
+            "rigid_angular_speed_mean": float(self._last_rigid_angular_speed_mean),
             "n_fragments": n_frags_out,
             "broken_edges": (self.fragment_manager.last_broken_edges
                               if self.fragment_manager else 0),
             "raw_components": (self.fragment_manager.last_raw_components
                                 if self.fragment_manager else 1),
+            "hard_detached_nodes": (self.fragment_manager.last_hard_detached_nodes
+                                     if self.fragment_manager else 0),
+            "new_detached_nodes": int(self._frame_fragment_stat("new_detached_nodes", 0)),
+            "detached_boundary_edges": (self.fragment_manager.last_detached_boundary_edges
+                                        if self.fragment_manager else 0),
             "promoted_components": (self.fragment_manager.last_promoted_components
                                      if self.fragment_manager else 0),
             "primary_promoted_components": (self.fragment_manager.last_primary_promoted_components
@@ -2013,6 +1750,28 @@ class ManifoldSimulator:
                                  if self.fragment_manager else 0),
             "cut_edges": (self.fragment_manager.last_cut_edges
                             if self.fragment_manager else 0),
+            "phase_cut_edges": (self.fragment_manager.last_phase_cut_edges
+                                  if self.fragment_manager else 0),
+            "phase_fragment_gate_max": (self.fragment_manager.last_phase_gate_max
+                                         if self.fragment_manager else 0.0),
+            "phase_fragment_gate_mean": (self.fragment_manager.last_phase_gate_mean
+                                          if self.fragment_manager else 0.0),
+            "phase_candidate_patches": int(self._frame_fragment_stat("phase_candidate_patches", 0)),
+            "phase_approved_patches": int(self._frame_fragment_stat("phase_approved_patches", 0)),
+            "phase_rejected_patches": int(self._frame_fragment_stat("phase_rejected_patches", 0)),
+            "phase_approved_nodes": int(self._frame_fragment_stat("phase_approved_nodes", 0)),
+            "phase_approval_score_max": float(self._frame_fragment_stat("phase_approval_score_max", 0.0)),
+            "phase_approval_score_mean": float(
+                self._frame_fragment_stat("phase_approval_score_weighted_sum", 0.0)
+                / max(float(self._frame_fragment_stat("phase_approved_patches", 0)), 1.0)
+            ),
+            "phase_approval_cvol_max": float(self._frame_fragment_stat("phase_approval_cvol_max", 0.0)),
+            "phase_approval_gate_max": float(self._frame_fragment_stat("phase_approval_gate_max", 0.0)),
+            "pseudo_thickness_mass": float(self._frame_fragment_stat("pseudo_thickness_mass", 0.0)),
+            "birth_phase_score": float(self._frame_fragment_stat("birth_phase_score", 0.0)),
+            "birth_cvol_max": float(self._frame_fragment_stat("birth_cvol_max", 0.0)),
+            "birth_phase_gate_max": float(self._frame_fragment_stat("birth_phase_gate_max", 0.0)),
+            "birth_phase_approved": bool(self._frame_fragment_stat("birth_phase_approved", False)),
             "cut_corridor_edges": (self.fragment_manager.last_cut_corridor_edges
                                     if self.fragment_manager else 0),
             "cross_edge_breaks": (self.fragment_manager.last_cross_edge_breaks
@@ -2051,31 +1810,26 @@ class ManifoldSimulator:
                                    if self.fragment_manager else 0.0),
             "closure_candidate_sizes": (self.fragment_manager.last_closure_candidate_sizes
                                          if self.fragment_manager else []),
-            "open_release_patches": (self.fragment_manager.last_open_release_patches
-                                      if self.fragment_manager else 0),
-            "open_release_nodes": (self.fragment_manager.last_open_release_nodes
-                                   if self.fragment_manager else 0),
-            "open_release_score_max": (self.fragment_manager.last_open_release_score_max
-                                       if self.fragment_manager else 0.0),
-            "catastrophic_release_patches": (self.fragment_manager.last_catastrophic_release_patches
-                                      if self.fragment_manager else 0),
-            "catastrophic_release_nodes": (self.fragment_manager.last_catastrophic_release_nodes
-                                   if self.fragment_manager else 0),
-            "catastrophic_release_score_max": (self.fragment_manager.last_catastrophic_release_score_max
-                                       if self.fragment_manager else 0.0),
-            "secondary_shatter_patches": (self.fragment_manager.last_secondary_shatter_patches
-                                      if self.fragment_manager else 0),
-            "secondary_shatter_nodes": (self.fragment_manager.last_secondary_shatter_nodes
-                                   if self.fragment_manager else 0),
-            "secondary_shatter_score_max": (self.fragment_manager.last_secondary_shatter_score_max
-                                       if self.fragment_manager else 0.0),
+            "open_release_patches": int(self._frame_fragment_stat("open_release_patches", 0)),
+            "open_release_nodes": int(self._frame_fragment_stat("open_release_nodes", 0)),
+            "open_release_score_max": float(self._frame_fragment_stat("open_release_score_max", 0.0)),
+            "impact_closure_patches": int(self._frame_fragment_stat("impact_closure_patches", 0)),
+            "impact_closure_nodes": int(self._frame_fragment_stat("impact_closure_nodes", 0)),
+            "impact_closure_score_max": float(self._frame_fragment_stat("impact_closure_score_max", 0.0)),
             "top_component_sizes": (self.fragment_manager.last_top_component_sizes
                                        if self.fragment_manager else []),
             "detached_distance": detached_distance,
             "mean_detached_distance": mean_detached_distance,
+            "render_offset_distance": render_offset_distance,
+            "render_mean_offset_distance": render_mean_offset_distance,
             "physical_detached_distance": physical_detached_distance,
             "physical_mean_detached_distance": physical_mean_detached_distance,
             "physical_fragment_drop": physical_fragment_drop,
+            "physical_release_displacement": physical_release_displacement,
+            "physical_mean_release_displacement": physical_mean_release_displacement,
+            "physical_lateral_release_displacement": physical_lateral_release_displacement,
+            "physical_mean_lateral_release_displacement": physical_mean_lateral_release_displacement,
+            "physical_fragment_lateral_spread": physical_fragment_lateral_spread,
             "split_event_age": split_event_age,
             "visible_shard_count": int(render_state.get("visible_shard_count", 0)),
             "interior_surface_count": int(render_state.get("interior_surface_count", 0)),

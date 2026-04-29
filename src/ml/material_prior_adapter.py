@@ -277,6 +277,13 @@ FAMILY_NAMES = (
     "neutral_reference",
 )
 
+FRAGMENT_CAPABLE_FAMILIES = {
+    "sharp_brittle",
+    "brittle_moderate",
+    "rough_quasi_brittle",
+    "neutral_reference",
+}
+
 
 FRACTURE_PRIOR_BOUNDS = {
     "tau_init": (0.12, 0.90),
@@ -297,6 +304,8 @@ SENTENCE_STYLE_RULES = (
         "tokens": (
             "diffuse", "microcrack", "micro crack", "tiny crack",
             "tiny surface", "scratch", "scratches", "shallow",
+            "without visible fracture", "no visible fracture",
+            "without brittle fracture", "denting", "deforming without",
         ),
         "fracture_mult": {
             "tau_init": 1.55,
@@ -310,16 +319,16 @@ SENTENCE_STYLE_RULES = (
             "anisotropy_strength": 0.55,
         },
         "runtime": {
+            "manifold.enable_front_propagation": False,
             "manifold.successor_topk": 0,
             "manifold.max_branching_tips": 0,
             "manifold.branch_drive_threshold": 0.99,
             "manifold.front_threshold": 0.98,
+            "manifold.impact_seed_magnitude": 0.035,
+            "manifold.edge_break_rate": 0.0,
+            "manifold.fragment_damage_threshold": 0.95,
             "manifold.open_crack_release_enable": False,
             "manifold.brittle_release_intensity": 0.0,
-            "manifold.catastrophic_release_enable": False,
-            "manifold.catastrophic_release_fragility": 0.0,
-            "manifold.secondary_shatter_enable": False,
-            "manifold.secondary_shatter_max_patches": 0,
             "gaussian_splatting.crack_gap_fraction": 0.08,
             "gaussian_splatting.crack_opacity_reduction": 0.16,
         },
@@ -329,6 +338,7 @@ SENTENCE_STYLE_RULES = (
         "tokens": (
             "spiderweb", "spider web", "branching", "branched",
             "network", "web cracks", "wide branching",
+            "connected cracks", "intersecting cracks", "cracks meet",
         ),
         "fracture_mult": {
             "tau_init": 0.92,
@@ -351,35 +361,59 @@ SENTENCE_STYLE_RULES = (
             "manifold.branch_drive_threshold": 0.22,
             "manifold.branching_bias": 0.78,
             "manifold.drive_quantile": 0.58,
-            "manifold.open_crack_release_max_patches": 6,
-            "manifold.open_crack_release_threshold": 0.43,
+            "manifold.damage_spread": 0.14,
+            "manifold.damage_source_scale": 0.48,
+            "manifold.edge_break_rate": 1.00,
+            "manifold.fragment_damage_threshold": 0.40,
+            "manifold.fragment_edge_memory_weight": 0.78,
+            "manifold.fragment_cut_diffusion_alpha": 0.08,
+            "manifold.fragment_cut_diffusion_iters": 1,
+            "manifold.fragment_persistent_min_size": 90,
+            "manifold.fragment_persistent_min_size_ratio": 0.0018,
+            "manifold.cut_vote_strength": 0.58,
+            "manifold.cut_core_damage_threshold": 0.20,
+            "manifold.cut_core_opening_threshold": 0.14,
+            "manifold.cut_hard_break_threshold": 0.42,
+            "manifold.authoritative_cut_threshold": 0.22,
+            "manifold.crack_connected_release_only": True,
+            "manifold.open_crack_release_enable": False,
+            "manifold.open_crack_release_max_patches": 0,
+            "manifold.open_crack_release_threshold": 1.0,
             "manifold.brittle_release_intensity": 1.25,
-            "manifold.catastrophic_release_enable": True,
-            "manifold.catastrophic_release_fragility": 0.48,
-            "manifold.catastrophic_release_threshold": 0.42,
-            "manifold.catastrophic_release_min_threshold": 0.13,
-            "manifold.catastrophic_release_patches_per_step": 5,
-            "manifold.catastrophic_release_patch_radius": 0.052,
-            "manifold.catastrophic_release_core_radius": 0.018,
-            "manifold.catastrophic_release_max_size_ratio": 0.030,
-            "manifold.catastrophic_release_max_released_ratio": 0.34,
-            "manifold.secondary_shatter_enable": True,
-            "manifold.secondary_shatter_start_step": 3,
-            "manifold.secondary_shatter_threshold": 0.20,
-            "manifold.secondary_shatter_floor": 0.08,
-            "manifold.secondary_shatter_max_patches": 28,
-            "manifold.secondary_shatter_sector_count": 24,
-            "manifold.secondary_shatter_band_count": 3,
-            "manifold.secondary_shatter_height_count": 2,
-            "manifold.secondary_shatter_max_size_ratio": 0.014,
-            "manifold.secondary_shatter_max_released_ratio": 0.45,
+            "manifold.impact_release_gain": 1.12,
+            "manifold.impact_closure_target_ratio": 0.24,
+            "manifold.impact_closure_max_patches": 18,
+            "manifold.impact_closure_active_frames": 0,
+            "manifold.impact_closure_sector_count": 18,
+            "manifold.impact_closure_band_count": 2,
+            "manifold.impact_closure_layer_count": 1,
+            "manifold.impact_closure_min_size_ratio": 0.0015,
+            "manifold.impact_closure_max_size_ratio": 0.045,
+            "manifold.fragment_impulse_strength": 0.0,
+            "manifold.fragment_event_boost": 1.0,
+            "manifold.fragment_impulse_boost_frames": 0,
+            "manifold.fragment_physical_gap_scale": 0.00024,
+            "manifold.fragment_physical_release_velocity": 0.003,
+            "manifold.fragment_physical_downward_bias": 0.10,
+            "manifold.fragment_physical_release_frames": 18,
+            "manifold.fragment_physical_lateral_bias": 0.24,
+            "manifold.fragment_physical_spin_gain": 0.10,
+            "manifold.debris_motion_gain": 0.0,
+            "manifold.shard_enable": False,
+            "manifold.shard_count_scale": 0.0,
         },
     },
     {
         "name": "radial_shatter",
         "tokens": (
             "radial", "many sharp", "shattering", "shatter",
-            "many cracks", "starburst",
+            "many cracks", "starburst", "localized shatter",
+            "localized cracks", "crack-connected", "connected radial",
+            "shard", "shards", "detached shard", "detached shards",
+        ),
+        "priority_tokens": (
+            "shard", "shards", "detached shard", "detached shards",
+            "shattering", "shatter", "starburst",
         ),
         "fracture_mult": {
             "tau_init": 0.88,
@@ -394,58 +428,66 @@ SENTENCE_STYLE_RULES = (
         },
         "runtime": {
             "manifold.max_seed_points": 14,
-            "manifold.seed_quantile": 0.982,
+            "manifold.seed_quantile": 0.978,
             "manifold.min_seed_spacing": 0.016,
-            "manifold.successor_topk": 5,
-            "manifold.max_branching_tips": 48,
+            "manifold.successor_topk": 6,
+            "manifold.max_branching_tips": 72,
             "manifold.branch_score_ratio": 0.74,
-            "manifold.branch_drive_threshold": 0.14,
+            "manifold.branch_drive_threshold": 0.10,
             "manifold.branching_bias": 0.90,
-            "manifold.min_successor_score": 0.09,
-            "manifold.drive_quantile": 0.48,
-            "manifold.fragment_damage_threshold": 0.24,
-            "manifold.fragment_primary_cut_ratio": 0.38,
-            "manifold.fragment_fallback_cut_ratio": 0.24,
-            "manifold.fragment_min_boundary_edges": 8,
+            "manifold.min_successor_score": 0.075,
+            "manifold.drive_quantile": 0.44,
+            "manifold.front_substeps": 4,
+            "manifold.damage_spread": 0.12,
+            "manifold.damage_source_scale": 0.50,
+            "manifold.edge_break_rate": 1.00,
+            "manifold.fragment_damage_threshold": 0.42,
+            "manifold.fragment_primary_cut_ratio": 0.48,
+            "manifold.fragment_fallback_cut_ratio": 0.32,
+            "manifold.fragment_min_boundary_edges": 10,
+            "manifold.fragment_edge_memory_weight": 0.78,
+            "manifold.fragment_cut_diffusion_alpha": 0.08,
+            "manifold.fragment_cut_diffusion_iters": 1,
+            "manifold.cut_vote_strength": 0.62,
+            "manifold.cut_core_damage_threshold": 0.22,
+            "manifold.cut_core_opening_threshold": 0.14,
+            "manifold.cut_hard_break_threshold": 0.44,
+            "manifold.authoritative_cut_threshold": 0.24,
             "manifold.support_release_threshold": 0.34,
             "manifold.support_overlap_threshold": 0.045,
-            "manifold.open_crack_release_max_patches": 20,
-            "manifold.open_crack_release_threshold": 0.28,
+            "manifold.crack_connected_release_only": True,
+            "manifold.open_crack_release_enable": False,
+            "manifold.open_crack_release_max_patches": 0,
+            "manifold.open_crack_release_threshold": 1.0,
             "manifold.brittle_release_intensity": 1.80,
-            "manifold.catastrophic_release_enable": True,
-            "manifold.catastrophic_release_fragility": 1.00,
-            "manifold.catastrophic_release_threshold": 0.28,
-            "manifold.catastrophic_release_min_threshold": 0.055,
-            "manifold.catastrophic_release_threshold_decay": 0.012,
-            "manifold.catastrophic_release_patches_per_step": 14,
-            "manifold.catastrophic_release_patch_radius": 0.068,
-            "manifold.catastrophic_release_core_radius": 0.026,
-            "manifold.catastrophic_release_min_size": 10,
-            "manifold.catastrophic_release_max_size_ratio": 0.052,
-            "manifold.catastrophic_release_max_released_ratio": 0.88,
-            "manifold.secondary_shatter_enable": True,
-            "manifold.secondary_shatter_start_step": 2,
-            "manifold.secondary_shatter_threshold": 0.16,
-            "manifold.secondary_shatter_floor": 0.14,
-            "manifold.secondary_shatter_max_patches": 112,
-            "manifold.secondary_shatter_sector_count": 32,
-            "manifold.secondary_shatter_band_count": 4,
-            "manifold.secondary_shatter_height_count": 2,
-            "manifold.secondary_shatter_min_size": 8,
-            "manifold.secondary_shatter_max_size_ratio": 0.010,
-            "manifold.secondary_shatter_max_released_ratio": 0.92,
-            "manifold.fragment_persistent_min_size": 3,
+            "manifold.impact_release_gain": 1.34,
+            "manifold.impact_closure_target_ratio": 0.42,
+            "manifold.impact_closure_max_patches": 14,
+            "manifold.impact_closure_active_frames": 0,
+            "manifold.impact_closure_sector_count": 14,
+            "manifold.impact_closure_band_count": 2,
+            "manifold.impact_closure_layer_count": 1,
+            "manifold.impact_closure_min_size_ratio": 0.0028,
+            "manifold.impact_closure_max_size_ratio": 0.075,
+            "manifold.fragment_persistent_min_size": 120,
+            "manifold.fragment_persistent_min_size_ratio": 0.0030,
             "manifold.fragment_component_hysteresis": 0.22,
             "manifold.fragment_render_min_size": 3,
-            "manifold.fragment_physical_min_size": 4,
+            "manifold.fragment_physical_min_size": 24,
             "manifold.fragment_physical_overlap_threshold": 0.06,
-            "manifold.fragment_impulse_strength": 4.20,
-            "manifold.fragment_event_boost": 2.25,
-            "manifold.fragment_offset_gain": 1.95,
-            "manifold.debris_motion_gain": 1.35,
-            "manifold.fragment_physical_release_velocity": 0.030,
-            "manifold.fragment_physical_release_frames": 32,
-            "manifold.shard_count_scale": 1.45,
+            "manifold.fragment_impulse_strength": 0.0,
+            "manifold.fragment_event_boost": 1.0,
+            "manifold.fragment_impulse_boost_frames": 0,
+            "manifold.fragment_offset_gain": 1.0,
+            "manifold.debris_motion_gain": 0.0,
+            "manifold.fragment_physical_gap_scale": 0.00034,
+            "manifold.fragment_physical_release_velocity": 0.006,
+            "manifold.fragment_physical_downward_bias": 0.12,
+            "manifold.fragment_physical_release_frames": 20,
+            "manifold.fragment_physical_lateral_bias": 0.38,
+            "manifold.fragment_physical_spin_gain": 0.18,
+            "manifold.shard_enable": False,
+            "manifold.shard_count_scale": 0.0,
         },
     },
     {
@@ -477,27 +519,7 @@ SENTENCE_STYLE_RULES = (
             "manifold.open_crack_release_max_patches": 8,
             "manifold.open_crack_release_threshold": 0.36,
             "manifold.brittle_release_intensity": 1.35,
-            "manifold.catastrophic_release_enable": True,
-            "manifold.catastrophic_release_fragility": 0.62,
-            "manifold.catastrophic_release_threshold": 0.38,
-            "manifold.catastrophic_release_min_threshold": 0.10,
-            "manifold.catastrophic_release_patches_per_step": 7,
-            "manifold.catastrophic_release_patch_radius": 0.074,
-            "manifold.catastrophic_release_core_radius": 0.030,
-            "manifold.catastrophic_release_min_size": 18,
-            "manifold.catastrophic_release_max_size_ratio": 0.065,
-            "manifold.catastrophic_release_max_released_ratio": 0.48,
-            "manifold.secondary_shatter_enable": True,
-            "manifold.secondary_shatter_start_step": 3,
-            "manifold.secondary_shatter_threshold": 0.19,
-            "manifold.secondary_shatter_floor": 0.10,
-            "manifold.secondary_shatter_max_patches": 36,
-            "manifold.secondary_shatter_sector_count": 20,
-            "manifold.secondary_shatter_band_count": 3,
-            "manifold.secondary_shatter_height_count": 2,
-            "manifold.secondary_shatter_min_size": 14,
-            "manifold.secondary_shatter_max_size_ratio": 0.020,
-            "manifold.secondary_shatter_max_released_ratio": 0.55,
+            "manifold.impact_release_gain": 1.18,
         },
     },
     {
@@ -524,19 +546,14 @@ SENTENCE_STYLE_RULES = (
             "manifold.branch_drive_threshold": 0.88,
             "manifold.drive_quantile": 0.86,
             "manifold.damage_spread": 0.18,
+            "manifold.fragment_persistent_min_size": 160,
+            "manifold.fragment_persistent_min_size_ratio": 0.0040,
+            "manifold.fragment_primary_cut_ratio": 0.66,
+            "manifold.fragment_fallback_cut_ratio": 0.52,
+            "manifold.strict_closure_max_released_ratio": 0.18,
             "manifold.open_crack_release_max_patches": 2,
             "manifold.open_crack_release_threshold": 0.44,
             "manifold.brittle_release_intensity": 0.90,
-            "manifold.catastrophic_release_enable": True,
-            "manifold.catastrophic_release_fragility": 0.18,
-            "manifold.catastrophic_release_threshold": 0.50,
-            "manifold.catastrophic_release_min_threshold": 0.18,
-            "manifold.catastrophic_release_patches_per_step": 1,
-            "manifold.catastrophic_release_patch_radius": 0.040,
-            "manifold.catastrophic_release_max_size_ratio": 0.020,
-            "manifold.catastrophic_release_max_released_ratio": 0.12,
-            "manifold.secondary_shatter_enable": False,
-            "manifold.secondary_shatter_max_patches": 0,
         },
     },
 )
@@ -581,6 +598,78 @@ CATEGORY_TO_FAMILY = {
     "composite": "neutral_reference",
     "other": "neutral_reference",
 }
+
+MATERIAL_CONTEXT_SPLITS = (
+    " dropped on ",
+    " falling on ",
+    " colliding with ",
+    " impacting ",
+    " against ",
+    " onto ",
+    " on concrete",
+)
+
+MATERIAL_HINT_RULES = (
+    {
+        "name": "glass",
+        "tokens": ("glass", "soda-lime", "tempered glass", "bottle", "pane", "window"),
+        "category_bonus": {"glass": 0.46},
+        "name_bonus": (("glass", 0.28), ("soda-lime", 0.36), ("tempered", 0.26)),
+    },
+    {
+        "name": "rubber",
+        "tokens": ("rubber", "latex", "elastomer", "neoprene", "silicone"),
+        "category_bonus": {"polymer": 0.22},
+        "name_bonus": (
+            ("rubber", 0.68),
+            ("latex", 0.48),
+            ("elastomer", 0.46),
+            ("neoprene", 0.40),
+            ("silicone", 0.32),
+        ),
+    },
+    {
+        "name": "metal",
+        "tokens": (
+            "steel", "structural steel", "stainless steel", "iron",
+            "cast iron", "aluminum", "aluminium", "metal",
+        ),
+        "category_bonus": {"metal": 0.58},
+        "name_bonus": (
+            ("structural steel", 0.78),
+            ("stainless steel", 0.70),
+            ("steel", 0.62),
+            ("cast iron", 0.44),
+            ("iron", 0.34),
+            ("aluminum", 0.34),
+            ("aluminium", 0.34),
+        ),
+    },
+    {
+        "name": "ceramic",
+        "tokens": ("ceramic", "porcelain", "stoneware", "china", "mug"),
+        "category_bonus": {"ceramic": 0.42},
+        "name_bonus": (("porcelain", 0.44), ("ceramic", 0.34), ("stoneware", 0.34)),
+    },
+    {
+        "name": "concrete",
+        "tokens": ("concrete", "cement", "mortar"),
+        "category_bonus": {"concrete": 0.42},
+        "name_bonus": (("concrete", 0.34), ("cement", 0.28), ("mortar", 0.28)),
+    },
+    {
+        "name": "stone",
+        "tokens": ("sandstone", "limestone", "marble", "stone", "rock"),
+        "category_bonus": {"stone": 0.34},
+        "name_bonus": (("sandstone", 0.44), ("limestone", 0.34), ("marble", 0.34)),
+    },
+    {
+        "name": "ice",
+        "tokens": ("ice", "frozen"),
+        "category_bonus": {"ice": 0.42},
+        "name_bonus": (("ice", 0.40), ("frozen", 0.22)),
+    },
+)
 
 FAMILY_STYLE_MULTIPLIERS = {
     "sharp_brittle": {
@@ -679,6 +768,7 @@ FAMILY_RUNTIME_PRESETS = {
         "manifold.fragment_visual_ramp_frames": 5,
         "manifold.fragment_impulse_boost_frames": 6,
         "manifold.fragment_event_boost": 1.90,
+        "manifold.impact_release_gain": 1.10,
         "manifold.shard_enable": True,
         "manifold.shard_count_scale": 1.00,
         "manifold.fragment_offset_gain": 1.65,
@@ -697,28 +787,6 @@ FAMILY_RUNTIME_PRESETS = {
         "manifold.support_release_threshold": 0.44,
         "manifold.support_promote_min_size": 3,
         "manifold.support_overlap_threshold": 0.06,
-        "manifold.catastrophic_release_enable": True,
-        "manifold.catastrophic_release_fragility": 0.62,
-        "manifold.catastrophic_release_threshold": 0.38,
-        "manifold.catastrophic_release_min_threshold": 0.10,
-        "manifold.catastrophic_release_threshold_decay": 0.008,
-        "manifold.catastrophic_release_patches_per_step": 7,
-        "manifold.catastrophic_release_patch_radius": 0.054,
-        "manifold.catastrophic_release_core_radius": 0.020,
-        "manifold.catastrophic_release_min_size": 8,
-        "manifold.catastrophic_release_max_size_ratio": 0.035,
-        "manifold.catastrophic_release_max_released_ratio": 0.46,
-        "manifold.secondary_shatter_enable": True,
-        "manifold.secondary_shatter_start_step": 4,
-        "manifold.secondary_shatter_threshold": 0.20,
-        "manifold.secondary_shatter_floor": 0.08,
-        "manifold.secondary_shatter_max_patches": 32,
-        "manifold.secondary_shatter_sector_count": 24,
-        "manifold.secondary_shatter_band_count": 3,
-        "manifold.secondary_shatter_height_count": 2,
-        "manifold.secondary_shatter_min_size": 8,
-        "manifold.secondary_shatter_max_size_ratio": 0.014,
-        "manifold.secondary_shatter_max_released_ratio": 0.50,
         "manifold.volumetric_cut_damage_scale": 0.72,
         "manifold.volumetric_auth_damage_floor": 0.82,
         "manifold.volumetric_detached_damage_floor": 0.96,
@@ -787,6 +855,7 @@ FAMILY_RUNTIME_PRESETS = {
         "manifold.fragment_visual_ramp_frames": 6,
         "manifold.fragment_impulse_boost_frames": 4,
         "manifold.fragment_event_boost": 1.18,
+        "manifold.impact_release_gain": 1.00,
         "manifold.shard_enable": False,
         "manifold.shard_count_scale": 0.0,
         "manifold.fragment_offset_gain": 1.05,
@@ -805,28 +874,6 @@ FAMILY_RUNTIME_PRESETS = {
         "manifold.support_release_threshold": 0.58,
         "manifold.support_promote_min_size": 10,
         "manifold.support_overlap_threshold": 0.12,
-        "manifold.catastrophic_release_enable": True,
-        "manifold.catastrophic_release_fragility": 0.34,
-        "manifold.catastrophic_release_threshold": 0.46,
-        "manifold.catastrophic_release_min_threshold": 0.16,
-        "manifold.catastrophic_release_threshold_decay": 0.004,
-        "manifold.catastrophic_release_patches_per_step": 3,
-        "manifold.catastrophic_release_patch_radius": 0.045,
-        "manifold.catastrophic_release_core_radius": 0.016,
-        "manifold.catastrophic_release_min_size": 14,
-        "manifold.catastrophic_release_max_size_ratio": 0.028,
-        "manifold.catastrophic_release_max_released_ratio": 0.28,
-        "manifold.secondary_shatter_enable": True,
-        "manifold.secondary_shatter_start_step": 5,
-        "manifold.secondary_shatter_threshold": 0.24,
-        "manifold.secondary_shatter_floor": 0.04,
-        "manifold.secondary_shatter_max_patches": 8,
-        "manifold.secondary_shatter_sector_count": 16,
-        "manifold.secondary_shatter_band_count": 2,
-        "manifold.secondary_shatter_height_count": 1,
-        "manifold.secondary_shatter_min_size": 14,
-        "manifold.secondary_shatter_max_size_ratio": 0.018,
-        "manifold.secondary_shatter_max_released_ratio": 0.24,
         "manifold.volumetric_cut_damage_scale": 0.52,
         "manifold.volumetric_auth_damage_floor": 0.70,
         "manifold.volumetric_detached_damage_floor": 0.84,
@@ -889,6 +936,7 @@ FAMILY_RUNTIME_PRESETS = {
         "manifold.fragment_visual_ramp_frames": 6,
         "manifold.fragment_impulse_boost_frames": 5,
         "manifold.fragment_event_boost": 1.10,
+        "manifold.impact_release_gain": 1.05,
         "manifold.shard_enable": False,
         "manifold.shard_count_scale": 0.0,
         "manifold.fragment_offset_gain": 1.32,
@@ -907,28 +955,6 @@ FAMILY_RUNTIME_PRESETS = {
         "manifold.support_release_threshold": 0.60,
         "manifold.support_promote_min_size": 20,
         "manifold.support_overlap_threshold": 0.18,
-        "manifold.catastrophic_release_enable": True,
-        "manifold.catastrophic_release_fragility": 0.42,
-        "manifold.catastrophic_release_threshold": 0.44,
-        "manifold.catastrophic_release_min_threshold": 0.14,
-        "manifold.catastrophic_release_threshold_decay": 0.005,
-        "manifold.catastrophic_release_patches_per_step": 5,
-        "manifold.catastrophic_release_patch_radius": 0.065,
-        "manifold.catastrophic_release_core_radius": 0.026,
-        "manifold.catastrophic_release_min_size": 22,
-        "manifold.catastrophic_release_max_size_ratio": 0.050,
-        "manifold.catastrophic_release_max_released_ratio": 0.36,
-        "manifold.secondary_shatter_enable": True,
-        "manifold.secondary_shatter_start_step": 4,
-        "manifold.secondary_shatter_threshold": 0.21,
-        "manifold.secondary_shatter_floor": 0.07,
-        "manifold.secondary_shatter_max_patches": 24,
-        "manifold.secondary_shatter_sector_count": 18,
-        "manifold.secondary_shatter_band_count": 3,
-        "manifold.secondary_shatter_height_count": 2,
-        "manifold.secondary_shatter_min_size": 20,
-        "manifold.secondary_shatter_max_size_ratio": 0.024,
-        "manifold.secondary_shatter_max_released_ratio": 0.45,
         "manifold.volumetric_cut_damage_scale": 0.86,
         "manifold.volumetric_auth_damage_floor": 0.88,
         "manifold.volumetric_detached_damage_floor": 0.98,
@@ -991,6 +1017,7 @@ FAMILY_RUNTIME_PRESETS = {
         "manifold.fragment_visual_ramp_frames": 1,
         "manifold.fragment_impulse_boost_frames": 0,
         "manifold.fragment_event_boost": 1.0,
+        "manifold.impact_release_gain": 0.75,
         "manifold.shard_enable": False,
         "manifold.shard_count_scale": 0.0,
         "manifold.fragment_offset_gain": 1.0,
@@ -1004,12 +1031,6 @@ FAMILY_RUNTIME_PRESETS = {
         "manifold.support_release_threshold": 1.0,
         "manifold.support_promote_min_size": 9999,
         "manifold.support_overlap_threshold": 1.0,
-        "manifold.catastrophic_release_enable": False,
-        "manifold.catastrophic_release_fragility": 0.0,
-        "manifold.catastrophic_release_patches_per_step": 0,
-        "manifold.catastrophic_release_max_released_ratio": 0.0,
-        "manifold.secondary_shatter_enable": False,
-        "manifold.secondary_shatter_max_patches": 0,
         "manifold.volumetric_cut_damage_scale": 0.0,
         "manifold.volumetric_auth_damage_floor": 0.0,
         "manifold.volumetric_detached_damage_floor": 0.0,
@@ -1022,6 +1043,13 @@ FAMILY_RUNTIME_PRESETS = {
         "manifold.fragment_physical_release_velocity": 0.0,
         "manifold.fragment_physical_downward_bias": 0.0,
         "manifold.fragment_physical_release_frames": 0,
+        "manifold.shape_match_strength": 0.18,
+        "manifold.shape_match_fragment_strength": 0.28,
+        "manifold.shape_match_damaged_strength": 0.10,
+        "manifold.shape_match_velocity_blend": 0.06,
+        "manifold.rigid_contact_restitution": 0.72,
+        "manifold.rigid_contact_angular_gain": 0.22,
+        "manifold.rigid_contact_friction": 0.04,
         "manifold.splitting_enabled": False,
         "gaussian_splatting.material_family": "diffuse_damage",
         "gaussian_splatting.crack_band_weight": 0.0,
@@ -1072,6 +1100,7 @@ FAMILY_RUNTIME_PRESETS = {
         "manifold.fragment_visual_ramp_frames": 6,
         "manifold.fragment_impulse_boost_frames": 4,
         "manifold.fragment_event_boost": 1.0,
+        "manifold.impact_release_gain": 1.0,
         "manifold.shard_enable": False,
         "manifold.shard_count_scale": 0.0,
         "manifold.fragment_offset_gain": 1.0,
@@ -1085,12 +1114,6 @@ FAMILY_RUNTIME_PRESETS = {
         "manifold.support_release_threshold": 0.56,
         "manifold.support_promote_min_size": 6,
         "manifold.support_overlap_threshold": 0.10,
-        "manifold.catastrophic_release_enable": False,
-        "manifold.catastrophic_release_fragility": 0.0,
-        "manifold.catastrophic_release_patches_per_step": 0,
-        "manifold.catastrophic_release_max_released_ratio": 0.0,
-        "manifold.secondary_shatter_enable": False,
-        "manifold.secondary_shatter_max_patches": 0,
         "manifold.volumetric_cut_damage_scale": 0.58,
         "manifold.volumetric_auth_damage_floor": 0.72,
         "manifold.volumetric_detached_damage_floor": 0.90,
@@ -1155,10 +1178,101 @@ class MaterialPriorAdapter:
     @staticmethod
     def sentence_style_for_text(text: str) -> Dict[str, object]:
         q = str(text or "").lower()
+        matches = []
         for rule in SENTENCE_STYLE_RULES:
-            if any(token in q for token in rule["tokens"]):
-                return rule
+            tokens = tuple(rule.get("tokens", ()))
+            priority_tokens = tuple(rule.get("priority_tokens", ()))
+            hits = sum(1 for token in tokens if token in q)
+            priority_hits = sum(1 for token in priority_tokens if token in q)
+            if hits > 0 or priority_hits > 0:
+                matches.append((100 * priority_hits + hits, rule))
+        if matches:
+            return max(matches, key=lambda item: item[0])[1]
         return {"name": "material_default", "fracture_mult": {}, "runtime": {}}
+
+    @staticmethod
+    def _material_hint_query(text: str) -> str:
+        q = str(text or "").lower()
+        for marker in MATERIAL_CONTEXT_SPLITS:
+            if marker in q:
+                q = q.split(marker, 1)[0]
+                break
+        return q
+
+    def material_hint_logits(
+        self,
+        text: str,
+        topk_materials: Sequence[MaterialEntry],
+    ) -> np.ndarray:
+        """Declarative lexical prior for explicit object material words.
+
+        CLIP remains the retriever.  This only adjusts the blend weights of the
+        retrieved candidates, and it ignores environment phrases such as
+        "dropped on concrete" so the floor material does not dominate the object.
+        """
+        entries = list(topk_materials)
+        q = self._material_hint_query(text)
+        logits = np.zeros(len(entries), dtype=np.float64)
+        if not q:
+            return logits
+
+        for rule in MATERIAL_HINT_RULES:
+            token_hits = sum(1 for token in rule.get("tokens", ()) if token in q)
+            if token_hits <= 0:
+                continue
+            for idx, entry in enumerate(entries):
+                name_l = entry.name.lower()
+                category_l = entry.category.lower()
+                bonus = float(rule.get("category_bonus", {}).get(category_l, 0.0))
+                for pattern, value in rule.get("name_bonus", ()):
+                    if pattern in name_l:
+                        bonus += float(value)
+                logits[idx] += min(bonus * (1.0 + 0.12 * (token_hits - 1)), 1.20)
+        return logits
+
+    @staticmethod
+    def _enforce_crack_connected_fragment_runtime(
+        runtime: Dict[str, object],
+        family: str,
+    ) -> Dict[str, object]:
+        """Make crack closure the only fragment birth path.
+
+        CLIP and sentence style still choose material family, crack growth,
+        branch density, closure thresholds, and post-fragment scatter.  What
+        they cannot do is bypass propagation with arbitrary damage patches.
+        Fragment labels are born only from crack-connected closure/ring logic.
+        """
+        out = dict(runtime)
+        family_name = str(family or "neutral_reference")
+        if family_name not in FRAGMENT_CAPABLE_FAMILIES:
+            out["manifold.crack_connected_release_only"] = False
+            out["manifold.open_crack_release_enable"] = False
+            out["manifold.open_crack_release_max_patches"] = 0
+            out["manifold.shard_enable"] = False
+            out["manifold.shard_count_scale"] = 0.0
+            out["manifold.debris_motion_gain"] = 0.0
+            return out
+
+        cap_by_family = {
+            "sharp_brittle": 0.68,
+            "brittle_moderate": 0.46,
+            "rough_quasi_brittle": 0.42,
+            "neutral_reference": 0.35,
+        }
+        out.update({
+            "manifold.crack_connected_release_only": True,
+            "manifold.strict_closure_max_released_ratio": cap_by_family.get(family_name, 0.35),
+            "manifold.open_crack_release_enable": False,
+            "manifold.open_crack_release_max_patches": 0,
+            "manifold.open_crack_release_threshold": 1.0,
+            "manifold.fragment_impulse_strength": 0.0,
+            "manifold.fragment_impulse_boost_frames": 0,
+            "manifold.debris_motion_gain": 0.0,
+            "manifold.shard_enable": False,
+            "manifold.shard_count_scale": 0.0,
+            "manifold.splitting_enabled": False,
+        })
+        return out
 
     def apply_sentence_style(
         self,
@@ -1176,6 +1290,8 @@ class MaterialPriorAdapter:
         if style_name == "material_default":
             out = dict(material_prior)
             runtime = dict(material_prior.get("runtime", {}))
+            family = str(material_prior.get("family", "neutral_reference"))
+            runtime = self._enforce_crack_connected_fragment_runtime(runtime, family)
             runtime["manifold.sentence_style"] = style_name
             out["runtime"] = runtime
             out["sentence_style"] = style_name
@@ -1190,6 +1306,7 @@ class MaterialPriorAdapter:
         family = str(material_prior.get("family", "neutral_reference"))
         runtime = self.fracture_prior_to_runtime_overrides(fracture, family)
         runtime.update(dict(style.get("runtime", {})))
+        runtime = self._enforce_crack_connected_fragment_runtime(runtime, family)
         runtime["manifold.sentence_style"] = style_name
 
         out = dict(material_prior)
@@ -1344,9 +1461,17 @@ class MaterialPriorAdapter:
         self,
         topk_materials: Sequence[MaterialEntry],
         scores: Sequence[float],
+        text: str | None = None,
     ) -> Dict[str, object]:
         entries = list(topk_materials)
-        weights = self.normalize_scores(scores)
+        scores_np = np.asarray(list(scores), dtype=np.float64)
+        hint_logits = (
+            self.material_hint_logits(text, entries)
+            if text is not None
+            else np.zeros(len(entries), dtype=np.float64)
+        )
+        adjusted_scores = scores_np + hint_logits
+        weights = self.normalize_scores(adjusted_scores)
         physics = self.build_physics_prior(entries, weights)
         family_prior = self.build_family_prior(entries, weights)
         family = family_prior["family"]
@@ -1361,22 +1486,27 @@ class MaterialPriorAdapter:
             "fracture": fracture,
             "runtime": runtime,
             "weights": weights.tolist(),
+            "material_hint_logits": hint_logits.tolist(),
             "dominant_category": dominant_category,
             "top_k": [
                 {
                     "name": entry.name,
                     "category": entry.category,
-                    "score": float(score),
+                    "score": float(adjusted_score),
+                    "raw_score": float(raw_score),
+                    "material_hint_logit": float(hint),
                     "weight": float(weight),
                     "family": self.family_for_entry(entry),
                 }
-                for entry, score, weight in zip(entries, scores, weights)
+                for entry, raw_score, adjusted_score, hint, weight
+                in zip(entries, scores_np, adjusted_scores, hint_logits, weights)
             ],
         }
 
     @staticmethod
     def scale_physics_to_mpm(
         physics_prior: Dict[str, float],
+        family: str | None = None,
         base_E: float = 1.5e7,
         base_Gc: float = 6.0e4,
         base_density: float = 1200.0,
@@ -1392,7 +1522,10 @@ class MaterialPriorAdapter:
         # of the material-style variation. Wide physical ratios still influence
         # behavior, but they no longer erase crack growth by over-suppressing
         # the contact-wave response.
-        E = base_E * _clamp(e_ratio ** 0.12, 0.85, 1.45)
+        if family == "diffuse_damage":
+            E = base_E * _clamp(e_ratio ** 0.18, 0.20, 0.62)
+        else:
+            E = base_E * _clamp(e_ratio ** 0.12, 0.85, 1.45)
         Gc = base_Gc * _clamp(gc_ratio ** 0.18, 0.70, 1.60)
         density = base_density * _clamp(rho_ratio ** 0.20, 0.85, 1.35)
         nu = _clamp(float(physics_prior["nu"]), 0.10, 0.49)
@@ -1603,4 +1736,8 @@ class MaterialPriorAdapter:
             "gaussian_splatting.shard_opacity_gain": shard_opacity_gain,
         }
         runtime.update(FAMILY_RUNTIME_PRESETS.get(family, FAMILY_RUNTIME_PRESETS["neutral_reference"]))
+        runtime = MaterialPriorAdapter._enforce_crack_connected_fragment_runtime(
+            runtime,
+            family,
+        )
         return runtime

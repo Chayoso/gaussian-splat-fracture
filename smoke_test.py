@@ -621,6 +621,7 @@ def make_fragment_manager(fracture_params, device):
         min_boundary_edges=fracture_params.get('fragment_min_boundary_edges', 12),
         detached_node_decay=fracture_params.get('fragment_detached_node_decay', 0.95),
         persistent_min_fragment_size=fracture_params.get('fragment_persistent_min_size', 8),
+        persistent_min_fragment_size_ratio=fracture_params.get('fragment_persistent_min_size_ratio', 0.0),
         component_hysteresis=fracture_params.get('fragment_component_hysteresis', 0.35),
         post_split_threshold_scale=fracture_params.get('fragment_post_split_threshold_scale', 0.92),
         cut_surface_enable=fracture_params.get('cut_surface_enable', False),
@@ -640,33 +641,21 @@ def make_fragment_manager(fracture_params, device):
         open_crack_release_enable=fracture_params.get('open_crack_release_enable', True),
         open_crack_release_threshold=fracture_params.get('open_crack_release_threshold', 0.0),
         open_crack_release_max_patches=fracture_params.get('open_crack_release_max_patches', 2),
+        crack_connected_release_only=fracture_params.get('crack_connected_release_only', False),
         crack_style=fracture_params.get(
             'sentence_style',
             fracture_params.get('crack_style', 'material_default'),
         ),
         brittle_release_intensity=fracture_params.get('brittle_release_intensity', 1.0),
-        catastrophic_release_enable=fracture_params.get('catastrophic_release_enable', False),
-        catastrophic_release_fragility=fracture_params.get('catastrophic_release_fragility', 0.0),
-        catastrophic_release_threshold=fracture_params.get('catastrophic_release_threshold', 0.36),
-        catastrophic_release_min_threshold=fracture_params.get('catastrophic_release_min_threshold', 0.08),
-        catastrophic_release_threshold_decay=fracture_params.get('catastrophic_release_threshold_decay', 0.010),
-        catastrophic_release_patches_per_step=fracture_params.get('catastrophic_release_patches_per_step', 0),
-        catastrophic_release_patch_radius=fracture_params.get('catastrophic_release_patch_radius', 0.060),
-        catastrophic_release_core_radius=fracture_params.get('catastrophic_release_core_radius', 0.024),
-        catastrophic_release_min_size=fracture_params.get('catastrophic_release_min_size', 16),
-        catastrophic_release_max_size_ratio=fracture_params.get('catastrophic_release_max_size_ratio', 0.040),
-        catastrophic_release_max_released_ratio=fracture_params.get('catastrophic_release_max_released_ratio', 0.55),
-        secondary_shatter_enable=fracture_params.get('secondary_shatter_enable', False),
-        secondary_shatter_start_step=fracture_params.get('secondary_shatter_start_step', 4),
-        secondary_shatter_threshold=fracture_params.get('secondary_shatter_threshold', 0.18),
-        secondary_shatter_floor=fracture_params.get('secondary_shatter_floor', 0.0),
-        secondary_shatter_max_patches=fracture_params.get('secondary_shatter_max_patches', 0),
-        secondary_shatter_sector_count=fracture_params.get('secondary_shatter_sector_count', 24),
-        secondary_shatter_band_count=fracture_params.get('secondary_shatter_band_count', 3),
-        secondary_shatter_height_count=fracture_params.get('secondary_shatter_height_count', 2),
-        secondary_shatter_min_size=fracture_params.get('secondary_shatter_min_size', 8),
-        secondary_shatter_max_size_ratio=fracture_params.get('secondary_shatter_max_size_ratio', 0.012),
-        secondary_shatter_max_released_ratio=fracture_params.get('secondary_shatter_max_released_ratio', 0.70),
+        impact_release_gain=fracture_params.get('impact_release_gain', 1.0),
+        impact_closure_target_ratio=fracture_params.get('impact_closure_target_ratio', -1.0),
+        impact_closure_max_patches=fracture_params.get('impact_closure_max_patches', -1),
+        impact_closure_active_frames=fracture_params.get('impact_closure_active_frames', 2),
+        impact_closure_sector_count=fracture_params.get('impact_closure_sector_count', 0),
+        impact_closure_band_count=fracture_params.get('impact_closure_band_count', 0),
+        impact_closure_layer_count=fracture_params.get('impact_closure_layer_count', 0),
+        impact_closure_min_size_ratio=fracture_params.get('impact_closure_min_size_ratio', 0.0),
+        impact_closure_max_size_ratio=fracture_params.get('impact_closure_max_size_ratio', 0.0),
         material_family=fracture_params.get('material_family', 'neutral_reference'),
         device=str(device),
     )
@@ -955,7 +944,11 @@ def run_vector_collapse_smoke(
     plot_every=10,
 ):
     material_family = fracture_params.get('material_family', 'rough_quasi_brittle')
-    driver = SurfaceCrackDriver(material_family=material_family)
+    crack_style = fracture_params.get(
+        'sentence_style',
+        fracture_params.get('crack_style', 'material_default'),
+    )
+    driver = SurfaceCrackDriver(material_family=material_family, crack_style=crack_style)
     state = make_fast_collapse_state(positions.shape[0], device)
     damage = torch.zeros(positions.shape[0], dtype=positions.dtype, device=device)
     opening = torch.zeros_like(damage)
@@ -977,6 +970,7 @@ def run_vector_collapse_smoke(
     print(f"\n{'='*50}")
     print(f"Running {frames} frames (vectorized surface collapse smoke)")
     print(f"Family: {material_family}")
+    print(f"Style: {crack_style}")
     print(f"{'='*50}\n")
 
     plot_every = max(1, int(plot_every))
@@ -1069,6 +1063,7 @@ def run_vector_collapse_smoke(
     print("Vector collapse smoke complete")
     print(f"Output: {out_dir}")
     print(f"  family = {material_family}")
+    print(f"  style = {crack_style}")
     print(f"  first_split_frame = {first_split_frame}")
     print(f"  max_n_frags = {max_n_frags}")
     print(f"  max_released_nodes = {max_released_nodes}")
@@ -1086,6 +1081,10 @@ def run_surface_only_smoke(
     fragment_every=None,
 ):
     material_family = fracture_params.get('material_family', 'neutral_reference')
+    crack_style = fracture_params.get(
+        'sentence_style',
+        fracture_params.get('crack_style', 'material_default'),
+    )
     graph = GaussianGraph(
         k=fracture_params.get('graph_k', 12),
         sigma=fracture_params.get('graph_sigma', 0.03),
@@ -1103,7 +1102,7 @@ def run_surface_only_smoke(
         make_fast_collapse_state(positions.shape[0], device)
         if fast_collapse else None
     )
-    driver = SurfaceCrackDriver(material_family=material_family)
+    driver = SurfaceCrackDriver(material_family=material_family, crack_style=crack_style)
     seed_center = driver.default_impact_center(positions)
     fracture_field.seed_damage(
         positions=positions,
@@ -1116,6 +1115,7 @@ def run_surface_only_smoke(
     print(f"\n{'='*50}")
     print(f"Running {frames} frames (surface-only matplotlib smoke)")
     print(f"Family: {material_family}")
+    print(f"Style: {crack_style}")
     if fast_collapse:
         print("Mode: fast collapse release")
     print(f"{'='*50}\n")
@@ -1224,7 +1224,7 @@ def run_surface_only_smoke(
                 fracture_field.a,
                 frame,
                 out_dir,
-                title_extra=f"  |  family={material_family}",
+                title_extra=f"  |  family={material_family} style={crack_style}",
             )
             if fast_collapse and n_frags > 1:
                 plot_fragment_frame(
@@ -1288,6 +1288,7 @@ def run_surface_only_smoke(
     print("Surface-only smoke complete")
     print(f"Output: {out_dir}")
     print(f"  family = {material_family}")
+    print(f"  style = {crack_style}")
     print(f"  first_split_frame = {first_split_frame}")
     print(f"  max_n_frags = {max_n_frags}")
     print(f"  max_cut_edges = {max_cut_edges}")
@@ -1388,6 +1389,11 @@ def main():
         material_prior = adapter.build_material_prior(
             topk_entries,
             raw_params["top_k_scores"],
+            text=args.clip,
+        )
+        material_prior = adapter.apply_sentence_style(
+            material_prior,
+            args.clip,
         )
         scaled = adapter.scale_physics_to_mpm(
             material_prior["physics"],
@@ -1415,6 +1421,7 @@ def main():
             f"open={material_prior['fracture']['open_gain']:.2f}"
         )
         print(f"  Family: {material_prior['family']}")
+        print(f"  Style: {material_prior.get('sentence_style', 'material_default')}")
 
     if args.family:
         config = apply_overrides_dict(config, FAMILY_RUNTIME_PRESETS[args.family])

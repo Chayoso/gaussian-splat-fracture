@@ -12,7 +12,8 @@ on the Gaussian manifold.
 import torch
 from torch import Tensor
 from typing import Optional, Tuple
-import numpy as np
+
+from src.utils.knn import knn_search
 
 
 class PhysicsProjector:
@@ -148,20 +149,10 @@ class PhysicsProjector:
             n1: (N_gauss, 3) principal tensile direction (unit vectors)
             sigma1: (N_gauss,) principal tensile stress magnitude
         """
-        device = stress.device
-        N = stress.shape[0]
-
         # Symmetrize stress
         S = 0.5 * (stress + stress.transpose(1, 2))
-
-        # Eigendecomposition
-        try:
-            eigenvalues, eigenvectors = torch.linalg.eigh(S)
-        except Exception:
-            # Fallback: return zero directions
-            N_g = x_gaussian.shape[0]
-            return (torch.zeros(N_g, 3, device=device),
-                    torch.zeros(N_g, device=device))
+        S = torch.nan_to_num(S, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1e8, 1e8)
+        eigenvalues, eigenvectors = self._symmetric_eigh_chunked(S)
 
         # Largest eigenvalue and its eigenvector
         sigma1_mpm = eigenvalues[:, -1].clamp(min=0.0)  # (N_mpm,)
@@ -187,6 +178,49 @@ class PhysicsProjector:
 
         return n1, sigma1
 
+    @staticmethod
+    def _diagonal_principal_fallback(S: Tensor) -> Tuple[Tensor, Tensor]:
+        """Return a bounded principal direction from the largest diagonal term."""
+        diag = torch.diagonal(S, dim1=1, dim2=2)
+        values, axis = diag.max(dim=1)
+        vectors = torch.zeros_like(S[:, :, 0])
+        vectors.scatter_(1, axis.unsqueeze(1), 1.0)
+        return values.unsqueeze(1), vectors.unsqueeze(2)
+
+    @classmethod
+    def _symmetric_eigh_chunked(
+        cls,
+        S: Tensor,
+        *,
+        chunk_size: int = 8192,
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Eigendecompose many 3x3 symmetric tensors without one huge cuSolver batch.
+
+        At 50K surface particles, a single batched CUDA `eigh` can fail before
+        the fracture code runs. Chunking keeps the normal principal-stress path
+        intact. If a chunk still fails, only that chunk degrades to a diagonal
+        principal-axis approximation instead of aborting the whole sweep.
+        """
+        if S.ndim != 3 or S.shape[1:] != (3, 3):
+            raise ValueError(f"expected stress tensor shape (N,3,3), got {tuple(S.shape)}")
+        values_out = []
+        vectors_out = []
+        n = int(S.shape[0])
+        for start in range(0, n, max(int(chunk_size), 1)):
+            chunk = S[start:start + chunk_size]
+            try:
+                values, vectors = torch.linalg.eigh(chunk)
+            except RuntimeError:
+                max_values, max_vectors = cls._diagonal_principal_fallback(chunk)
+                min_values = torch.zeros_like(max_values)
+                values = torch.cat([min_values, min_values, max_values], dim=1)
+                zero = torch.zeros_like(max_vectors)
+                vectors = torch.cat([zero, zero, max_vectors], dim=2)
+            values_out.append(values)
+            vectors_out.append(vectors)
+        return torch.cat(values_out, dim=0), torch.cat(vectors_out, dim=0)
+
     def _get_knn_weights(
         self,
         x_mpm: Tensor,
@@ -206,25 +240,10 @@ class PhysicsProjector:
                 and frame >= 0):
             return self._cached_knn_idx, self._cached_knn_weights
 
-        N_gauss = x_gaussian.shape[0]
         N_mpm = x_mpm.shape[0]
         k = min(self.k, N_mpm)
-        device = x_mpm.device
 
-        # Compute kNN (chunked for memory)
-        if N_gauss <= 20000:
-            dists = torch.cdist(x_gaussian, x_mpm)  # (N_gauss, N_mpm)
-            knn_dist, knn_idx = dists.topk(k, largest=False, dim=1)
-        else:
-            knn_idx = torch.empty(N_gauss, k, dtype=torch.long, device=device)
-            knn_dist = torch.empty(N_gauss, k, device=device)
-            chunk = 4096
-            for i in range(0, N_gauss, chunk):
-                j = min(i + chunk, N_gauss)
-                d = torch.cdist(x_gaussian[i:j], x_mpm)
-                dist_c, idx_c = d.topk(k, largest=False, dim=1)
-                knn_idx[i:j] = idx_c
-                knn_dist[i:j] = dist_c
+        knn_dist, knn_idx = knn_search(x_gaussian, x_mpm, k)
 
         # Gaussian kernel weights
         weights = torch.exp(-knn_dist ** 2 / (2.0 * self.sigma ** 2))
