@@ -133,6 +133,27 @@ ABLATION_OVERRIDES = {
     "no_phase_approval": {
         "manifold.phase_approval_enable": False,
     },
+    "no_phase_cc_modulation": {
+        "manifold.phase_cc_modulation_enable": False,
+    },
+    "no_phase_total": {
+        "manifold.phase_approval_enable": False,
+        "manifold.phase_cc_modulation_enable": False,
+    },
+    "no_at2_jacobi": {
+        "manifold.at2_jacobi_enable": False,
+        "manifold.at2_drive_gain": 0.0,
+        "manifold.at2_reg_gain": 0.0,
+    },
+    "no_griffith_gate": {
+        "manifold.growth_griffith_threshold": 0.0,
+    },
+    "branch_direction_angle": {
+        "manifold.branch_direction_mode": "angle",
+    },
+    "branch_direction_hybrid": {
+        "manifold.branch_direction_mode": "hybrid",
+    },
     "no_crack_front_branching": {
         "manifold.successor_topk": 1,
         "manifold.branching_bias": 0.0,
@@ -167,6 +188,13 @@ ABLATION_OVERRIDES = {
         "manifold.edge_break_rate": 0.92,
         "manifold.branching_bias": 0.16,
         "manifold.strict_closure_max_released_ratio": 0.35,
+    },
+    "legacy_F_reset": {
+        "manifold.impact_F_reset_alpha": 1.0,
+    },
+    "legacy_damage_delay": {
+        "manifold.damage_feedback_delay_frames": 8,
+        "manifold.damage_feedback_ramp_frames": 6,
     },
 }
 
