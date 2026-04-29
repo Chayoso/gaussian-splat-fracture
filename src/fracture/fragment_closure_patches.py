@@ -78,6 +78,7 @@ class FragmentClosurePatchMixin:
         corridor_edge_mask: Tensor,
         component_group_map: dict,
         group_ids: set,
+        excluded_mask: Optional[Tensor] = None,
     ) -> dict:
         if positions is None or graph.knn_idx is None or not group_ids:
             return {}
@@ -85,6 +86,11 @@ class FragmentClosurePatchMixin:
         angle_bins, compactness_target, _ = self._closure_params()
         two_pi = float(2.0 * torch.pi)
         scores = {}
+        excluded = (
+            excluded_mask.to(device=labels.device, dtype=torch.bool)
+            if excluded_mask is not None
+            else None
+        )
 
         for group_id in sorted(group_ids):
             in_group = torch.zeros(labels.shape[0], dtype=torch.bool, device=labels.device)
@@ -93,6 +99,8 @@ class FragmentClosurePatchMixin:
                 if component_group_map.get(old_label, old_label) != group_id:
                     continue
                 mask = labels == old_label
+                if excluded is not None:
+                    mask = mask & (~excluded)
                 in_group |= mask
                 group_size += int(mask.sum().item())
             if group_size <= 0:

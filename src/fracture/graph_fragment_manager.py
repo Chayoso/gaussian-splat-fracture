@@ -103,6 +103,7 @@ class GraphFragmentManager(
         phase_approval_enable: bool = True,
         phase_approval_threshold_scale: float = 1.0,
         phase_approval_threshold_offset: float = 0.0,
+        phase_cc_modulation_enable: bool = True,
         material_family: str = "neutral_reference",
         device: str = "cuda",
     ):
@@ -176,6 +177,12 @@ class GraphFragmentManager(
         self.impact_closure_completion_ratio = min(
             max(float(impact_closure_completion_ratio), 0.0), 1.0)
         self.phase_approval_enable = bool(phase_approval_enable)
+        # CC-detection narrow-band modulation: when on, edge_phase_gate is
+        # multiplied into seed_d_cut and used to gate hard_cut.  This
+        # implements the v1.5 narrow-band doctrine but couples connectivity
+        # detection to the phase field; turning it off lets ablations
+        # measure pure surface-graph CC behavior.
+        self.phase_cc_modulation_enable = bool(phase_cc_modulation_enable)
         self.phase_approval_threshold_scale = float(phase_approval_threshold_scale)
         self.phase_approval_threshold_offset = float(phase_approval_threshold_offset)
         self.material_family = str(material_family)
@@ -588,7 +595,7 @@ class GraphFragmentManager(
             auth_i = self.authoritative_cut_memory.unsqueeze(1).expand_as(seed_d_cut)
             auth_j = self.authoritative_cut_memory[graph.knn_idx]
             seed_d_cut = torch.maximum(seed_d_cut, 0.85 * torch.maximum(auth_i, auth_j))
-        if edge_phase_gate is not None:
+        if edge_phase_gate is not None and self.phase_cc_modulation_enable:
             seed_d_cut = seed_d_cut * edge_phase_gate
             if hard_cut is not None:
                 hard_cut = hard_cut & (edge_phase_gate > 0.12)
@@ -741,6 +748,7 @@ class GraphFragmentManager(
             corridor_edge_mask=corridor_edge_mask,
             component_group_map=component_group_map,
             group_ids=candidate_group_ids,
+            excluded_mask=hard_detached_mask,
         )
         _, _, closure_debug_threshold = self._closure_params()
         primary_promoted_labels = set()

@@ -131,6 +131,9 @@ class ManifoldSimulator(
             anisotropy_strength=fp.get('anisotropy_strength', 0.10),
             crack_style=fp.get('sentence_style', fp.get('crack_style', 'material_default')),
             material_family=fp.get('material_family', 'neutral_reference'),
+            growth_griffith_threshold=fp.get('growth_griffith_threshold', 0.50),
+            branch_direction_mode=fp.get('branch_direction_mode', 'energy'),
+            branch_angle_prior_floor=fp.get('branch_angle_prior_floor', 0.50),
             device=device_str,
         )
 
@@ -256,6 +259,7 @@ class ManifoldSimulator(
             phase_approval_enable=fp.get('phase_approval_enable', True),
             phase_approval_threshold_scale=fp.get('phase_approval_threshold_scale', 1.0),
             phase_approval_threshold_offset=fp.get('phase_approval_threshold_offset', 0.0),
+            phase_cc_modulation_enable=fp.get('phase_cc_modulation_enable', True),
             material_family=fp.get('material_family', 'neutral_reference'),
             device=device_str,
         ) if frag_enabled else None

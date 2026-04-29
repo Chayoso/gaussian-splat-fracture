@@ -71,6 +71,17 @@ manifold:
   at2_drive_gain: 1.0
   at2_reg_gain: 1.0
   at2_dc_fraction: 0.5
+  # Crack-front Griffith gate: candidate must clear g_th * normalized drive
+  # before it is allowed to advance.  `growth_griffith_threshold = 0.0`
+  # disables the gate (legacy percentile-only mode).
+  growth_griffith_threshold: 0.50
+  # Branch direction selection. "energy" picks lateral candidate with
+  # highest local drive (Karma-Lobkovsky-like); "angle" preserves the
+  # legacy hash-noise angle target as the dominant factor; "hybrid"
+  # blends them via geometric mean.  In "energy"/"hybrid" the angle
+  # score is floored at `branch_angle_prior_floor` to avoid hard zeros.
+  branch_direction_mode: energy
+  branch_angle_prior_floor: 0.50
   fragment_detect_every: 2
   fragment_damage_threshold: 0.50
   min_fragment_particles: 40

@@ -46,6 +46,7 @@ class GaussianCrackVisualizer:
         interior_surface_opacity: float = 0.72,
         interior_surface_darken: float = 0.38,
         interior_surface_gap_gain: float = 0.72,
+        sh_high_order_damp: float = 0.5,
     ):
         self.damage_threshold = damage_threshold
         self.device = device
@@ -77,6 +78,9 @@ class GaussianCrackVisualizer:
         self.interior_surface_opacity = float(interior_surface_opacity)
         self.interior_surface_darken = float(interior_surface_darken)
         self.interior_surface_gap_gain = float(interior_surface_gap_gain)
+        # SH l>=2 damp factor applied (non-accumulatively) when rotating
+        # _features_rest by the deformation gradient's rotation component.
+        self._sh_high_order_damp = min(max(float(sh_high_order_damp), 0.0), 1.0)
         self.crack_color = torch.tensor(crack_color, dtype=torch.float32, device=device)
 
         # Light direction for dynamic diffuse shading
@@ -167,6 +171,45 @@ class GaussianCrackVisualizer:
         q_old = gaussians._rotation.data  # (K, 4) wxyz
         q_new = self._quat_multiply(q_rot, q_old)
         gaussians._rotation.data = q_new
+
+        # Rotate SH dipole (l=1) terms in _features_rest by the same R, and
+        # damp higher orders (l>=2) since we don't apply full Wigner-D.  The
+        # restore path resets _features_rest from _original_rest each frame,
+        # so the damping is non-accumulative.
+        self._rotate_sh_features_rest(gaussians, R_mat)
+
+    @torch.no_grad()
+    def _rotate_sh_features_rest(self, gaussians, R_mat: Tensor) -> None:
+        """Rotate l=1 SH coefficients by R; damp l>=2 to keep view-dependent
+        appearance from drifting under large fragment rotation.
+
+        3DGS real-SH ordering for l=1 maps (m=-1, 0, +1) -> (y, z, x).  Under
+        a rigid rotation R, the l=1 coefficients transform as a 3-vector
+        after reordering yzx -> xyz, applying R, and reordering back.
+        Higher orders (l=2, 3) require Wigner-D matrices; in this surrogate
+        we damp them by `_sh_high_order_damp` (default 0.5) which avoids
+        wrong view-dependent shading on rotated fragments without nuking the
+        baseline appearance.  Damping is non-accumulative because
+        ``_restore_base_state`` copies ``_original_rest`` back each frame.
+        """
+        if not hasattr(gaussians, '_features_rest'):
+            return
+        rest = gaussians._features_rest.data
+        K = int(R_mat.shape[0])
+        if rest.shape[0] < K or rest.shape[1] < 3:
+            return
+        device = rest.device
+        # l=1 rotation: yzx -> xyz, apply R, then xyz -> yzx
+        yzx_to_xyz = torch.tensor([2, 0, 1], device=device, dtype=torch.long)
+        xyz_to_yzx = torch.tensor([1, 2, 0], device=device, dtype=torch.long)
+        sh_l1 = rest[:K, :3, :]  # (K, 3, C) in (y, z, x)
+        c_xyz = sh_l1.index_select(1, yzx_to_xyz)
+        c_xyz_rot = torch.einsum('kij,kjc->kic', R_mat.to(c_xyz.dtype), c_xyz)
+        sh_l1_rot = c_xyz_rot.index_select(1, xyz_to_yzx)
+        rest[:K, :3, :] = sh_l1_rot
+        if rest.shape[1] > 3:
+            damp = float(getattr(self, '_sh_high_order_damp', 0.5))
+            rest[:K, 3:, :] *= damp
 
     @staticmethod
     def _rotmat_to_quat_batch(R: Tensor) -> Tensor:

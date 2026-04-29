@@ -43,6 +43,9 @@ class CrackFront:
         anisotropy_strength: float = 0.10,
         crack_style: str = "material_default",
         material_family: str = "neutral_reference",
+        growth_griffith_threshold: float = 0.50,
+        branch_direction_mode: str = "energy",
+        branch_angle_prior_floor: float = 0.50,
         device: str = "cuda",
     ):
         self.seed_quantile = seed_quantile
@@ -68,6 +71,19 @@ class CrackFront:
         self.anisotropy_strength = anisotropy_strength
         self.crack_style = str(crack_style)
         self.material_family = str(material_family)
+        # Griffith-style hard gate: candidate must clear g_th of normalized
+        # drive before it is allowed to advance, regardless of aggregate score.
+        self.growth_griffith_threshold = min(
+            max(float(growth_griffith_threshold), 0.0), 1.0)
+        # Branch direction selection: "energy" picks lateral candidate with
+        # highest local drive (Karma-Lobkovsky-like), "angle" preserves the
+        # legacy hash-noise angle target.  "hybrid" blends them.
+        self.branch_direction_mode = str(branch_direction_mode).lower()
+        # In "energy" / "hybrid" mode, the angle_score acts as a soft
+        # modulator floored at this value (so a misaligned but high-energy
+        # candidate still receives `floor` of the score).
+        self.branch_angle_prior_floor = min(
+            max(float(branch_angle_prior_floor), 0.0), 1.0)
         self.device = torch.device(device)
 
         self.tip_mask: Optional[Tensor] = None
@@ -1123,12 +1139,35 @@ class CrackFront:
                 if branch_target_dir is not None:
                     branch_target_align = (edge @ branch_target_dir).clamp(0.0, 1.0)
                     angle_score = torch.maximum(angle_score, branch_target_align)
-                branch_event_score = (
-                    angle_score
-                    * lateral_score
-                    * local_drive
-                    * (1.0 - duplicate_score)
+
+                # Branch direction selection.
+                #   "energy" — pick lateral candidate with highest local drive
+                #              (Karma-Lobkovsky-style: branch follows energy);
+                #              the legacy hash-based angle target only acts as
+                #              a soft modulator floored at branch_angle_prior_floor.
+                #   "angle"  — legacy: angle_score is the dominant factor.
+                #   "hybrid" — geometric mean of the two.
+                energy_branch = (
+                    lateral_score * local_drive * (1.0 - duplicate_score)
                 ).clamp(0.0, 1.0)
+                if self.branch_direction_mode == "angle":
+                    branch_event_score = (
+                        angle_score * energy_branch
+                    ).clamp(0.0, 1.0)
+                elif self.branch_direction_mode == "hybrid":
+                    angle_mod = (
+                        self.branch_angle_prior_floor
+                        + (1.0 - self.branch_angle_prior_floor) * angle_score
+                    )
+                    branch_event_score = torch.sqrt(
+                        (angle_mod * energy_branch).clamp(min=0.0)
+                    ).clamp(0.0, 1.0)
+                else:  # "energy"
+                    angle_mod = (
+                        self.branch_angle_prior_floor
+                        + (1.0 - self.branch_angle_prior_floor) * angle_score
+                    )
+                    branch_event_score = (angle_mod * energy_branch).clamp(0.0, 1.0)
                 branch_bonus = float(family_cfg.get("branch_event_bonus", 0.0))
                 if can_branch_tip and branch_bonus > 0.0:
                     score = score + branch_bonus * branch_event_score
@@ -1137,7 +1176,15 @@ class CrackFront:
             if duplicate_penalty > 0.0:
                 score = score - duplicate_penalty * duplicate_score
 
-            keep = torch.where(score > self.min_successor_score)[0]
+            # Griffith-style gate: candidate must clear the local energy
+            # drive threshold before it is allowed to advance, separate from
+            # the soft aggregate score.  This makes propagation an
+            # energy-conditioned event rather than a pure score quantile.
+            griffith_threshold = self.growth_griffith_threshold
+            griffith_pass = local_drive >= griffith_threshold
+            keep = torch.where(
+                (score > self.min_successor_score) & griffith_pass
+            )[0]
             if keep.numel() == 0:
                 if int(self.tip_age[i].item()) < self.max_tip_age:
                     next_tip_mask[i] = True

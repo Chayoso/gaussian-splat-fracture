@@ -1216,6 +1216,64 @@ class MaterialPriorAdapter:
         return logits
 
     @staticmethod
+    def _apply_family_runtime_caps(
+        runtime: Dict[str, object],
+        family: str,
+    ) -> Dict[str, object]:
+        """Re-clamp tip/branching keys to family bounds.
+
+        ``fracture_prior_to_runtime_overrides`` already clamps these by
+        family, but a sentence-style ``runtime.update()`` can subsequently
+        push them outside the family envelope.  This helper re-applies the
+        per-family bounds so the family is the actual cap, not an
+        easily-overwritten suggestion.  Each rule mirrors the corresponding
+        clamp inside ``fracture_prior_to_runtime_overrides``.
+        """
+        out = dict(runtime)
+        family_name = str(family or "neutral_reference")
+
+        def _get(key: str, default):
+            val = out.get(key, default)
+            try:
+                return type(default)(val)
+            except (TypeError, ValueError):
+                return default
+
+        if family_name == "sharp_brittle":
+            out["manifold.successor_topk"] = 1
+            out["manifold.max_branching_tips"] = min(_get("manifold.max_branching_tips", 8), 8)
+            out["manifold.branch_score_ratio"] = max(
+                _get("manifold.branch_score_ratio", 0.92), 0.92)
+            out["manifold.branch_drive_threshold"] = max(
+                _get("manifold.branch_drive_threshold", 0.62), 0.62)
+        elif family_name == "brittle_moderate":
+            out["manifold.successor_topk"] = min(_get("manifold.successor_topk", 2), 2)
+            out["manifold.max_branching_tips"] = min(_get("manifold.max_branching_tips", 10), 10)
+            out["manifold.branch_score_ratio"] = max(
+                _get("manifold.branch_score_ratio", 0.88), 0.88)
+            out["manifold.branch_drive_threshold"] = max(
+                _get("manifold.branch_drive_threshold", 0.48), 0.48)
+        elif family_name == "rough_quasi_brittle":
+            out["manifold.successor_topk"] = max(_get("manifold.successor_topk", 2), 2)
+            out["manifold.max_branching_tips"] = max(_get("manifold.max_branching_tips", 16), 16)
+            out["manifold.branch_score_ratio"] = max(
+                _get("manifold.branch_score_ratio", 0.72), 0.72)
+            out["manifold.branch_drive_threshold"] = max(
+                _get("manifold.branch_drive_threshold", 0.18), 0.18)
+        elif family_name == "diffuse_damage":
+            out["manifold.successor_topk"] = 0
+            out["manifold.max_branching_tips"] = 0
+            out["manifold.branch_score_ratio"] = 0.999
+            out["manifold.branch_drive_threshold"] = 0.99
+            out["manifold.front_threshold"] = 0.999
+        else:
+            out["manifold.successor_topk"] = min(
+                max(_get("manifold.successor_topk", 1), 1), 2)
+            out["manifold.max_branching_tips"] = min(
+                _get("manifold.max_branching_tips", 12), 12)
+        return out
+
+    @staticmethod
     def _enforce_crack_connected_fragment_runtime(
         runtime: Dict[str, object],
         family: str,
@@ -1226,6 +1284,8 @@ class MaterialPriorAdapter:
         branch density, closure thresholds, and post-fragment scatter.  What
         they cannot do is bypass propagation with arbitrary damage patches.
         Fragment labels are born only from crack-connected closure/ring logic.
+        Family-level tip/branching caps are re-applied so style overrides
+        cannot push them outside the family envelope.
         """
         out = dict(runtime)
         family_name = str(family or "neutral_reference")
@@ -1236,6 +1296,7 @@ class MaterialPriorAdapter:
             out["manifold.shard_enable"] = False
             out["manifold.shard_count_scale"] = 0.0
             out["manifold.debris_motion_gain"] = 0.0
+            out = MaterialPriorAdapter._apply_family_runtime_caps(out, family_name)
             return out
 
         cap_by_family = {
@@ -1262,6 +1323,7 @@ class MaterialPriorAdapter:
             "manifold.shard_count_scale": 0.0,
             "manifold.splitting_enabled": False,
         })
+        out = MaterialPriorAdapter._apply_family_runtime_caps(out, family_name)
         return out
 
     def apply_sentence_style(
