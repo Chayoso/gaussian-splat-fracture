@@ -486,16 +486,26 @@ class FragmentPhysicsMixin:
             omega=omega,
         )
         # Post-impact angular damping (ground friction surrogate).
-        # Without this the SVD-recovered omega is re-injected every
-        # substep via rigid_v and the body rotates indefinitely after
-        # landing.  Free-fall rotation is conserved (no damping until
-        # contact).
+        # Two-regime model:
+        # - Above `shape_match_static_omega` (rad/s): kinetic friction,
+        #   mild multiplicative decay per substep -- preserves a falling
+        #   body's natural tipping/rolling.
+        # - Below threshold: static friction surrogate, aggressive decay
+        #   (omega *= shape_match_static_damping, default 0.5).  This is
+        #   what prevents the body from spinning indefinitely once it
+        #   has tipped over and lies flat: the contact-impulse loop
+        #   keeps injecting tiny torques from numerical noise, and
+        #   without a static threshold the body never reaches rest.
+        # Free-fall rotation is preserved (no damping before contact).
         if (
             self._gravity_drop
             and self._gravity_drop_contacted
-            and self.shape_match_angular_damping < 1.0
         ):
-            omega = omega * float(self.shape_match_angular_damping)
+            omega_norm = float(omega.norm().item())
+            if omega_norm < float(self.shape_match_static_omega):
+                omega = omega * float(self.shape_match_static_damping)
+            elif self.shape_match_angular_damping < 1.0:
+                omega = omega * float(self.shape_match_angular_damping)
 
         dt_eff = max(float(dt), 1e-8)
         rel_target = target - current_com.unsqueeze(0)

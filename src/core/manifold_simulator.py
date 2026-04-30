@@ -406,10 +406,20 @@ class ManifoldSimulator(
             fp.get('shape_match_velocity_blend', 0.35))
         # Per-substep multiplicative decay applied to the shape-matched
         # angular velocity once the body has hit the ground.  Acts as a
-        # surrogate for ground friction; free-fall rotation is preserved.
-        # `1.0` disables (legacy behavior, body spins indefinitely).
+        # surrogate for kinetic ground friction; free-fall rotation is
+        # preserved.  `1.0` disables (legacy behavior, body spins
+        # indefinitely).
         self.shape_match_angular_damping = float(
             fp.get('shape_match_angular_damping', 0.985))
+        # Static-friction surrogate: when omega.norm() falls below this
+        # threshold (rad/s), apply `shape_match_static_damping` per
+        # substep instead of the kinetic-friction value.  Without a
+        # static cutoff the contact impulse loop sustains tiny rotations
+        # from numerical noise indefinitely (body never reaches rest).
+        self.shape_match_static_omega = float(
+            fp.get('shape_match_static_omega', 8.0))
+        self.shape_match_static_damping = float(
+            fp.get('shape_match_static_damping', 0.5))
         self.shape_match_min_particles = max(
             int(fp.get('shape_match_min_particles', 12)), 1)
         self.rigid_contact_enabled = bool(

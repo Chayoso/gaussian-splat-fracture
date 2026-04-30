@@ -96,6 +96,15 @@ manifold:
   # 0.985 default, omega decays ~63% over 30 frames (~half second of
   # animated time at 24 fps).  Set to 1.0 to disable.
   shape_match_angular_damping: 0.985
+  # Static-friction surrogate.  Below `shape_match_static_omega` rad/s,
+  # apply `shape_match_static_damping` per substep instead of the
+  # kinetic-friction value.  Without this the contact-impulse loop
+  # injects tiny torques from numerical noise every substep and the
+  # body never reaches rest -- it slowly drifts back to non-zero
+  # rotation.  At 8 rad/s threshold and 0.5 damping the body settles
+  # within ~10 frames once it has tipped over.
+  shape_match_static_omega: 8.0
+  shape_match_static_damping: 0.5
   fragment_detect_every: 2
   fragment_damage_threshold: 0.50
   min_fragment_particles: 40
