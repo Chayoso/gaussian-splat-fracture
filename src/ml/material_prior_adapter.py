@@ -461,7 +461,15 @@ SENTENCE_STYLE_RULES = (
             "manifold.fragment_persistent_min_size_ratio": 0.0,
             "manifold.fragment_component_hysteresis": 0.22,
             "manifold.fragment_render_min_size": 3,
-            "manifold.fragment_physical_min_size": 24,
+            # Radial shatter: ghost-mesh control.  At
+            # `fragment_physical_min_size = 24` many small graph
+            # patches fall below the registry threshold and stay
+            # labeled as base body (label 0), producing a faint
+            # "original mesh" outline in the physical view.  Drop to 8
+            # so smaller pieces are properly registered as fragments,
+            # leaving only genuinely cohesive remnants in the base
+            # body label.
+            "manifold.fragment_physical_min_size": 8,
             "manifold.fragment_physical_overlap_threshold": 0.06,
             "manifold.fragment_impulse_strength": 0.0,
             "manifold.fragment_event_boost": 1.0,
