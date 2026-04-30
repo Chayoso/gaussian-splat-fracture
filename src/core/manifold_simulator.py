@@ -404,6 +404,12 @@ class ManifoldSimulator(
             fp.get('shape_match_damaged_strength', shape_defaults["damaged"]))
         self.shape_match_velocity_blend = float(
             fp.get('shape_match_velocity_blend', 0.35))
+        # Per-substep multiplicative decay applied to the shape-matched
+        # angular velocity once the body has hit the ground.  Acts as a
+        # surrogate for ground friction; free-fall rotation is preserved.
+        # `1.0` disables (legacy behavior, body spins indefinitely).
+        self.shape_match_angular_damping = float(
+            fp.get('shape_match_angular_damping', 0.985))
         self.shape_match_min_particles = max(
             int(fp.get('shape_match_min_particles', 12)), 1)
         self.rigid_contact_enabled = bool(

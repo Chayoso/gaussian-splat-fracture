@@ -485,6 +485,17 @@ class FragmentPhysicsMixin:
             v_com=v_com,
             omega=omega,
         )
+        # Post-impact angular damping (ground friction surrogate).
+        # Without this the SVD-recovered omega is re-injected every
+        # substep via rigid_v and the body rotates indefinitely after
+        # landing.  Free-fall rotation is conserved (no damping until
+        # contact).
+        if (
+            self._gravity_drop
+            and self._gravity_drop_contacted
+            and self.shape_match_angular_damping < 1.0
+        ):
+            omega = omega * float(self.shape_match_angular_damping)
 
         dt_eff = max(float(dt), 1e-8)
         rel_target = target - current_com.unsqueeze(0)

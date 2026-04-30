@@ -88,6 +88,14 @@ manifold:
   # `branch_event_threshold` with a relative top-K mask so 10K and 50K
   # produce comparable branch density per tip per step.
   branch_event_topk: 2
+  # Post-impact angular damping for shape-matched rigid components.
+  # Multiplicative decay applied per substep once the body lands;
+  # free-fall rotation is preserved.  Without this the SVD-recovered
+  # omega is re-injected every substep via shape matching and the
+  # body spins indefinitely after landing.  At 3 physics substeps and
+  # 0.985 default, omega decays ~63% over 30 frames (~half second of
+  # animated time at 24 fps).  Set to 1.0 to disable.
+  shape_match_angular_damping: 0.985
   fragment_detect_every: 2
   fragment_damage_threshold: 0.50
   min_fragment_particles: 40
