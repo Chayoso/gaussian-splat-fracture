@@ -76,6 +76,193 @@ co-design thesis is strong enough to lead with.
 Recommendation: **Draft B** -- the problem statement is sharper and the
 co-design motivation is exposed directly.
 
+## Method (working draft)
+
+This section drafts the technical body of the paper.  Notation is
+held consistent with the implementation: per-Gaussian quantities use
+subscript ``i``, per-edge quantities use ``(i, j)``, and graph
+operators are written explicitly.
+
+### 3.1 Splat-aligned representation
+
+We sample ``N`` 3D Gaussians on the input mesh's surface with
+tangent-frame-aligned anisotropic scaling: each splat ``g_i`` carries
+position ``p_i ∈ R^3``, opacity ``α_i``, RGB color ``c_i``, scale
+``σ_i ∈ R^3`` (per-axis), and rotation quaternion ``q_i``.  The two
+in-plane axes of ``σ_i`` are larger than the out-of-plane axis, so
+each splat is a flattened ellipsoid lying tangent to the surface.
+Material-conditioned RGB and opacity are assigned procedurally per
+material family before simulation.
+
+A surface graph ``G = (V, E)`` is constructed via kNN over splat
+positions with normal-aware edge filtering: edges between splats
+whose normals point in opposing directions are pruned to prevent
+damage from leaking through thin geometry.  Edge weights ``w_{ij}``
+are Gaussian kernels of distance with bandwidth ``σ_g``.
+
+### 3.2 Surface-graph AT2 phase field
+
+We integrate a single Jacobi step toward the AT2 phase-field
+equilibrium [Bourdin-Francfort-Marigo 2008] on the splat graph.
+With ``H_i`` the irreversibly-accumulated history (``H_i ←
+max(H_i, ψ_i^+)`` where ``ψ_i^+`` is the per-splat tensile drive
+projected from MPM), the equilibrium target is
+
+    c_eq[i] = (a * H_i + b * (l0/σ_g)^2 * lap_c[i]) / (1 + a * H_i),
+
+where ``lap_c[i] = Σ_j w_{ij} (c_j - c_i)`` is the row-normalized
+graph Laplacian, ``l0`` is the Allen-Cahn regularization length, and
+``a``, ``b`` are calibration coefficients (default ``a = b = 1``).
+The damage update is irreversible:
+
+    c_i ← c_i + clip(c_eq[i] - c_i, 0, dC_max * f_dc),
+
+with ``f_dc = 0.5`` so the AT2 layer contributes at most half of the
+allowed per-step damage budget.  The remaining budget is spent by the
+tip-based crack-front correction (§3.3).
+
+### 3.3 Tip-based crack-front with energy gating
+
+While the AT2 base layer evolves the smooth damage field, we maintain
+an explicit set of crack-front tips ``T ⊆ V`` for structured
+propagation.  At each substep, every tip ``i ∈ T`` selects up to
+``k_max`` successor edges ``(i, j)``.  Three gates apply:
+
+**Griffith gate.**  An edge ``(i, j)`` qualifies for advance only if
+its local drive ``ψ_j^+`` clears a Griffith-style threshold
+``g_th = 0.5`` (normalized).  This is a hard binary gate, separate
+from the soft aggregate score, so propagation becomes an
+energy-conditioned event rather than a percentile of the current
+frame's drive distribution.
+
+**Energy-driven branch direction.**  Branching candidates are scored
+by
+
+    s_branch[j] = lateral(j) * drive(j) * (1 - dup(j)),
+
+where ``lateral(j)`` is the perpendicular-to-tip component, ``dup(j)``
+penalizes redundancy with already-visited paths, and the legacy
+hash-noise angle target acts only as a soft modulator with floor
+``φ_floor = 0.5``.  This places branches at energy hot-spots rather
+than at fixed configured angles.
+
+**Top-K resolution-invariant gate.**  Among each tip's ``k_max``
+candidates we keep only the top-``K`` by ``s_branch`` (default
+``K = 2``).  Because ``K`` is a relative ranking rather than an
+absolute threshold, the branch density per tip per advance step is
+bounded as graph density grows.  At ``N = 10K``, ``50K``, ``100K``
+the per-tip branch behavior is identical, even though the legacy
+absolute threshold would let more candidates qualify in the denser
+graph.
+
+### 3.4 Multimodal conditioning
+
+A user prompt ``s`` is encoded by CLIP into a 512-d text embedding.
+Two heads consume the embedding:
+
+**Material retrieval (CLIP-KNN).**  Cosine similarity against a
+pre-encoded `MaterialDB` of described materials yields top-``K``
+nearest entries; their Young's modulus ``E``, fracture toughness
+``G_c``, and Poisson ratio ``ν`` are softmax-weighted and
+log-averaged.  The predicted family among ``{sharp_brittle,
+brittle_moderate, rough_quasi_brittle, neutral_reference,
+diffuse_damage}`` routes through a family-clamp that establishes
+upper bounds on tip count, branching factor, and release ratio.
+
+**Style head (auxiliary learned).**  A two-layer MLP
+(``CLIP_dim → 128 → S``) is trained on weak supervision derived
+from an existing keyword-rule selector applied to a
+``38 phrase × 6 prefix = 228``-sentence template corpus.  The head
+infers among ``S = 5`` canonical morphologies (radial shatter,
+spiderweb branching, single smooth, chunky crumble, diffuse
+microcrack).  When the head's top-class probability exceeds
+``0.55`` the head's prediction drives runtime overrides; otherwise
+the keyword rule is used as fallback.  At inference the head
+generalizes to paraphrased prompts the rule cannot match -- e.g.,
+"the bottle disintegrated into many radial pieces" routes to
+``radial_shatter`` at ``p = 0.996`` although neither
+``radial`` nor ``shatter`` appears in the rule's token list.
+
+**Material physics override.**  When the predicted family is
+``neutral_reference`` AND the prompt mentions a metal token (
+``steel``, ``iron``, ``titanium``, ``aluminum``, ``alloy``, ...
+), runtime is forced to zero out the crack front:
+``successor_topk = 0``, ``enable_front_propagation = False``.  This
+honors the material physics claim that even with explicit
+``radial cracks`` wording, a steel object does not brittle-fracture
+under the simulated impact.
+
+### 3.5 Phase-approved fragment birth
+
+Connected components on the damage-cut graph yield candidate fragment
+patches.  In strict mode (``crack_connected_release_only = True``), a
+patch becomes a fragment only if it survives a narrow-band
+phase-approval gate combining four signals:
+
+    score(patch) = 0.34 * cvol_max + 0.18 * cvol_mean
+                 + 0.24 * φ_max + 0.12 * opening_max
+                 + 0.12 * boundary_score,
+
+with ``cvol`` the volumetric crack proxy, ``φ`` the narrow-band phase
+gate, and ``boundary_score`` the cut-supported boundary edge
+fraction.  Patches passing the gate at ``score ≥ τ_phase`` (family-
+specific, e.g. ``0.34`` for ``sharp_brittle``) are born as
+fragments.  The ``hard_detached_mask`` is excluded from the closure-
+score numerator so previously-detached patches do not inflate the
+scores of new candidate groups.
+
+### 3.6 Physical fragment registry
+
+The graph fragment manager produces per-Gaussian labels every frame,
+but graph labels are noisy at high resolution: small surface patches
+appear and disappear as crack propagation oscillates.  We maintain a
+``_physical_fragment_labels`` registry that filters surface labels
+into coherent persistent chunks satisfying
+``size ≥ fragment_physical_min_size`` AND ``overlap_with_previous ≥
+0.5``.  Each registered chunk receives a stable integer ID across
+frames.  The renderer reads these IDs (not graph IDs) so a
+fragment's color and pose update consistently across the
+animation -- this is what eliminates the "floating Gaussian" artefact
+common in 3DGS-fracture pipelines.
+
+### 3.7 Continuous physics through impact
+
+Fragments and the still-attached body are co-simulated on a shared
+volumetric MPM grid for accurate momentum and contact dynamics:
+
+* Free-fall: COM linear gravity plus optional rigid-body angular
+  velocity ``ω_drop`` so the body can tumble in flight (default
+  ``ω_drop = 0``).  No grid physics during fall.
+* Impact: per-particle velocity is set to ``v_com + ω × (x - com)``
+  preserving rotational state.  Deformation gradient is *not* reset
+  to identity (legacy behaviour); ``F`` and affine velocity ``C``
+  blend toward identity by ``α`` (default ``α = 0``, no reset).
+* Post-impact: damage feedback delay ``τ_d = 4`` frames + ramp
+  ``τ_r = 2``, so damage influences stress within 6 frames after
+  contact (vs. the 14-frame legacy decoupling that left
+  shape-matching solely responsible for cohesion).
+* Shape matching: per-fragment SVD-recovered rotation ``R`` and
+  angular velocity ``ω``.  Post-impact ``ω`` is damped per substep:
+  multiplicative kinetic ``× 0.985`` for ``|ω| ≥ 8`` rad/s, and a
+  more aggressive static-friction surrogate ``× 0.5`` below the
+  threshold.  This pair of regimes gives a settling envelope --
+  rolling motion is preserved during the high-energy phase, and
+  numerical noise from the contact-impulse loop cannot sustain
+  micro-rotation indefinitely once the body has tipped over.
+
+### 3.8 Photoreal rendering
+
+Per-frame splat state is exported as gzipped Houdini JSON
+(``frame_NNNN.geo.gz``) containing ``P, Cd, Alpha, scale (vec3),
+pscale (float), orient (vec4 ijk-s), fragment_id (int), damage,
+N``.  In Houdini the file feeds a ``File SOP → Copy-to-Points``
+network that instances PBR-shaded ellipsoids; HDRI dome lighting and
+Karma path tracing produce the final frames.  Material-conditioned
+shader settings (transmission for glass/ice, subsurface for ceramic,
+etc.) come from a per-family lookup that mirrors the family used by
+the simulator's runtime conditioning.  No per-mesh 3DGS training is
+required; the procedural material LUT defines appearance.
+
 ## Notes
 
 - Five sentence styles is the count exposed by the StyleHead's weak
