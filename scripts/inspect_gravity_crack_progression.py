@@ -32,6 +32,7 @@ from scripts.validate_sentence_materials import (  # noqa: E402
 from src.pipeline.manifold_fracture_pipeline import ManifoldFracturePipeline  # noqa: E402
 from src.diagnostics.raw_graph_plot import save_raw_graph_diagnostic as _save_raw_graph_diagnostic  # noqa: E402
 from src.diagnostics.physical_fragment_plot import save_physical_diagnostic as _save_physical_diagnostic  # noqa: E402
+from src.diagnostics.houdini_export import export_simulator_state as _export_houdini_geo  # noqa: E402
 from src.utils.knn import knn_search  # noqa: E402
 
 
@@ -394,6 +395,22 @@ def _snapshot_metrics(
                     f"impact+{frame - impact_frame}"
                 ),
             )
+
+        # Houdini-readable per-frame state (.geo.gz JSON).  Each snapshot
+        # carries the per-Gaussian attributes a Houdini Copy-to-Points or
+        # Volume Path Trace network needs: P, Cd, Alpha, scale (3-axis),
+        # pscale, orient (quaternion in Houdini ijk-s convention),
+        # fragment_id, damage, and N (crack normal).
+        houdini_dir = out_dir / "houdini_export"
+        houdini_path = houdini_dir / f"{base_name}.geo"
+        try:
+            _export_houdini_geo(
+                houdini_path,
+                simulator=simulator,
+                compress=True,
+            )
+        except Exception as exc:  # pragma: no cover -- diagnostic best-effort
+            print(f"[houdini_export] failed at frame {frame}: {exc}")
 
     row = {
         "loop_frame": int(frame),
