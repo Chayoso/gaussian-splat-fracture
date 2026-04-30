@@ -3,33 +3,27 @@
 Working title and abstract candidates for the SIGGRAPH Asia
 submission.  Updated as the writing progresses.
 
-## Candidate titles
+## Title (selected)
 
-### Primary candidates
+> **Sentence to Shatter: Language-Conditioned Fracture Animation on
+> Gaussian Splats**
 
-1. **Language-Conditioned Surface Phase-Field Fracture for Photorealistic
-   Gaussian Splat Animation**
-   _Standard academic phrasing; safest framing._
+Honest about the input modality (text only -- not image+text, hence
+not "multimodal") while keeping the catchy "Sentence to Shatter"
+prefix.  "Fracture Animation" makes the output explicit and "Gaussian
+Splats" anchors the rendering target.
 
-2. **Splat-Aware Fracture: Co-Designing a Surface Phase-Field Crack Front
-   with Gaussian Splatting**
-   _Surfaces the co-design thesis directly in the title._
+### Earlier candidates (reference)
 
-### Alternative phrasings
-
-3. **Crack on Splats: Promptable Photoreal Fracture via Surface Phase-Field**
-   _Short and catchy; opens with a verb._
-
-4. **Surface-Graph AT2 Phase-Field with Tip-Based Crack Fronts for
-   Controllable Gaussian Splat Fracture**
-   _Method-first, very explicit about what is novel._
-
-5. **Sentence-to-Shatter: Multimodal Fracture Synthesis on Gaussian Splat
-   Manifolds**
-   _Most narrative; emphasizes language conditioning._
-
-Recommendation: **#1** for a conservative submission, **#2** when the
-co-design thesis is strong enough to lead with.
+1. *Language-Conditioned Surface Phase-Field Fracture for Photorealistic
+   Gaussian Splat Animation* -- conservative academic framing.
+2. *Splat-Aware Fracture: Co-Designing a Surface Phase-Field Crack Front
+   with Gaussian Splatting* -- surfaces the co-design thesis.
+3. *Crack on Splats: Promptable Photoreal Fracture via Surface Phase-Field*
+4. *Surface-Graph AT2 Phase-Field with Tip-Based Crack Fronts for
+   Controllable Gaussian Splat Fracture* -- method-first.
+5. *Sentence-to-Shatter: Multimodal Fracture Synthesis on Gaussian Splat
+   Manifolds* -- earlier "multimodal" form (replaced; we only use text).
 
 ## Abstract drafts
 
