@@ -850,6 +850,9 @@ def _run_prompt_progression(
         })
     else:
         summary_row.update(_annotate_birth_causality(snapshot_rows))
+    # Inject the particle count so the verdict can resolution-scale
+    # fragment-count thresholds (calibrated at 10K).
+    summary_row.setdefault("gravity_particles", int(getattr(args, "gravity_particles", 10000)))
     summary_row["expected_release_mode"], summary_row["fragment_release_verdict"] = _release_verdict_for_row(summary_row)
 
     (out_dir / "summary.json").write_text(json.dumps(summary_row, indent=2, ensure_ascii=False), encoding="utf-8")

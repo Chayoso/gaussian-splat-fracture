@@ -129,16 +129,29 @@ def _release_verdict_for_row(row: dict) -> tuple[str, str]:
         or "physical_fragment_drop" in row
     )
 
+    # Resolution scaling: thresholds were calibrated at 10K particles.
+    # At higher resolutions a structurally identical fracture pattern
+    # produces proportionally more graph-level fragment labels because
+    # the surface graph is denser.  We scale fragment-count thresholds
+    # with sqrt(N/10000) so a 50K run is judged on the same physical
+    # bar as a 10K run.  Read total node count from the row's
+    # `gravity_particles` field (injected by the inspect script at row
+    # build time); fall back to 10000 (no scaling) when absent.
+    n_particles = float(row.get("gravity_particles", row.get("n_particles", 10000)) or 10000)
+    res_scale = max((n_particles / 10000.0) ** 0.5, 1.0)
+
     passed = False
     if mode == "crack_connected_fragment":
         if family == "sharp_brittle" and style == "radial_shatter":
+            min_frag_radial = max(int(round(24 * res_scale)), 24)
+            min_branch_radial = max(int(round(32 * res_scale)), 32)
             passed = (
-                max_frags >= 24
+                max_frags >= min_frag_radial
                 and released >= 0.35
                 and released <= 0.68
                 and largest <= 0.65
                 and bcut >= 0.35
-                and branch_events >= 32
+                and branch_events >= min_branch_radial
                 and nonclosure_patches == 0
                 and (first_detach < 0 or first_detach <= 2)
                 and (moved <= 0.35 or not has_motion_metrics)
@@ -154,19 +167,32 @@ def _release_verdict_for_row(row: dict) -> tuple[str, str]:
                 and (moved <= 0.35 or not has_motion_metrics)
             )
     elif mode == "complete_shatter":
-        passed = max_frags >= 48 and released >= 0.40 and largest <= 0.70 and (moved >= 0.04 or not has_motion_metrics)
+        min_frag = max(int(round(48 * res_scale)), 48)
+        passed = max_frags >= min_frag and released >= 0.40 and largest <= 0.70 and (moved >= 0.04 or not has_motion_metrics)
     elif mode == "fragmented_web":
-        passed = max_frags >= 16 and released >= 0.12 and largest <= 0.88 and (moved >= 0.025 or not has_motion_metrics)
+        min_frag = max(int(round(16 * res_scale)), 16)
+        passed = max_frags >= min_frag and released >= 0.12 and largest <= 0.88 and (moved >= 0.025 or not has_motion_metrics)
     elif mode == "chunk_release":
-        passed = max_frags >= 8 and released >= 0.08 and largest <= 0.92 and (moved >= 0.02 or not has_motion_metrics)
+        min_frag = max(int(round(8 * res_scale)), 8)
+        passed = max_frags >= min_frag and released >= 0.08 and largest <= 0.92 and (moved >= 0.02 or not has_motion_metrics)
     elif mode == "crack_split":
-        passed = 1 <= max_frags <= 12 and largest >= 0.50 and nonclosure_patches == 0
+        max_cap = max(int(round(12 * res_scale)), 12)
+        passed = 1 <= max_frags <= max_cap and largest >= 0.50 and nonclosure_patches == 0
     elif mode == "partial_fragment":
         passed = max_frags >= 2 and released >= 0.03
     elif mode == "no_fragment":
-        passed = final_frags <= 1 and released <= 0.01 and moved <= 0.01 and nonclosure_patches == 0
+        # Tolerance scales mildly with resolution for graph-label noise
+        # at 50K+ where a single rogue patch can survive numerically.
+        max_residual_frags = max(int(round(1 * res_scale)), 1)
+        passed = (
+            final_frags <= max_residual_frags
+            and released <= 0.01
+            and moved <= 0.01
+            and nonclosure_patches == 0
+        )
     else:
-        passed = max_frags <= 4
+        max_cap = max(int(round(4 * res_scale)), 4)
+        passed = max_frags <= max_cap
     return mode, "PASS" if passed else "FAIL"
 
 

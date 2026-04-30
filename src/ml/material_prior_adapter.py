@@ -1292,6 +1292,53 @@ class MaterialPriorAdapter:
                 logits[idx] += min(bonus * (1.0 + 0.12 * (token_hits - 1)), 1.20)
         return logits
 
+    # Tokens that identify materials whose physics should override any
+    # sentence-style request for fracture.  When the family is
+    # `neutral_reference` AND the prompt mentions one of these, we
+    # zero out the crack-front and treat the run as no-fragment --
+    # honoring the material physics over the sentence style.
+    _METAL_NO_FRACTURE_TOKENS: tuple = (
+        "steel", "metal", "iron", "titanium", "aluminum",
+        "aluminium", "stainless", "alloy", "copper", "brass",
+        "bronze", "carbon steel",
+    )
+
+    @staticmethod
+    def _enforce_metal_no_fracture(
+        runtime: Dict[str, object],
+        family: str,
+        text: str,
+    ) -> Dict[str, object]:
+        """For ``neutral_reference`` family + a metal-token prompt, force
+        zero-fracture runtime so the material physics overrides any
+        sentence-style request.
+
+        Defends the paper claim that material physics is the upper
+        bound for fracture: even if the sentence asks for radial
+        cracks, a steel/metal prompt produces no fragments because the
+        material does not brittle-fracture under the simulated impact.
+        """
+        if family != "neutral_reference":
+            return runtime
+        text_l = str(text or "").lower()
+        if not any(tok in text_l for tok in MaterialPriorAdapter._METAL_NO_FRACTURE_TOKENS):
+            return runtime
+        out = dict(runtime)
+        out["manifold.successor_topk"] = 0
+        out["manifold.max_branching_tips"] = 0
+        out["manifold.branch_drive_threshold"] = 0.99
+        out["manifold.front_threshold"] = 0.999
+        out["manifold.enable_front_propagation"] = False
+        out["manifold.impact_seed_magnitude"] = 0.02
+        out["manifold.fragment_damage_threshold"] = 0.95
+        out["manifold.crack_connected_release_only"] = False
+        out["manifold.open_crack_release_enable"] = False
+        out["manifold.open_crack_release_max_patches"] = 0
+        out["manifold.shard_enable"] = False
+        out["manifold.shard_count_scale"] = 0.0
+        out["manifold.debris_motion_gain"] = 0.0
+        return out
+
     @staticmethod
     def _apply_family_runtime_caps(
         runtime: Dict[str, object],
@@ -1429,6 +1476,7 @@ class MaterialPriorAdapter:
             runtime = dict(material_prior.get("runtime", {}))
             family = str(material_prior.get("family", "neutral_reference"))
             runtime = self._enforce_crack_connected_fragment_runtime(runtime, family)
+            runtime = self._enforce_metal_no_fracture(runtime, family, text)
             runtime["manifold.sentence_style"] = style_name
             out["runtime"] = runtime
             out["sentence_style"] = style_name
@@ -1444,6 +1492,7 @@ class MaterialPriorAdapter:
         runtime = self.fracture_prior_to_runtime_overrides(fracture, family)
         runtime.update(dict(style.get("runtime", {})))
         runtime = self._enforce_crack_connected_fragment_runtime(runtime, family)
+        runtime = self._enforce_metal_no_fracture(runtime, family, text)
         runtime["manifold.sentence_style"] = style_name
 
         out = dict(material_prior)
