@@ -75,6 +75,16 @@ TIERS = {
         gravity_z=-3500.0,
         media_max_steps=10,
     ),
+    "final50k_long": Tier(
+        particles=50000,
+        frames=200,
+        grids=64,
+        substeps=3,
+        snapshot_stride=4,
+        drop_center_z=0.42,
+        gravity_z=-3500.0,
+        media_max_steps=42,
+    ),
 }
 
 
