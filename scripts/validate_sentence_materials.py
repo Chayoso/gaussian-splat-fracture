@@ -145,6 +145,11 @@ def _release_verdict_for_row(row: dict) -> tuple[str, str]:
         if family == "sharp_brittle" and style == "radial_shatter":
             min_frag_radial = max(int(round(24 * res_scale)), 24)
             min_branch_radial = max(int(round(32 * res_scale)), 32)
+            # Radial-shatter post-fracture motion: with the May-2026
+            # physical-release fix, fragments actually rain down rather
+            # than staying glued to the body, so the motion cap rises
+            # from 0.35 (legacy "no particle spray" guard) to 0.80 to
+            # admit the now-intended downward + lateral spread.
             passed = (
                 max_frags >= min_frag_radial
                 and released >= 0.35
@@ -154,7 +159,7 @@ def _release_verdict_for_row(row: dict) -> tuple[str, str]:
                 and branch_events >= min_branch_radial
                 and nonclosure_patches == 0
                 and (first_detach < 0 or first_detach <= 2)
-                and (moved <= 0.35 or not has_motion_metrics)
+                and (moved <= 0.80 or not has_motion_metrics)
             )
         else:
             passed = (
