@@ -55,6 +55,12 @@ class GaussianGraph:
         self.N: int = 0
         self._build_count: int = 0
         self._normals: Optional[Tensor] = None    # cached normals
+        # Curvature-weighted anisotropy: per-particle in-shell direction of
+        # max curvature ("principal tangent") and the corresponding
+        # anisotropy strength.  Used downstream by the AT2 fracture field
+        # to bias crack normals along natural ridge / curvature lines.
+        self._principal_tangent: Optional[Tensor] = None     # (N, 3) unit
+        self._principal_anisotropy: Optional[Tensor] = None  # (N,) in [0, 1]
 
     def set_normals(self, normals: Tensor) -> None:
         """Store surface normals for normal-aware edge filtering.
@@ -63,6 +69,79 @@ class GaussianGraph:
             normals: (N, 3) unit normals per Gaussian
         """
         self._normals = normals
+
+    @torch.no_grad()
+    def compute_curvature_directions(self, positions: Tensor) -> None:
+        """Per-particle principal in-shell direction via local tangent-plane PCA.
+
+        For each particle, gather kNN neighbours, project their offsets onto
+        the local tangent plane (perpendicular to the stored surface
+        normal), and eigendecompose the weighted covariance.  The
+        eigenvector of the largest eigenvalue is the in-shell direction of
+        maximum local extent -- the natural axis along which thin-shell
+        cracks tend to align (ridge / curvature lines).
+
+        Sets:
+            self._principal_tangent     (N, 3) unit vectors in the tangent
+                                        plane.
+            self._principal_anisotropy  (N,) ratio (lambda1 - lambda2) /
+                                        (lambda1 + lambda2) clamped to
+                                        [0, 1].  Near 1 = strongly
+                                        anisotropic (ridge), near 0 =
+                                        isotropic (flat region).
+        """
+        if (self.knn_idx is None
+                or self._normals is None
+                or self.knn_idx.shape[0] != positions.shape[0]):
+            self._principal_tangent = None
+            self._principal_anisotropy = None
+            return
+        K = int(self.knn_idx.shape[1])
+        if K < 3:
+            self._principal_tangent = None
+            self._principal_anisotropy = None
+            return
+
+        eps = 1e-8
+        N = positions.shape[0]
+        nbr = positions[self.knn_idx]                            # (N, K, 3)
+        centered = nbr - positions.unsqueeze(1)                  # (N, K, 3)
+
+        # Project out the surface-normal component to get in-plane offsets.
+        n = self._normals                                        # (N, 3)
+        n_dot = (centered * n.unsqueeze(1)).sum(dim=2, keepdim=True)
+        in_plane = centered - n_dot * n.unsqueeze(1)             # (N, K, 3)
+
+        # Use existing kNN Gaussian weights if available, else uniform.
+        if self.weights is not None and self.weights.shape == (N, K):
+            w = self.weights.clamp(min=0.0)
+        else:
+            w = torch.full((N, K), 1.0 / K, device=positions.device,
+                           dtype=positions.dtype)
+
+        weighted = in_plane * w.unsqueeze(2)                     # (N, K, 3)
+        cov = torch.einsum('nki,nkj->nij', in_plane, weighted)   # (N, 3, 3)
+
+        try:
+            eigvals, eigvecs = torch.linalg.eigh(cov)            # ascending
+        except RuntimeError:
+            self._principal_tangent = None
+            self._principal_anisotropy = None
+            return
+
+        # Largest in-plane eigenvalue is the last; second-largest is -2.
+        principal = eigvecs[..., -1]                             # (N, 3)
+        principal = principal / principal.norm(dim=1, keepdim=True).clamp(min=eps)
+
+        l1 = eigvals[..., -1]
+        l2 = eigvals[..., -2]
+        aniso = ((l1 - l2) / (l1 + l2 + eps)).clamp(0.0, 1.0)
+
+        # If a particle has nearly-degenerate covariance (l1 ~ l2), aniso
+        # is near 0 and the principal direction is unreliable; downstream
+        # blending uses aniso as the gate, so this is safe to leave.
+        self._principal_tangent = principal
+        self._principal_anisotropy = aniso
 
     def build(self, positions: Tensor, force: bool = False) -> None:
         """

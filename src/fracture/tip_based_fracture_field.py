@@ -49,6 +49,7 @@ class GaussianFractureField:
         at2_drive_gain: float = 1.0,
         at2_reg_gain: float = 1.0,
         at2_dc_fraction: float = 0.5,
+        curvature_weight: float = 0.0,
         graph: Optional[GaussianGraph] = None,
         crack_front: Optional[CrackFront] = None,
         device: str = "cuda",
@@ -92,6 +93,11 @@ class GaussianFractureField:
         self.at2_drive_gain = max(float(at2_drive_gain), 0.0)
         self.at2_reg_gain = max(float(at2_reg_gain), 0.0)
         self.at2_dc_fraction = min(max(float(at2_dc_fraction), 0.0), 1.0)
+        # Curvature-weighted anisotropy: blend the gradient-derived crack
+        # normal with the in-plane direction perpendicular to the local
+        # principal-curvature tangent.  0.0 disables (paper-baseline AT2),
+        # 0.4--0.5 favors thin-shell ridge alignment.
+        self.curvature_weight = max(min(float(curvature_weight), 1.0), 0.0)
         self.device = torch.device(device)
 
         self.graph = graph or GaussianGraph(device=device)
@@ -163,6 +169,25 @@ class GaussianFractureField:
 
         self._frame_count += 1
         self.graph.build(positions)
+
+        # Lazy one-shot curvature direction precompute.  Done once on the
+        # first build with a populated kNN graph; rest-shape curvature is
+        # essentially constant for a brittle shell up to fracture, so a
+        # single PCA per node is sufficient and amortized.
+        if (self.curvature_weight > 0.0
+                and getattr(self.graph, "_principal_tangent", None) is None
+                and self.graph.knn_idx is not None
+                and getattr(self.graph, "_normals", None) is not None):
+            self.graph.compute_curvature_directions(positions)
+            if (self._frame_count == 1
+                    and self.graph._principal_anisotropy is not None):
+                aniso = self.graph._principal_anisotropy
+                print(
+                    f"[FractureField] Curvature directions cached: "
+                    f"w={self.curvature_weight:.2f} "
+                    f"aniso mean={float(aniso.mean()):.3f} "
+                    f"max={float(aniso.max()):.3f}"
+                )
 
         if impact_center is not None:
             self.seed_center = impact_center.detach().clone()
@@ -497,6 +522,43 @@ class GaussianFractureField:
         has_grad = damaged & (grad_mag > 1e-4)
         if has_grad.any():
             self.n[has_grad] = grad_c[has_grad] / grad_mag[has_grad].unsqueeze(1)
+
+        # --- Curvature-weighted anisotropy ---
+        # Blend the gradient-derived normal with the in-plane direction
+        # perpendicular to the local principal-curvature tangent.  Cracks
+        # in thin shells naturally align ALONG ridges, so the in-plane
+        # crack normal sits perpendicular to the ridge tangent.  The
+        # blend weight is gated by per-node anisotropy so flat regions
+        # (where the principal tangent is undefined) are not biased.
+        if (self.curvature_weight > 0.0
+                and getattr(self.graph, "_principal_tangent", None) is not None
+                and getattr(self.graph, "_principal_anisotropy", None) is not None
+                and getattr(self.graph, "_normals", None) is not None
+                and has_grad.any()):
+            pt = self.graph._principal_tangent
+            sn = self.graph._normals
+            aniso = self.graph._principal_anisotropy
+            if (pt.shape[0] == self.n.shape[0]
+                    and sn.shape[0] == self.n.shape[0]
+                    and aniso.shape[0] == self.n.shape[0]):
+                # In-plane perpendicular to principal tangent.
+                n_curv = torch.cross(sn, pt, dim=1)
+                n_curv = n_curv / n_curv.norm(dim=1, keepdim=True).clamp(min=1e-8)
+                # Align sign with the existing gradient-based normal so
+                # the blend doesn't cancel.
+                idx = has_grad
+                ref = self.n[idx]
+                cand = n_curv[idx]
+                sign = torch.where(
+                    (ref * cand).sum(dim=1, keepdim=True) >= 0.0,
+                    torch.ones_like(ref[:, :1]),
+                    -torch.ones_like(ref[:, :1]),
+                )
+                cand = cand * sign
+                w = (self.curvature_weight * aniso[idx]).unsqueeze(1)
+                blended = (1.0 - w) * ref + w * cand
+                blended = blended / blended.norm(dim=1, keepdim=True).clamp(min=1e-8)
+                self.n[idx] = blended
 
         remaining_idx = torch.where(damaged & ~has_grad)[0]
         if remaining_idx.numel() == 0:

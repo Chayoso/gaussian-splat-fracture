@@ -433,7 +433,14 @@ SENTENCE_STYLE_RULES = (
             "manifold.branching_bias": 0.90,
             "manifold.min_successor_score": 0.075,
             "manifold.drive_quantile": 0.44,
+            # AT2 propagation: full burst mode (cracks complete in 1-2
+            # sim frames).  Visual "sudden transform" feel is mitigated
+            # at the playback layer (30/60 FPS viewer) where each sim
+            # frame plays at ~16-33ms, so the ~1-2 frame burst spans
+            # ~30-60ms of real playback -- close to how brittle glass
+            # actually fractures.
             "manifold.front_substeps": 4,
+            "manifold.at2_drive_gain": 1.0,
             "manifold.damage_spread": 0.12,
             "manifold.damage_source_scale": 0.50,
             "manifold.edge_break_rate": 1.00,
@@ -457,34 +464,89 @@ SENTENCE_STYLE_RULES = (
             "manifold.open_crack_release_threshold": 1.0,
             "manifold.brittle_release_intensity": 1.80,
             "manifold.impact_release_gain": 1.34,
-            "manifold.fragment_persistent_min_size": 8,
-            "manifold.fragment_persistent_min_size_ratio": 0.0,
+            # Middle-ground thresholds: between v1.5 paper-baseline
+            # (120/24 -> ~50 chunky fragments) and v6 (8/8 -> 308
+            # micro-fragments, looked like exploding noise).  Values
+            # below are calibrated for ~10K particles and roughly
+            # ~100--150 fragments.  For higher particle counts the
+            # ratio (0.0012) auto-scales the persistent threshold;
+            # physical_min_size and render_min_size should additionally
+            # be scaled by sqrt(N / 10K) at runtime if a coarser
+            # fragment density is desired.
+            "manifold.fragment_persistent_min_size": 40,
+            "manifold.fragment_persistent_min_size_ratio": 0.0012,
             "manifold.fragment_component_hysteresis": 0.22,
             "manifold.fragment_render_min_size": 3,
-            # Radial shatter: ghost-mesh control.  At
-            # `fragment_physical_min_size = 24` many small graph
-            # patches fall below the registry threshold and stay
-            # labeled as base body (label 0), producing a faint
-            # "original mesh" outline in the physical view.  Drop to 8
-            # so smaller pieces are properly registered as fragments,
-            # leaving only genuinely cohesive remnants in the base
-            # body label.
-            "manifold.fragment_physical_min_size": 8,
+            "manifold.fragment_physical_min_size": 12,
+            # Curvature-weighted anisotropy: bias crack normals along the
+            # local principal-curvature tangent so fractures follow
+            # natural ridge / curvature lines instead of the kNN-grid
+            # axes.  0.4 = moderate bias; flat regions are gated by
+            # per-node anisotropy so radial cracks at impact still
+            # propagate freely.
+            "manifold.curvature_weight": 0.4,
+            # Causal-support gate: a fragment candidate is rejected
+            # unless the mean cut-vote across its boundary is at least
+            # this ratio.  Eliminates the "fragments form before crack
+            # tips arrive" artefact -- AT2 damage diffuses wider than
+            # tips travel, and without this gate ~38% of boundaries are
+            # formed without crack support.  0.55 lets natural radial
+            # shatter still complete in 1-2 frames (burst mode) while
+            # blocking the diffusion-only patches that previously
+            # showed up as ghost fragments in raw-graph diagnostics.
+            "manifold.fragment_boundary_cut_min_ratio": 0.55,
             "manifold.fragment_physical_overlap_threshold": 0.06,
             "manifold.fragment_impulse_strength": 0.0,
             "manifold.fragment_event_boost": 1.0,
             "manifold.fragment_impulse_boost_frames": 0,
             "manifold.fragment_offset_gain": 1.0,
             "manifold.debris_motion_gain": 0.0,
-            # Radial shatter: aggressive separation so fragments
-            # actually rain down from the body rather than staying
-            # graph-labeled but physically attached.
-            "manifold.fragment_physical_gap_scale": 0.0010,
-            "manifold.fragment_physical_release_velocity": 0.025,
-            "manifold.fragment_physical_downward_bias": 0.35,
-            "manifold.fragment_physical_release_frames": 60,
-            "manifold.fragment_physical_lateral_bias": 0.55,
-            "manifold.fragment_physical_spin_gain": 0.06,
+            # Radial shatter: small initial separation kick, then
+            # natural gravity-driven fall.  Earlier (v5) settings of
+            # release_velocity 0.025 + lateral_bias 0.55 over 60
+            # substeps produced an explosive lateral burst rather
+            # than a "rain down" look.  Softened to a gentle nudge
+            # (release window 30 substeps) so gravity dominates the
+            # rest of the post-impact trajectory.
+            "manifold.fragment_physical_gap_scale": 0.0006,
+            # Punchy release impulse: 0.4 over 10 frames (= 0.04 / frame
+            # peak) carries the pre-impact kinetic energy outward into
+            # fragments before MPM floor contact zeros v_com.  Earlier
+            # 0.010 over 30 frames was too gentle -- fragments started
+            # nearly stationary after impact ("느리게 처음 움직이는").
+            "manifold.fragment_physical_release_velocity": 0.4,
+            "manifold.fragment_physical_downward_bias": 0.65,
+            "manifold.fragment_physical_release_frames": 10,
+            "manifold.fragment_physical_lateral_bias": 0.20,
+            "manifold.fragment_physical_spin_gain": 0.04,
+            # Per-fragment random jitter on release_dir / spin_axis /
+            # speed.  Without this all fragments share the same outward-
+            # plus-down direction and synchronized release_velocity ramp,
+            # producing a coordinated "elastic-breathing" expansion +
+            # contraction look.  With 0.30 jitter each fragment gets a
+            # unique deterministic-but-distinct kick, breaking the
+            # lockstep into chaotic scatter -- closer to real glass
+            # shatter trajectories.
+            "manifold.fragment_release_jitter": 0.30,
+            # Loosen rigid-body coupling so fragments fall under gravity.
+            # Sharp_brittle family default is 0.97 which makes shape
+            # matching average per-fragment v_com over particles -- when
+            # half a fragment touches floor (v=0) and half is in-air,
+            # the in-air half gets dragged toward zero velocity, so the
+            # fragment hovers instead of falling.  0.7 lets MPM physics
+            # (gravity, free-fall) dominate while still keeping fragments
+            # mostly rigid.
+            "manifold.shape_match_fragment_strength": 0.20,
+            "manifold.fragment_physical_max_speed": 2.40,
+            # No floor bounce so fragments don't lift after contact.
+            "manifold.rigid_contact_restitution": 0.0,
+            # Post-impact gravity matching free-fall: hardcoded default
+            # is -400 for sharp_brittle but pre-impact uses -2000, so
+            # fragments stop accelerating after impact (visually look
+            # like they "hover").  Match free-fall magnitude so the
+            # whole drop is a single uniformly-accelerating motion.
+            "manifold.post_impact_gravity_z": -2000.0,
+            "manifold.post_impact_damping": 0.985,
             "manifold.shard_enable": False,
             "manifold.shard_count_scale": 0.0,
         },
@@ -1437,7 +1499,12 @@ class MaterialPriorAdapter:
             return out
 
         cap_by_family = {
-            "sharp_brittle": 0.68,
+            # Raised from 0.68 to 0.92 so the `radial_shatter` style
+            # can produce true "complete shatter": only ~8% base
+            # remnant instead of 32%.  Other sharp_brittle styles
+            # (spiderweb, single_smooth) clamp themselves lower in
+            # their own runtime overrides, so they are unaffected.
+            "sharp_brittle": 0.92,
             "brittle_moderate": 0.46,
             "rough_quasi_brittle": 0.42,
             "neutral_reference": 0.35,

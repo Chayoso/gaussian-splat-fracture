@@ -166,6 +166,7 @@ class ManifoldSimulator(
             at2_drive_gain=fp.get('at2_drive_gain', 1.0),
             at2_reg_gain=fp.get('at2_reg_gain', 1.0),
             at2_dc_fraction=fp.get('at2_dc_fraction', 0.5),
+            curvature_weight=fp.get('curvature_weight', 0.0),
             graph=self.graph,
             crack_front=crack_front,
             device=device_str,
@@ -237,6 +238,7 @@ class ManifoldSimulator(
             support_release_threshold=fp.get('support_release_threshold', 0.56),
             support_promote_min_size=fp.get('support_promote_min_size', 6),
             support_overlap_threshold=fp.get('support_overlap_threshold', 0.10),
+            fragment_boundary_cut_min_ratio=fp.get('fragment_boundary_cut_min_ratio', 0.0),
             open_crack_release_enable=fp.get('open_crack_release_enable', True),
             open_crack_release_threshold=fp.get('open_crack_release_threshold', 0.0),
             open_crack_release_max_patches=fp.get('open_crack_release_max_patches', 2),
@@ -392,6 +394,8 @@ class ManifoldSimulator(
             fp.get('fragment_physical_lateral_bias', shape_defaults.get("fragment_lateral_bias", 0.0)))
         self.fragment_physical_spin_gain = float(
             fp.get('fragment_physical_spin_gain', shape_defaults.get("fragment_spin_gain", 0.0)))
+        self.fragment_release_jitter = max(0.0, float(
+            fp.get('fragment_release_jitter', 0.0)))
         self.fragment_physical_max_speed = float(
             fp.get('fragment_physical_max_speed', shape_defaults.get("fragment_max_speed", 0.35)))
         self.shape_matching_enabled = bool(
@@ -1563,12 +1567,19 @@ class ManifoldSimulator(
               f"seed_mag={seed_magnitude:.3f} Hx={seed_H_multiplier:.2f} "
               f"release_gain={self._impact_release_gain:.2f}")
 
-        # Post-impact physics adjustments
+        # Post-impact physics adjustments.  Default values (-220 / -400)
+        # are intentionally weakened relative to the free-fall gravity
+        # (-2000) for diffuse-damage / soft materials so fragments don't
+        # tunnel through the floor.  For brittle materials we want
+        # uniformly accelerating fall before AND after impact, so allow
+        # a runtime override to keep gravity at its free-fall magnitude.
         g_vec = self.mpm.gravity.clone()
         g_vec[:] = 0.0
-        g_vec[2] = -220.0 if self.material_family == "diffuse_damage" else -400.0
+        default_gz = -220.0 if self.material_family == "diffuse_damage" else -400.0
+        g_vec[2] = float(self.fracture_cfg.get('post_impact_gravity_z', default_gz))
         self.mpm.gravity = g_vec
-        self.mpm.damping = 0.995 if self.material_family == "diffuse_damage" else 0.975
+        default_damping = 0.995 if self.material_family == "diffuse_damage" else 0.975
+        self.mpm.damping = float(self.fracture_cfg.get('post_impact_damping', default_damping))
         print(f"  [POST-IMPACT] gravity→[0,0,{g_vec[2].item():.0f}] damping→{self.mpm.damping:.3f}")
 
     # ================================================================

@@ -82,6 +82,7 @@ class GraphFragmentManager(
         support_release_threshold: float = 0.56,
         support_promote_min_size: int = 6,
         support_overlap_threshold: float = 0.10,
+        fragment_boundary_cut_min_ratio: float = 0.0,
         open_crack_release_enable: bool = True,
         open_crack_release_threshold: float = 0.0,
         open_crack_release_max_patches: int = 2,
@@ -153,6 +154,14 @@ class GraphFragmentManager(
         self.support_release_threshold = float(support_release_threshold)
         self.support_promote_min_size = int(support_promote_min_size)
         self.support_overlap_threshold = float(support_overlap_threshold)
+        # Causal-support gate: a fragment candidate is rejected when the
+        # mean cut-vote across its boundary is below this ratio.  0.0
+        # disables (paper-baseline behavior); 0.4--0.6 enforces that
+        # fragment boundaries actually align with cracked edges, fixing
+        # the "premature fragmentation" mismatch where AT2 damage
+        # diffusion forms patches before crack tips arrive.
+        self.fragment_boundary_cut_min_ratio = max(
+            min(float(fragment_boundary_cut_min_ratio), 1.0), 0.0)
         self.open_crack_release_enable = bool(open_crack_release_enable)
         self.open_crack_release_threshold = float(open_crack_release_threshold)
         self.open_crack_release_max_patches = max(int(open_crack_release_max_patches), 0)

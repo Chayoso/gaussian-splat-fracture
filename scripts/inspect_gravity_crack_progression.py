@@ -286,6 +286,8 @@ def _snapshot_metrics(
     previous_event_count: int,
     mesh_visual_state: dict | None = None,
     save_plot: bool = True,
+    save_houdini: bool = True,
+    pre_impact: bool = False,
 ) -> tuple[dict, int]:
     positions, c, visited, tips, front = _surface_state(simulator)
     fragment_ids = _fragment_ids(simulator, int(c.shape[0]))
@@ -323,7 +325,10 @@ def _snapshot_metrics(
     )
     crack_frame = int(getattr(front, "_advance_step", 0)) if front is not None else 0
 
-    base_name = f"frame_{frame:04d}_impact_{frame - impact_frame:03d}"
+    if pre_impact:
+        base_name = f"frame_{frame:04d}_fall_{frame:03d}"
+    else:
+        base_name = f"frame_{frame:04d}_impact_{frame - impact_frame:03d}"
     plot_path = out_dir / "snapshots" / f"{base_name}_raw_graph.png"
     physical_plot_path = out_dir / "snapshots" / f"{base_name}_physical.png"
     if save_plot:
@@ -396,11 +401,14 @@ def _snapshot_metrics(
                 ),
             )
 
-        # Houdini-readable per-frame state (.geo.gz JSON).  Each snapshot
-        # carries the per-Gaussian attributes a Houdini Copy-to-Points or
-        # Volume Path Trace network needs: P, Cd, Alpha, scale (3-axis),
-        # pscale, orient (quaternion in Houdini ijk-s convention),
-        # fragment_id, damage, and N (crack normal).
+    # Houdini-readable per-frame state (.geo.gz JSON).  Each snapshot
+    # carries the per-Gaussian attributes a Houdini Copy-to-Points or
+    # Volume Path Trace network needs: P, Cd, Alpha, scale (3-axis),
+    # pscale, orient (quaternion in Houdini ijk-s convention),
+    # fragment_id, damage, and N (crack normal).  Decoupled from
+    # ``save_plot`` so dense per-frame Houdini exports can run without
+    # paying the matplotlib PNG-rendering cost (--skip-png).
+    if save_houdini:
         houdini_dir = out_dir / "houdini_export"
         houdini_path = houdini_dir / f"{base_name}.geo"
         try:
@@ -620,7 +628,14 @@ def _write_report(
         "| ---: | ---: | ---: | ---: | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: | --- | ---: | ---: | ---: | --- |",
     ]
     for row in rows:
-        plot_rel = Path(row["plot"]).relative_to(out_dir)
+        plot_str = str(row.get("plot") or "")
+        if plot_str:
+            try:
+                plot_rel = Path(plot_str).relative_to(out_dir)
+            except ValueError:
+                plot_rel = Path(plot_str)
+        else:
+            plot_rel = Path("")
         lines.append(
             "| {loop} | {impact} | {crack} | {cmax:.3f} | {ymax:.3f} | {seed_gate:.2f}/{gate:.2f}/{cut_gate:.2f} | {cvol:.3f}/{cproxy:.3f} | {phase_birth} | {omega:.3f} | {cracked} | {visited} | {tips} | "
             "{labels} | {detached} | {hard_det} | {new_det} | {rel:.3f} | {largest:.3f} | {closure:.3f} | {causal_edges} | {bcut:.3f} | {birth} | {phys_open} | "
@@ -718,26 +733,32 @@ def _run_prompt_progression(
 
     def callback(frame: int, simulator, stats: dict) -> None:
         nonlocal impact_frame, previous_event_count
-        if not bool(stats.get("gravity_contacted", False)):
-            return
-        if impact_frame is None:
+        contacted = bool(stats.get("gravity_contacted", False))
+        if contacted and impact_frame is None:
             impact_frame = int(frame)
-        since_impact = int(frame) - int(impact_frame)
+        # Allow pre-impact snapshots so the falling motion shows up in
+        # the .geo.gz timeline.  Without this the viewer only sees the
+        # post-impact shatter and misses the entire drop animation.
+        effective_impact = int(impact_frame) if impact_frame is not None else int(frame)
+        since_impact = int(frame) - effective_impact
         is_snapshot = (
-            since_impact == 0
-            or since_impact % max(int(args.snapshot_stride), 1) == 0
+            int(frame) == 0
+            or (impact_frame is not None and since_impact == 0)
+            or int(frame) % max(int(args.snapshot_stride), 1) == 0
             or int(frame) == int(args.gravity_frames) - 1
         )
         row, previous_event_count = _snapshot_metrics(
             frame=int(frame),
-            impact_frame=int(impact_frame),
+            impact_frame=effective_impact,
             simulator=simulator,
             stats=stats,
             prompt=prompt,
             out_dir=out_dir,
             previous_event_count=previous_event_count,
             mesh_visual_state=mesh_visual_state,
-            save_plot=is_snapshot,
+            save_plot=is_snapshot and not args.skip_png,
+            save_houdini=is_snapshot,
+            pre_impact=(impact_frame is None),
         )
         metric_rows.append(row)
         if not is_snapshot:
@@ -936,6 +957,9 @@ def main() -> None:
     parser.add_argument("--physics-substeps", type=int, default=3)
     parser.add_argument("--fragment-every", type=int, default=1)
     parser.add_argument("--snapshot-stride", type=int, default=5)
+    parser.add_argument("--skip-png", action="store_true",
+                        help="skip raw_graph + physical PNG renders; "
+                             "Houdini .geo.gz still exported each snapshot")
     parser.add_argument("--drop-center-z", type=float, default=0.42)
     parser.add_argument("--gravity-z", type=float, default=-3500.0)
     parser.add_argument(

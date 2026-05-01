@@ -195,7 +195,21 @@ class FragmentPhysicsMixin:
                     ((1.0 - lateral_bias) * direction + lateral_bias * lateral).unsqueeze(0)
                 ).squeeze(0)
             stored_dir = state.get("release_dir")
+            jitter_mag = max(0.0, float(getattr(self, "fragment_release_jitter", 0.0)))
             if stored_dir is None:
+                # Per-fragment deterministic-but-distinct perturbation:
+                # seed an RNG with the fragment id so each fragment gets
+                # a UNIQUE direction jitter, breaking the lockstep
+                # "elastic-breathing" look where every fragment moves
+                # along the same radial-out + downward path.
+                if jitter_mag > 0.0:
+                    gen = torch.Generator(device="cpu")
+                    gen.manual_seed(int(frag_id) * 9173 + 17)
+                    rand3 = torch.randn(3, generator=gen).to(direction.device).to(direction.dtype)
+                    rand3 = rand3 / rand3.norm().clamp(min=1e-8)
+                    direction = self._safe_vector_normalize(
+                        ((1.0 - jitter_mag) * direction + jitter_mag * rand3).unsqueeze(0)
+                    ).squeeze(0)
                 state["release_dir"] = direction.detach().clone()
             else:
                 direction = self._safe_vector_normalize(
@@ -209,13 +223,39 @@ class FragmentPhysicsMixin:
                 spin_axis = torch.cross(direction, up, dim=0)
                 if float(spin_axis.norm().item()) < 1e-8:
                     spin_axis = torch.tensor([1.0, 0.0, 0.0], device=self.x_mpm.device, dtype=self.x_mpm.dtype)
-                spin_axis = self._safe_vector_normalize(spin_axis.unsqueeze(0)).squeeze(0)
+                # Per-fragment random tilt of the spin axis so fragments
+                # tumble around different axes instead of all spinning
+                # around the same horizontal-tangent direction.
+                if jitter_mag > 0.0:
+                    gen = torch.Generator(device="cpu")
+                    gen.manual_seed(int(frag_id) * 9173 + 53)
+                    rand3 = torch.randn(3, generator=gen).to(spin_axis.device).to(spin_axis.dtype)
+                    rand3 = rand3 / rand3.norm().clamp(min=1e-8)
+                    spin_axis = self._safe_vector_normalize(
+                        ((1.0 - 0.85 * jitter_mag) * spin_axis + 0.85 * jitter_mag * rand3).unsqueeze(0)
+                    ).squeeze(0)
+                else:
+                    spin_axis = self._safe_vector_normalize(spin_axis.unsqueeze(0)).squeeze(0)
                 state["spin_axis"] = spin_axis.detach().clone()
             else:
                 spin_axis = self._safe_vector_normalize(spin_axis.to(self.x_mpm.device).unsqueeze(0)).squeeze(0)
 
-            gap_step = self.fragment_physical_gap_scale * taper * (1.0 + 1.25 * release_score)
-            vel_step = self.fragment_physical_release_velocity * taper * (0.55 + 0.95 * release_score)
+            # Per-fragment random scale on the release magnitudes so
+            # fragments don't all reach peak velocity at the same instant.
+            speed_scale = 1.0
+            if jitter_mag > 0.0:
+                gen = torch.Generator(device="cpu")
+                gen.manual_seed(int(frag_id) * 9173 + 91)
+                # Uniform multiplier in [1 - jitter_mag, 1 + jitter_mag].
+                speed_scale = float(1.0 + jitter_mag * (2.0 * torch.rand(1, generator=gen).item() - 1.0))
+                state["speed_scale"] = speed_scale
+            else:
+                speed_scale = float(state.get("speed_scale", 1.0))
+
+            gap_step = (self.fragment_physical_gap_scale * taper
+                        * (1.0 + 1.25 * release_score) * speed_scale)
+            vel_step = (self.fragment_physical_release_velocity * taper
+                        * (0.55 + 0.95 * release_score) * speed_scale)
             pseudo_mass = max(float(state.get("pseudo_thickness_mass", int(mask.sum().item()))), 1.0)
             mass_scale = max(0.62, min((float(mask.sum().item()) / pseudo_mass) ** 0.25, 1.18))
             gap_step *= mass_scale

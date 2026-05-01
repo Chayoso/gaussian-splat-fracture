@@ -559,14 +559,19 @@ class GaussianCrackVisualizer:
             gaussians._scaling.data[debris_mask] -= 0.25 * self.fragment_shell_gain
             gaussians._features_dc.data[debris_mask] *= max(0.35, 1.0 - self.debris_darkening)
 
-        # Manifold fracture visualization (crack normals + opening)
+        # Manifold fracture visualization (crack normals + opening).
+        # Fragmented Gaussians (fragment_id > 0) are physically detached
+        # already, so the per-particle crack-gap offset only adds visual
+        # noise on top of their MPM-rigid pose.  Pass fragment_ids so
+        # those splats are excluded from the gap-opening offset.
         if crack_normals is not None and crack_opening is not None:
             if self.material_family == "diffuse_damage":
                 self._apply_damage_visualization(gaussians, c_surface)
             else:
                 self._apply_manifold_crack_visualization(
                     gaussians, c_surface, crack_normals, crack_opening,
-                    crack_tips=crack_tips, crack_visited=crack_visited)
+                    crack_tips=crack_tips, crack_visited=crack_visited,
+                    fragment_ids=fragment_ids)
         else:
             # Legacy: scalar damage visualization
             has_damage = (c_surface is not None
@@ -606,6 +611,7 @@ class GaussianCrackVisualizer:
         crack_opening: Tensor,
         crack_tips: Tensor = None,
         crack_visited: Tensor = None,
+        fragment_ids: Tensor = None,
     ):
         """Visualize cracks using manifold fracture state.
 
@@ -665,6 +671,12 @@ class GaussianCrackVisualizer:
 
         # --- 2. Position offset along crack normal (opening) ---
         open_mask = ((c_surface > 0.35) | crack_tips) & (crack_opening > 1e-4)
+        # Already-fragmented Gaussians (fragment_id > 0) are detached and
+        # follow MPM rigid-body motion; the per-particle crack-gap offset
+        # would only inject visible per-frame jitter on top of that, so
+        # exclude them.
+        if fragment_ids is not None and fragment_ids.shape[0] >= open_mask.shape[0]:
+            open_mask = open_mask & (fragment_ids[:open_mask.shape[0]] == 0)
         if open_mask.any() and crack_normals is not None:
             # Offset Gaussians slightly along crack normal
             # Creates a visible gap effect

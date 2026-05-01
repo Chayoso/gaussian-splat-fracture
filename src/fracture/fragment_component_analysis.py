@@ -454,6 +454,15 @@ class FragmentComponentAnalysisMixin:
                 continue
             if cut_support < self.support_overlap_threshold:
                 continue
+            # Causal-support gate (B): reject candidates whose boundary
+            # is not predominantly aligned with cut votes.  This forces
+            # fragment formation to wait for the crack tip's visited
+            # mask to actually trace the boundary, eliminating the
+            # "fragments form before cracks complete" mismatch caused
+            # by AT2 damage diffusing wider than tip propagation.
+            if (getattr(self, "fragment_boundary_cut_min_ratio", 0.0) > 0.0
+                    and boundary_cut < float(self.fragment_boundary_cut_min_ratio)):
+                continue
             if release_score >= base_release_thresh:
                 support_lost_labels.add(old_label)
                 support_lost_mask[mask] = True

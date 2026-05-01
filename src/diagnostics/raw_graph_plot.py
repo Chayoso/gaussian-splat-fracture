@@ -567,8 +567,26 @@ def save_raw_graph_diagnostic(
             ax.add_collection(collection)
         _draw_causal_edges(ax, i, j)
         if cracked_np.any():
-            ax.scatter(pos[cracked_np, i], pos[cracked_np, j], s=0.42, c=c[cracked_np],
-                       cmap="inferno", alpha=0.18, linewidths=0, zorder=3)
+            # Two-tier damage rendering: a strong "damage front" overlay
+            # for c > 0.42 (where fragment boundaries actually form) so the
+            # visualization aligns with the bottom-row fragment surfaces,
+            # plus the lighter c > cracked_threshold halo behind.
+            damage_front = c > 0.42
+            damage_halo = cracked_np & ~damage_front
+            if damage_halo.any():
+                ax.scatter(
+                    pos[damage_halo, i], pos[damage_halo, j],
+                    s=0.55, c=c[damage_halo],
+                    cmap="inferno", vmin=0.0, vmax=1.0,
+                    alpha=0.30, linewidths=0, zorder=3,
+                )
+            if damage_front.any():
+                ax.scatter(
+                    pos[damage_front, i], pos[damage_front, j],
+                    s=1.6, c=c[damage_front],
+                    cmap="inferno", vmin=0.0, vmax=1.0,
+                    alpha=0.65, linewidths=0, zorder=4,
+                )
         if tips_np.any():
             ax.scatter(pos[tips_np, i], pos[tips_np, j], s=15, c="#00d7ff",
                        marker="x", linewidths=0.75)

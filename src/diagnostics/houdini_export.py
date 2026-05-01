@@ -268,34 +268,38 @@ def export_simulator_state(
     rot = rot / rot.norm(dim=1, keepdim=True).clamp(min=1e-8)
     orient_np = rot.cpu().numpy()
 
+    # Per-Gaussian fragment / damage / normal attributes.  The simulator's
+    # _physical_fragment_labels is per-MPM-particle; we map it to surface
+    # particles (one-to-one with the original Gaussians) via _surface_indices.
+    # Densification can grow Gaussian count past N_surface, so we always
+    # truncate-or-pad to the current Gaussian count instead of refusing the
+    # assignment when sizes diverge.
     physical_labels = getattr(simulator, "_physical_fragment_labels", None)
     surface_indices = getattr(simulator, "_surface_indices", None)
-    fid_np = None
+    fid_np = np.zeros(n, dtype=np.int32)
     if (physical_labels is not None
             and surface_indices is not None
             and physical_labels.numel() > 0):
         try:
-            sid = physical_labels[surface_indices].cpu().numpy()
-            if sid.shape[0] >= n:
-                fid_np = sid[:n].astype(np.int32)
-        except Exception:
-            fid_np = None
-    if fid_np is None:
-        fid_np = np.zeros(n, dtype=np.int32)
+            sid = physical_labels[surface_indices].cpu().numpy().astype(np.int32)
+            m = min(int(sid.shape[0]), n)
+            fid_np[:m] = sid[:m]
+        except Exception as exc:
+            print(f"[houdini_export] fragment_id alignment skipped: {exc}")
 
     fracture_field = getattr(simulator, "fracture_field", None)
-    damage_np = None
+    damage_np = np.zeros(n, dtype=np.float32)
     if fracture_field is not None and getattr(fracture_field, "c", None) is not None:
         c = fracture_field.c
-        if c.shape[0] >= n:
-            damage_np = c[:n].cpu().numpy()
-    if damage_np is None:
-        damage_np = np.zeros(n, dtype=np.float32)
+        m = min(int(c.shape[0]), n)
+        damage_np[:m] = c[:m].cpu().numpy().astype(np.float32)
 
     if crack_normal is None and fracture_field is not None and getattr(fracture_field, "n", None) is not None:
         nfield = fracture_field.n
-        if nfield.shape[0] >= n:
-            crack_normal = nfield[:n].cpu().numpy()
+        m = min(int(nfield.shape[0]), n)
+        if m > 0:
+            crack_normal = np.zeros((n, 3), dtype=np.float32)
+            crack_normal[:m] = nfield[:m].cpu().numpy().astype(np.float32)
 
     return write_houdini_geo(
         out_path,
