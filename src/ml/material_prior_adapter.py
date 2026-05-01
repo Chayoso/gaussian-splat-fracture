@@ -576,6 +576,92 @@ SENTENCE_STYLE_RULES = (
         },
     },
     {
+        "name": "complete_pulverization",
+        "tokens": (
+            "pulverize", "pulverized", "pulverizes", "completely pulverized",
+            "shattered to dust", "fine powder", "ultra shatter",
+            "explode into dust", "exploded into hundreds",
+            "exploding into hundreds of tiny shards",
+            "obliterate", "obliterated", "totally shattered",
+        ),
+        "priority_tokens": (
+            "pulverize", "pulverized", "ultra shatter",
+            "shattered to dust", "exploded into hundreds",
+            "totally shattered", "obliterated",
+        ),
+        "fracture_mult": {
+            "tau_init": 0.78,            # easier to start cracks
+            "growth_gain": 1.45,         # cracks grow faster
+            "band_width": 0.86,          # narrower bands -> sharper edges
+            "band_fill_gain": 1.18,
+            "open_gain": 1.42,           # more aperture
+            "split_threshold": 0.72,     # more splits
+            "edge_break_rate": 1.55,     # 50% more edges break
+            "branching_bias": 4.20,      # extreme branching
+            "anisotropy_strength": 0.78,
+        },
+        "runtime": {
+            # Geometrically saturated radial shatter -> hundreds of tiny
+            # shards, near-zero base remnant.  Inherits the v30 physics
+            # profile (Griffith release + global p2g2p + AT2 halt) but
+            # cranks the fracture-side parameters to "ultra-brittle":
+            # nearly every graph patch graduates to a physical fragment,
+            # the family cap is raised so the base remnant ratio drops
+            # below ~10%, and Griffith gain doubles so the per-particle
+            # release impulse is more visibly explosive.
+            "manifold.max_seed_points": 24,
+            "manifold.seed_quantile": 0.965,
+            "manifold.min_seed_spacing": 0.012,
+            "manifold.successor_topk": 8,
+            "manifold.max_branching_tips": 110,
+            "manifold.branch_score_ratio": 0.62,
+            "manifold.branch_drive_threshold": 0.06,
+            "manifold.branching_bias": 1.20,
+            "manifold.min_successor_score": 0.060,
+            "manifold.drive_quantile": 0.40,
+            "manifold.front_substeps": 4,
+            "manifold.damage_spread": 0.16,
+            "manifold.damage_source_scale": 0.70,
+            "manifold.edge_break_rate": 1.40,
+            "manifold.fragment_damage_threshold": 0.34,
+            "manifold.fragment_primary_cut_ratio": 0.42,
+            "manifold.fragment_fallback_cut_ratio": 0.26,
+            "manifold.fragment_min_boundary_edges": 6,
+            "manifold.fragment_persistent_min_size": 12,
+            "manifold.fragment_persistent_min_size_ratio": 0.0008,
+            "manifold.fragment_render_min_size": 3,
+            "manifold.fragment_physical_min_size": 6,
+            "manifold.fragment_physical_overlap_threshold": 0.05,
+            "manifold.support_release_threshold": 0.28,
+            "manifold.crack_connected_release_only": True,
+            "manifold.brittle_release_intensity": 2.10,
+            "manifold.impact_release_gain": 1.60,
+            # Inherit v30 motion profile (no visual hacks, Griffith
+            # release on, AT2 halt on, etc.) -- but with stronger
+            # Griffith gain so the explosive feel matches the prompt.
+            "manifold.fragment_release_jitter": 0.0,
+            "manifold.fragment_offset_gain": 0.0,
+            "manifold.fragment_visual_offset_scale": 0.0,
+            "manifold.fragment_physical_release_velocity": 0.0,
+            "manifold.fragment_physical_downward_bias": 0.0,
+            "manifold.shape_match_strength": 0.97,
+            "manifold.shape_match_fragment_strength": 0.97,
+            "manifold.shape_match_velocity_blend": 0.0,
+            "manifold.fragment_physical_max_speed": 3.20,
+            "manifold.rigid_contact_restitution": 0.0,
+            "manifold.unified_impact_impulse_scale": 0.05,
+            "manifold.unified_impact_tumble_scale": 0.20,
+            "manifold.fragment_griffith_release_gain": 0.0020,
+            "manifold.fragment_griffith_downward_bias": 0.20,
+            "manifold.post_impact_gravity_z": -3500.0,
+            "manifold.post_impact_damping": 0.95,
+            "manifold.curvature_weight": 0.4,
+            "manifold.fragment_boundary_cut_min_ratio": 0.45,
+            "manifold.shard_enable": False,
+            "manifold.shard_count_scale": 0.0,
+        },
+    },
+    {
         "name": "chunky_crumble",
         "tokens": (
             "crumbling", "crumble", "chunks", "chunk", "granular",
