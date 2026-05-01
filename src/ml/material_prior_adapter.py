@@ -540,6 +540,17 @@ SENTENCE_STYLE_RULES = (
             "manifold.fragment_physical_max_speed": 2.40,
             # No floor bounce so fragments don't lift after contact.
             "manifold.rigid_contact_restitution": 0.0,
+            # Unified impact impulse (rigid-body form): redirect part of
+            # the pre-impact KE as a v_com horizontal slide + omega tumble
+            # so the entire body (base + fragments) shares a coherent
+            # post-impact rigid motion.  Per-particle radial impulses
+            # average to zero in v_com and get absorbed by shape match
+            # within a few substeps -- only NET v_com / omega changes
+            # survive shape match damping.  scale=0.10 with v_impact=35
+            # gives a 3.5 m/s horizontal slide + ~9 rad/s tumble around
+            # the perpendicular horizontal axis.
+            "manifold.unified_impact_impulse_scale": 0.10,
+            "manifold.unified_impact_tumble_scale": 0.10,
             # Post-impact gravity matching free-fall: hardcoded default
             # is -400 for sharp_brittle but pre-impact uses -2000, so
             # fragments stop accelerating after impact (visually look

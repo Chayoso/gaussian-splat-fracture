@@ -396,6 +396,14 @@ class ManifoldSimulator(
             fp.get('fragment_physical_spin_gain', shape_defaults.get("fragment_spin_gain", 0.0)))
         self.fragment_release_jitter = max(0.0, float(
             fp.get('fragment_release_jitter', 0.0)))
+        # Griffith-style stress-driven release at fragment graduation.
+        # 0.0 disables (uniform release_velocity hack remains active);
+        # > 0 enables per-particle KE injection scaled by local sqrt(stress)
+        # along the principal tensile direction.
+        self.fragment_griffith_release_gain = max(0.0, float(
+            fp.get('fragment_griffith_release_gain', 0.0)))
+        self.fragment_griffith_downward_bias = max(0.0, min(1.0, float(
+            fp.get('fragment_griffith_downward_bias', 0.0))))
         self.fragment_physical_max_speed = float(
             fp.get('fragment_physical_max_speed', shape_defaults.get("fragment_max_speed", 0.35)))
         self.shape_matching_enabled = bool(
@@ -1147,26 +1155,46 @@ class ManifoldSimulator(
 
         # Update fracture field.  Brittle impact burst uses more internal front
         # advances per visible frame without changing the external frame count.
-        old_front_substeps = int(getattr(self.fracture_field, "front_substeps", 1))
-        if bool(getattr(self, "_fracture_burst_active", False)):
-            self.fracture_field.front_substeps = max(
-                old_front_substeps,
-                int(self.impact_fracture_burst_front_substeps),
-            )
-        try:
-            self.fracture_field.update(
-                positions=x_surf_world,
-                init_score=init_score,
-                growth_drive=growth_drive,
-                growth_dir=growth_dir,
-                F_gaussian=F_gauss,
-                impact_center=impact_center_world,
-                phase_gate=phase_advance_gate,
-                seed_phase_gate=phase_seed_gate,
-            )
-        finally:
+        # Skip the AT2 update entirely once fragmentation has saturated:
+        # post-saturation iteration just keeps redistributing the damage
+        # field into already-fragmented regions, which propagates noise
+        # into the stress tensor that the per-fragment shape match then
+        # tries (and fails) to damp out, producing visible base-body
+        # particle oscillation.  Saturation = c_max already at 1.0 AND
+        # the physical fragment registry is non-empty AND the registry
+        # count is stable (frame-to-frame change <= 1).
+        skip_at2 = False
+        if (self.fracture_field.c is not None
+                and float(self.fracture_field.c.max().item()) >= 0.999
+                and self._physical_fragment_labels is not None
+                and bool((self._physical_fragment_labels > 0).any())):
+            cur_count = int((self._physical_fragment_labels > 0).unique().numel())
+            prev_count = int(getattr(self, "_at2_halt_prev_count", -1))
+            if prev_count >= 0 and abs(cur_count - prev_count) <= 1:
+                skip_at2 = True
+            self._at2_halt_prev_count = cur_count
+
+        if not skip_at2:
+            old_front_substeps = int(getattr(self.fracture_field, "front_substeps", 1))
             if bool(getattr(self, "_fracture_burst_active", False)):
-                self.fracture_field.front_substeps = old_front_substeps
+                self.fracture_field.front_substeps = max(
+                    old_front_substeps,
+                    int(self.impact_fracture_burst_front_substeps),
+                )
+            try:
+                self.fracture_field.update(
+                    positions=x_surf_world,
+                    init_score=init_score,
+                    growth_drive=growth_drive,
+                    growth_dir=growth_dir,
+                    F_gaussian=F_gauss,
+                    impact_center=impact_center_world,
+                    phase_gate=phase_advance_gate,
+                    seed_phase_gate=phase_seed_gate,
+                )
+            finally:
+                if bool(getattr(self, "_fracture_burst_active", False)):
+                    self.fracture_field.front_substeps = old_front_substeps
 
     # ================================================================
     # Fragment detection
@@ -1510,6 +1538,95 @@ class ManifoldSimulator(
         if self.fragment_manager is not None:
             self.fragment_manager.impact_release_gain = self._impact_release_gain
         print(f"  [IMPACT] Ground contact! v_impact={v_impact:.3f}")
+
+        # Unified impact impulse (rigid-body form): convert part of the
+        # pre-impact kinetic energy into a horizontal v_com kick plus a
+        # tumble omega around the orthogonal horizontal axis.  Per-
+        # particle radial impulses sum to ~zero in v_com (outward
+        # vectors cancel by symmetry), so shape matching damps them out
+        # within a few substeps and the base body looks frozen.  A v_com
+        # + omega kick is a NET rigid-body motion -- shape matching can
+        # damp internal jitter but the COM still translates and the body
+        # still rolls sideways, exactly the "옆으로 뒹군다" the impact
+        # would physically produce when the bunny lands off-center.
+        impulse_scale = float(self.fracture_cfg.get(
+            'unified_impact_impulse_scale', 0.0))
+        if impulse_scale > 0.0 and impact_speed > 1e-3:
+            # Direction of horizontal kick: from impact_center toward the
+            # body COM (in XY).  Off-center landings naturally lean the
+            # body in that direction.  For perfectly centered drops we
+            # fall back to a deterministic seeded vector so the run is
+            # reproducible.
+            z_vals_pre = self.x_mpm[:, 2]
+            z_min_pre = float(z_vals_pre.min().item())
+            z_max_pre = float(z_vals_pre.max().item())
+            obj_h = max(z_max_pre - z_min_pre, 1e-6)
+            z_thresh_pre = z_min_pre + obj_h * 0.03
+            bottom_pre = z_vals_pre < z_thresh_pre
+            if bool(bottom_pre.any()):
+                center_pre = self.x_mpm[bottom_pre].mean(dim=0)
+            else:
+                center_pre = self.x_mpm.mean(dim=0)
+            body_com = self.x_mpm.mean(dim=0)
+            offset_xy = body_com[:2] - center_pre[:2]
+            offset_norm = float(offset_xy.norm().item())
+            if offset_norm < 1e-4:
+                # Symmetric drop -> pick a deterministic seed direction.
+                offset_xy = torch.tensor([1.0, 0.0],
+                                         device=offset_xy.device,
+                                         dtype=offset_xy.dtype)
+                offset_norm = 1.0
+            horiz_dir = offset_xy / offset_norm
+            horiz_mag = impulse_scale * impact_speed
+
+            # NOTE: Earlier we also applied Griffith stress-driven
+            # release to ALL particles at the impact moment (including
+            # base body) to fix the "frozen base / scattering fragments"
+            # asymmetry.  But Griffith uses a random +/- sign per
+            # particle along the principal stress direction (correct for
+            # cracks: the bond opens to BOTH sides), and applying that
+            # to a still-cohesive base body just scattered the splats
+            # randomly.  Reverted: Griffith release is only applied at
+            # fragment graduation now (cohesive base body keeps the
+            # rigid v_com + omega kick alone).
+
+            # v_com horizontal kick: applied uniformly to v_mpm (translation).
+            self.v_mpm[:, 0] = self.v_mpm[:, 0] + horiz_mag * horiz_dir[0]
+            self.v_mpm[:, 1] = self.v_mpm[:, 1] + horiz_mag * horiz_dir[1]
+            self._v_com[0] = self._v_com[0] + horiz_mag * horiz_dir[0]
+            self._v_com[1] = self._v_com[1] + horiz_mag * horiz_dir[1]
+
+            # Tumble axis: perpendicular to horiz_dir in XY plane (so the
+            # body rolls forward in the slide direction).  axis = z x horiz
+            # -> (-h_y, h_x, 0) which curls the top of the body forward.
+            tumble_scale = float(self.fracture_cfg.get(
+                'unified_impact_tumble_scale', 0.0))
+            if tumble_scale > 0.0:
+                omega_axis = torch.tensor(
+                    [-float(horiz_dir[1]), float(horiz_dir[0]), 0.0],
+                    device=self.v_mpm.device, dtype=self.v_mpm.dtype,
+                )
+                # rad/s scaled by impact speed / object size.
+                omega_mag = tumble_scale * impact_speed / obj_h
+                domega = omega_axis * omega_mag
+                rel = self.x_mpm - body_com.unsqueeze(0)
+                v_rot_kick = torch.cross(
+                    domega.unsqueeze(0).expand_as(rel), rel, dim=1)
+                self.v_mpm = self.v_mpm + v_rot_kick
+                if hasattr(self, '_omega_com') and self._omega_com is not None:
+                    self._omega_com = self._omega_com + domega.to(
+                        self._omega_com.device)
+                print(
+                    f"  [IMPACT] unified rigid kick: horiz=[{horiz_dir[0]:.2f},"
+                    f"{horiz_dir[1]:.2f}] mag={horiz_mag:.3f}  "
+                    f"omega_axis=[{omega_axis[0]:.2f},{omega_axis[1]:.2f},0] "
+                    f"omega_mag={omega_mag:.2f}rad/s"
+                )
+            else:
+                print(
+                    f"  [IMPACT] unified horiz kick: dir=[{horiz_dir[0]:.2f},"
+                    f"{horiz_dir[1]:.2f}] mag={horiz_mag:.3f}"
+                )
 
         # Soft F reset: blend F toward identity rather than wipe.  alpha=0
         # preserves all pre-impact deformation (paper-defensible: physics is

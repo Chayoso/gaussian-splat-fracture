@@ -257,9 +257,15 @@ def _summarize_history(history: list[dict]) -> dict:
         "max_open_release_patches": int(max(int(row.get("open_release_patches", 0)) for row in history)),
         "max_open_release_nodes": int(max(int(row.get("open_release_nodes", 0)) for row in history)),
         "max_open_release_score": max_row("open_release_score_max"),
-        "max_impact_closure_patches": int(max(int(row.get("impact_closure_patches", 0)) for row in history)),
-        "max_impact_closure_nodes": int(max(int(row.get("impact_closure_nodes", 0)) for row in history)),
-        "max_impact_closure_score": max_row("impact_closure_score_max"),
+        "max_catastrophic_release_patches": int(max(int(row.get("catastrophic_release_patches", 0)) for row in history)),
+        "max_catastrophic_release_nodes": int(max(int(row.get("catastrophic_release_nodes", 0)) for row in history)),
+        "max_catastrophic_release_score": max_row("catastrophic_release_score_max"),
+        "max_secondary_shatter_patches": int(max(int(row.get("secondary_shatter_patches", 0)) for row in history)),
+        "max_secondary_shatter_nodes": int(max(int(row.get("secondary_shatter_nodes", 0)) for row in history)),
+        "max_secondary_shatter_score": max_row("secondary_shatter_score_max"),
+        "max_impact_shatter_patches": int(max(int(row.get("impact_shatter_patches", 0)) for row in history)),
+        "max_impact_shatter_nodes": int(max(int(row.get("impact_shatter_nodes", 0)) for row in history)),
+        "max_impact_shatter_score": max_row("impact_shatter_score_max"),
         "max_physical_fragment_drop": max_row("physical_fragment_drop"),
         "max_physical_detached_distance": max_row("physical_detached_distance"),
         "max_physical_release_displacement": max_row("physical_release_displacement"),
@@ -466,8 +472,8 @@ def _write_gravity_report(rows: list[dict], out_dir: Path) -> None:
         "",
         "No-render gravity-drop run. CLIP predicts material priors, then the object falls under gravity and reports crack/fragment metrics.",
         "",
-        "| prompt | family | style | mode | verdict | strict | top1 | impact | frags max/final | rel | largest | bcut | hard det | saved boundary | cracked max/final | visited | tips | tip events | branch events | junction | max child | angle mean/std | branch | c_max | cut_edges | open p/n | impact closure p/n | gain | scatter |",
-        "| --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| prompt | family | style | mode | verdict | strict | top1 | impact | frags max/final | rel | largest | bcut | hard det | saved boundary | cracked max/final | visited | tips | tip events | branch events | junction | max child | angle mean/std | branch | c_max | cut_edges | open p/n | cat p/n | sec p/n | gain | scatter |",
+        "| --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
         if row.get("error"):
@@ -481,7 +487,7 @@ def _write_gravity_report(rows: list[dict], out_dir: Path) -> None:
             "| {prompt} | {family} | {style} | {mode} | {verdict} | {strict} | {top1} | {impact} | {maxf}/{finalf} | "
             "{rel:.3f} | {largest:.3f} | {bcut:.3f} | {hard_det} | {saved_boundary} | {maxc}/{finalc} | {visited} | {tips} | {events} | {branches} | {junction} | {maxchildren} | "
             "{angle_mean:.1f}/{angle_std:.1f} | {branch:.3f} | {cmax:.3f} | {cut} | {openp}/{openn} | "
-            "{impactp}/{impactn} | {gain:.2f} | {scatter:.4f} |".format(
+            "{catp}/{catn} | {secp}/{secn} | {gain:.2f} | {scatter:.4f} |".format(
                 prompt=row["prompt"][:46],
                 family=row["family"],
                 style=row.get("sentence_style", "material_default"),
@@ -512,14 +518,16 @@ def _write_gravity_report(rows: list[dict], out_dir: Path) -> None:
                 cut=row.get("max_cut_edges", 0),
                 openp=row.get("max_open_release_patches", 0),
                 openn=row.get("max_open_release_nodes", 0),
-                impactp=row.get("max_impact_closure_patches", 0),
-                impactn=row.get("max_impact_closure_nodes", 0),
+                catp=row.get("max_catastrophic_release_patches", 0),
+                catn=row.get("max_catastrophic_release_nodes", 0),
+                secp=row.get("max_secondary_shatter_patches", 0),
+                secn=row.get("max_secondary_shatter_nodes", 0),
                 gain=float(row.get("impact_release_gain", 1.0)),
                 scatter=float(row.get("max_physical_release_displacement", 0.0)),
             )
         )
     lines.append("")
-    lines.append("Interpretation: CLIP chooses material/style parameters. Fragment birth should stay crack-connected; `bcut` should be nonzero when fragments appear. `scatter` is post-fragment physical release displacement.")
+    lines.append("Interpretation: CLIP chooses material/style parameters. Fragment birth should stay closure-only: open/cat/sec must remain 0, and `bcut` should be nonzero when fragments appear. `scatter` is post-fragment physical release displacement.")
     (out_dir / "gravity_material_validation.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -590,6 +598,10 @@ def run_gravity_sweep(
             row.update({
                 "runtime_crack_connected_release_only": bool(getattr(manager, "crack_connected_release_only", False)),
                 "runtime_open_crack_release_enable": bool(getattr(manager, "open_crack_release_enable", True)),
+                "runtime_catastrophic_release_enable": bool(getattr(manager, "catastrophic_release_enable", False)),
+                "runtime_catastrophic_release_patches_per_step": int(getattr(manager, "catastrophic_release_patches_per_step", 0)),
+                "runtime_secondary_shatter_enable": bool(getattr(manager, "secondary_shatter_enable", False)),
+                "runtime_secondary_shatter_max_patches": int(getattr(manager, "secondary_shatter_max_patches", 0)),
             })
         plot_path = None
         if bool(getattr(args, "plot_final", True)):

@@ -71,6 +71,19 @@ class FragmentPhysicsMixin:
                     "release_dir": None,
                     "spin_axis": None,
                 }
+                # Griffith-based stress-driven fracture release: at the
+                # exact moment a fragment graduates, convert a fraction
+                # of the locally-stored elastic energy into per-particle
+                # kinetic energy, with the impulse direction aligned
+                # along the maximum tensile stress eigenvector.  This
+                # replaces the older uniform release_velocity hack
+                # (which gave every particle in the fragment the same
+                # outward kick regardless of where it sat in the stress
+                # field) with a physically-motivated per-particle
+                # impulse: stress-concentration sites release more KE,
+                # and the impulse direction is locally consistent with
+                # the actual fracture mechanics.
+                self._apply_griffith_release_impulse(mask)
 
             persistent[mask] = persistent_label
             state = self._physical_fragment_states.get(
@@ -115,25 +128,109 @@ class FragmentPhysicsMixin:
             return persistent
         return raw_particle_labels
 
+    @torch.no_grad()
+    def _apply_griffith_release_impulse(self, mask: Tensor) -> None:
+        """Per-particle stress-driven KE injection at fragment graduation.
+
+        Models the Griffith energy-release rate: when a bond breaks the
+        stored elastic energy ``(1/2 sigma : epsilon) dV`` is released,
+        and a fraction is converted to kinetic energy along the maximum
+        tensile direction (the direction the crack opens).
+
+        Per-particle:
+          - sigma = self._last_stress[i]      (3x3 cauchy stress)
+          - eigvals, eigvecs = eigh(sigma)
+          - Most positive eigval = principal tension; its eigenvector
+            is the natural opening direction.
+          - magnitude = sqrt(2 * alpha * E_density / rho)
+                      = sqrt(alpha * lambda_max^2 / (rho * E_modulus))
+            where alpha is the conversion fraction (config).
+
+        Result: stress-concentration sites kick harder, low-stress
+        sites barely move; impulse direction is locally consistent with
+        actual brittle-fracture mechanics; per-particle variance is
+        intrinsic to the local stress field rather than imposed by
+        external jitter.  Replaces the uniform release_velocity hack.
+        """
+        gain = float(getattr(self, "fragment_griffith_release_gain", 0.0))
+        if gain <= 0.0:
+            return
+        if (getattr(self, "_last_stress", None) is None
+                or self._last_stress.shape[0] != self.x_mpm.shape[0]):
+            return
+        if not bool(mask.any()):
+            return
+
+        idx = torch.where(mask)[0]
+        if idx.numel() == 0:
+            return
+
+        sigma = self._last_stress[idx].to(self.x_mpm.dtype)  # (M, 3, 3)
+        # Symmetrize for numerical stability before eigendecomposition.
+        sigma_sym = 0.5 * (sigma + sigma.transpose(-1, -2))
+
+        try:
+            eigvals, eigvecs = torch.linalg.eigh(sigma_sym)
+        except RuntimeError:
+            return
+
+        # Largest eigenvalue is the principal tensile stress; its
+        # eigenvector points in the crack-opening direction.  Random
+        # sign per particle so neighboring sites don't all kick the
+        # same way (avoids a coherent fragment-wide drift artefact).
+        principal_dir = eigvecs[..., -1]                                # (M, 3)
+        principal_val = eigvals[..., -1].clamp(min=0.0)                  # (M,)
+
+        # Random +/- per particle (deterministic seed for reproducibility).
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(int(self._next_physical_fragment_id) * 7919 + 31)
+        signs = (torch.randint(0, 2, (idx.numel(),), generator=gen,
+                               dtype=torch.float32) * 2.0 - 1.0)
+        signs = signs.to(principal_dir.device).to(principal_dir.dtype)
+
+        # Magnitude: sqrt(stress) gives the right energy scaling
+        # (E ~ sigma^2 / E_modulus, KE ~ E -> v ~ sqrt(E) ~ |sigma|).
+        # Clamp to fragment_physical_max_speed so a single high-stress
+        # site can't overshoot the simulator's velocity bound.
+        max_speed = max(float(getattr(self, "fragment_physical_max_speed", 2.0)), 0.05)
+        magnitude = gain * torch.sqrt(principal_val + 1e-8)
+        magnitude = magnitude.clamp(max=max_speed)
+        impulse = principal_dir * (magnitude * signs).unsqueeze(-1)
+
+        # Bias the kick downward so released fragments don't lift
+        # against gravity (the typical brittle-shatter visual is a
+        # rain-down, not a fountain).
+        down_bias = float(getattr(self, "fragment_griffith_downward_bias", 0.0))
+        if down_bias > 0.0:
+            impulse[:, 2] = impulse[:, 2] - down_bias * magnitude
+            # Re-normalize-ish: keep the kick magnitude bounded.
+            cur_norm = impulse.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            target_norm = magnitude.unsqueeze(-1).clamp(min=0.0)
+            impulse = impulse * (target_norm / cur_norm).clamp(max=1.0)
+
+        self.v_mpm[idx] = self.v_mpm[idx] + impulse
+
     def _step_fragmented_physics(self, stress: Tensor, dt: float):
-        """Per-fragment MPM physics."""
-        # Map Gaussian fragments back to MPM particles
+        """Single global MPM step with per-fragment label tracking.
+
+        Earlier this routine ran one ``p2g2p_subset`` per fragment label,
+        which gave each fragment its own isolated grid and broke
+        inter-fragment interaction completely (fragments tunneled
+        through each other and the base body kept its own decoupled
+        dynamics).  Reviewer-defensible behaviour: a single global
+        p2g2p over all particles, with the per-fragment registry update
+        + per-fragment shape matching applied as a label-only overlay.
+        """
         surf_frag_ids = self.fragment_manager.fragment_ids
         raw_mpm_frag_ids = self._map_surface_labels_to_particles(surf_frag_ids)
         mpm_frag_ids = self._update_physical_fragment_registry(raw_mpm_frag_ids)
 
-        # Per-fragment P2G2P
-        for frag_id in mpm_frag_ids.unique(sorted=True).tolist():
-            frag_mask = mpm_frag_ids == frag_id
-            frag_idx = torch.where(frag_mask)[0]
-            if len(frag_idx) < 10:
-                self.v_mpm[frag_idx] += dt * self.mpm.gravity.unsqueeze(0)
-                self.x_mpm[frag_idx] += self.v_mpm[frag_idx] * dt
-                self.x_mpm[frag_idx] = self.x_mpm[frag_idx].clamp(
-                    self.mpm.clip_bound, 1.0 - self.mpm.clip_bound)
-                continue
-            self.x_mpm, self.v_mpm, self.C, self.F = self.mpm.p2g2p_subset(
-                self.x_mpm, self.v_mpm, self.C, self.F, stress, frag_idx)
+        # Global P2G2P over all particles (base body + fragments share
+        # the same grid).  Inter-fragment forces propagate naturally
+        # through the grid, and base + fragments inherit the same
+        # post-impact velocity field.
+        self.x_mpm, self.v_mpm, self.C, self.F = self.mpm.p2g2p(
+            self.x_mpm, self.v_mpm, self.C, self.F, stress)
 
         self._apply_physical_fragment_release_drift(mpm_frag_ids, dt)
         self.mpm.time += dt
