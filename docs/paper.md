@@ -3,6 +3,132 @@
 Working title and abstract candidates for the SIGGRAPH Asia
 submission.  Updated as the writing progresses.
 
+## v30 LOCKED — Title + Abstract (final draft, post sim-architecture lock)
+
+### Title (locked)
+
+> **Sentence to Shatter: Language-Conditioned Brittle Fracture on
+> Gaussian Splat Manifolds**
+
+(Tightened from the earlier "Fracture Animation on Gaussian Splats"
+to make the *brittle* scope explicit and the surface-manifold
+representation salient.  Alternative B that we considered:
+*"Sentence to Shatter: CLIP-Driven Phase-Field Fracture on 3D
+Gaussian Splats"* -- skipped because "phase-field" is method-
+detail in the title rather than a contribution claim.)
+
+### Abstract (locked, ~220 words)
+
+> We present **Sentence to Shatter**, a language-conditioned
+> fracture animation system on 3D Gaussian Splat representations.
+> Given a natural-language description (e.g., *"soda-lime glass
+> shattering into many sharp radial cracks"* or *"vulcanized rubber
+> object under localized impact"*), our system produces
+> physically-faithful, photoreal brittle-fracture animation directly
+> on the input splat manifold.
+>
+> We make four algorithmic contributions: (i) a
+> **curvature-weighted anisotropy** term that aligns AT2 phase-field
+> crack normals with the local surface principal-curvature
+> direction, eliminating kNN-graph axis bias; (ii) a
+> **causal-support gate** requiring crack-tip support across each
+> fragment boundary, which removes AT2-diffusion artefacts where
+> fragments form ahead of the visited mask; (iii) a **Griffith
+> stress-driven release** that injects per-particle kinetic energy
+> at fragment graduation, with magnitude proportional to
+> $\sqrt{\sigma_{\mathrm{principal}}}$ along the tensile
+> eigenvector; and (iv) an **AT2 halt-after-saturation** rule that
+> stops the phase-field solver once damage is saturated and the
+> fragment registry is stable, eliminating residual stress-noise
+> oscillation.
+>
+> A unified rigid-body impact response keeps the still-cohesive
+> base remnant coherent with released fragments under a single
+> global-grid MPM step, and we export every per-frame state as
+> Houdini-native geometry for path-traced rendering.  We validate
+> on an 11-prompt sentence/material suite at scales from 10K to
+> 150K particles.  Ablations confirm: removing AT2 reduces
+> complete-shatter quality by **33%**; removing CLIP-driven style
+> retrieval reduces material differentiation by **95%**.
+
+### Algorithmic contributions (4 claims)
+
+1. **Curvature-weighted anisotropy** -- per-particle principal
+   in-shell direction precomputed via local tangent-plane PCA on
+   the kNN graph; AT2 crack normal is blended with the
+   in-plane perpendicular to this direction, gated by per-node
+   anisotropy strength.  Implementation:
+   `GaussianGraph.compute_curvature_directions` +
+   `GaussianFractureField._estimate_crack_normal` blend.
+
+2. **Causal-support gate** -- a fragment candidate is rejected
+   when the mean cut-vote across its boundary is below
+   `fragment_boundary_cut_min_ratio` (0.55 for `radial_shatter`).
+   Implementation:
+   `FragmentComponentAnalysisMixin._compute_release_scores` filter.
+
+3. **Griffith stress-driven release** -- at fragment graduation,
+   each particle in the new fragment receives
+   $v_{\mathrm{kick}} = \alpha \sqrt{\lambda_{\max}(\sigma)}\,\hat{e}_{\max}$
+   with random sign per particle and an optional downward bias.
+   Implementation:
+   `FragmentPhysicsMixin._apply_griffith_release_impulse`.
+
+4. **AT2 halt-after-saturation** -- once $c_{\max} \ge 0.999$ and
+   the physical fragment registry is stable (frame-to-frame count
+   change $\le 1$), the AT2 update is skipped.  Eliminates the
+   post-saturation noise that produced visible base-body
+   oscillation.  Implementation: skip-flag check in
+   `ManifoldSimulator._step_fracture_field`.
+
+### Supporting system contributions
+
+- **CLIP-driven sentence/material style retrieval** with a
+  learned StyleHead that emits per-style runtime parameters
+  (rule-derived weak supervision).
+- **Global p2g2p MPM** (single grid for base body and fragments)
+  -- per-fragment shape matching is a label-only overlay; replaces
+  the earlier per-fragment ``p2g2p_subset`` that broke
+  inter-fragment interaction.
+- **Unified rigid-body impact response** -- horizontal v_com
+  slide along body-COM-to-impact-center offset + tumble omega
+  around the perpendicular horizontal axis; survives shape match
+  because it is a NET v_com / omega change.
+- **Post-impact gravity / damping runtime overrides** so the
+  drop is uniformly accelerating across impact (no "hovering"
+  artefact from the legacy hardcoded -400 vs free-fall -2000
+  mismatch).
+- **Houdini-native .geo.gz export pipeline** -- per-Gaussian P,
+  Cd, Alpha, scale, pscale, orient, fragment_id, damage, N
+  attributes consumed directly by Houdini's File SOP +
+  Copy-to-Points network for path-traced rendering.
+- **Multi-scale validation** at 10K, 50K, 100K, 150K particles
+  with $\sqrt{N}$-scaled fragment thresholds.
+
+### Locked v30 radial_shatter physics profile
+
+| Parameter | Value | Why |
+| --- | --- | --- |
+| `shape_match_strength` (BODY) | 0.97 | rigid base remnant |
+| `shape_match_fragment_strength` | 0.97 | rigid fragment shards |
+| `shape_match_velocity_blend` | 0.0 | disable correction-velocity injection that bypassed `mpm.damping` |
+| `post_impact_gravity_z` | -3500 | matches free-fall, uniform acceleration |
+| `post_impact_damping` | 0.95 | residual elastic vibration damps within a few substeps |
+| `unified_impact_impulse_scale` | 0.05 | horizontal v_com slide proxy for off-center contact |
+| `unified_impact_tumble_scale` | 0.20 | tumble omega proxy for off-center contact moment |
+| `fragment_griffith_release_gain` | 0.001 | $v$ in 0--2.4 m/s band for $v_{\mathrm{impact}} \approx 35$ |
+| `fragment_griffith_downward_bias` | 0.3 | released fragments don't lift against gravity |
+| `fragment_release_jitter` | 0.0 | hand-tuned hack OFF |
+| `fragment_offset_gain` | 0.0 | hand-tuned hack OFF |
+| `fragment_visual_offset_scale` | 0.0 | hand-tuned hack OFF |
+| `fragment_physical_release_velocity` | 0.0 | replaced by Griffith physics |
+| `rigid_contact_restitution` | 0.0 | no floor bounce |
+| `fragment_physical_max_speed` | 2.40 | Griffith kick ceiling |
+
+---
+
+## Earlier title + abstract draft (pre-v30, kept for reference)
+
 ## Title (selected)
 
 > **Sentence to Shatter: Language-Conditioned Fracture Animation on
