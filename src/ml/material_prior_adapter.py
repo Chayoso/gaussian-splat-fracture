@@ -522,42 +522,55 @@ SENTENCE_STYLE_RULES = (
             # Per-fragment random jitter on release_dir / spin_axis /
             # speed.  Without this all fragments share the same outward-
             # plus-down direction and synchronized release_velocity ramp,
-            # producing a coordinated "elastic-breathing" expansion +
-            # contraction look.  With 0.30 jitter each fragment gets a
-            # unique deterministic-but-distinct kick, breaking the
-            # lockstep into chaotic scatter -- closer to real glass
-            # shatter trajectories.
-            "manifold.fragment_release_jitter": 0.30,
-            # Loosen rigid-body coupling so fragments fall under gravity.
-            # Sharp_brittle family default is 0.97 which makes shape
-            # matching average per-fragment v_com over particles -- when
-            # half a fragment touches floor (v=0) and half is in-air,
-            # the in-air half gets dragged toward zero velocity, so the
-            # fragment hovers instead of falling.  0.7 lets MPM physics
-            # (gravity, free-fall) dominate while still keeping fragments
-            # mostly rigid.
-            "manifold.shape_match_fragment_strength": 0.20,
+            # v30 LOCKED radial-shatter physics profile.
+            #
+            # Visual hacks (release_velocity / jitter / fragment offset)
+            # all OFF -- the only KE source for fragments is the
+            # physically-motivated Griffith stress release at graduation,
+            # and the only KE source for the base body is the unified
+            # rigid-body impact response.  Shape matching is fully rigid
+            # (0.97 / 0.97) for both body and fragments so post-impact
+            # particles follow rigid-body kinematics on top of MPM grid
+            # physics.  shape_match_velocity_blend = 0 disables the
+            # correction-velocity injection that previously bypassed
+            # mpm.damping and produced visible base-body oscillation.
+            "manifold.fragment_release_jitter": 0.0,
+            "manifold.fragment_offset_gain": 0.0,
+            "manifold.fragment_visual_offset_scale": 0.0,
+            "manifold.fragment_physical_release_velocity": 0.0,
+            "manifold.fragment_physical_downward_bias": 0.0,
+            "manifold.shape_match_strength": 0.97,
+            "manifold.shape_match_fragment_strength": 0.97,
+            "manifold.shape_match_velocity_blend": 0.0,
             "manifold.fragment_physical_max_speed": 2.40,
-            # No floor bounce so fragments don't lift after contact.
             "manifold.rigid_contact_restitution": 0.0,
-            # Unified impact impulse (rigid-body form): redirect part of
-            # the pre-impact KE as a v_com horizontal slide + omega tumble
-            # so the entire body (base + fragments) shares a coherent
-            # post-impact rigid motion.  Per-particle radial impulses
-            # average to zero in v_com and get absorbed by shape match
-            # within a few substeps -- only NET v_com / omega changes
-            # survive shape match damping.  scale=0.10 with v_impact=35
-            # gives a 3.5 m/s horizontal slide + ~9 rad/s tumble around
-            # the perpendicular horizontal axis.
-            "manifold.unified_impact_impulse_scale": 0.10,
-            "manifold.unified_impact_tumble_scale": 0.10,
-            # Post-impact gravity matching free-fall: hardcoded default
-            # is -400 for sharp_brittle but pre-impact uses -2000, so
-            # fragments stop accelerating after impact (visually look
-            # like they "hover").  Match free-fall magnitude so the
-            # whole drop is a single uniformly-accelerating motion.
-            "manifold.post_impact_gravity_z": -2000.0,
-            "manifold.post_impact_damping": 0.985,
+            # Unified impact impulse (rigid-body form): horizontal v_com
+            # slide along body-COM-to-impact-center offset + tumble omega
+            # around the perpendicular horizontal axis.  Per-particle
+            # radial impulses sum to ~zero in v_com, so they get absorbed
+            # by shape match within a few substeps -- only NET v_com +
+            # omega changes survive.  scale=0.05 + tumble=0.20 gives a
+            # measured horizontal slide and a clear sideways roll for
+            # the intact base remnant.
+            "manifold.unified_impact_impulse_scale": 0.05,
+            "manifold.unified_impact_tumble_scale": 0.20,
+            # Griffith stress-driven fragment release: per-particle KE
+            # injection at fragment graduation, magnitude proportional
+            # to sqrt(principal stress), direction along the principal
+            # tensile eigenvector with a downward bias and a random
+            # +/- sign per particle (a real bond opens to BOTH sides).
+            # gain=0.001 puts the kick in the 0-2.4 m/s band consistent
+            # with v_impact ~35 stored elastic energy converted at the
+            # fracture surface.
+            "manifold.fragment_griffith_release_gain": 0.001,
+            "manifold.fragment_griffith_downward_bias": 0.3,
+            # Post-impact gravity matches the free-fall magnitude so
+            # acceleration is uniform across impact (no visible
+            # "hovering" after contact).  Stronger damping (0.95) plus
+            # velocity_blend=0 above kills residual elastic vibration
+            # within a few substeps.
+            "manifold.post_impact_gravity_z": -3500.0,
+            "manifold.post_impact_damping": 0.95,
             "manifold.shard_enable": False,
             "manifold.shard_count_scale": 0.0,
         },
