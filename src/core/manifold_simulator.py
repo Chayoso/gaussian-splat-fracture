@@ -404,6 +404,67 @@ class ManifoldSimulator(
             fp.get('fragment_griffith_release_gain', 0.0)))
         self.fragment_griffith_downward_bias = max(0.0, min(1.0, float(
             fp.get('fragment_griffith_downward_bias', 0.0))))
+        # Per-fragment-at-graduation NET rigid-body release.  Complements
+        # Griffith (which uses +/- random signs per particle and so sums
+        # to ~0 at the COM): this adds a NET COM translation + tumble that
+        # survives shape match.  Analogous to the whole-body unified
+        # impact response but applied at fragment graduation.
+        # `fragment_release_v_com_gain` is the m/s magnitude of the v_com
+        # kick along the radial (frag_com - base_com) direction; clamped
+        # to fragment_physical_max_speed.  0.0 disables.
+        self.fragment_release_v_com_gain = max(0.0, float(
+            fp.get('fragment_release_v_com_gain', 0.0)))
+        # `fragment_release_tumble_gain` is dimensionless; the resulting
+        # angular speed is `tumble_gain * v_com_mag / obj_size`, so a
+        # value of ~1.5 produces a few rad/s for a 0.4-unit mesh and a
+        # 0.5 m/s slide.  0.0 disables.
+        self.fragment_release_tumble_gain = max(0.0, float(
+            fp.get('fragment_release_tumble_gain', 0.0)))
+        # Fraction of v_com_gain applied as an upward Z boost on top of
+        # the XY-radial lateral kick, so fragments arc up briefly before
+        # falling rather than just shooting straight out the side.  The
+        # XY component carries the dominant "explosive scatter" feel;
+        # upward fraction controls arc height.
+        self.fragment_release_upward_fraction = max(0.0, min(1.0, float(
+            fp.get('fragment_release_upward_fraction', 0.30))))
+        # Extra per-substep downward acceleration on fragment-labeled
+        # particles only; additive on top of the global post-impact
+        # gravity (`post_impact_gravity_z`).  Compensates for the fact
+        # that strong post-impact damping tuned to suppress base-body
+        # elastic vibration also bleeds the gravity-induced velocity of
+        # small detached fragments.  Negative = downward.  0.0 disables.
+        self.fragment_extra_gravity_z = float(
+            fp.get('fragment_extra_gravity_z', 0.0))
+        # Per-particle floor bounce on fragment-labeled particles.  The
+        # MPM grid uses a "slip" BC at the floor which zeros the normal
+        # velocity component as part of p2g2p, so any per-fragment
+        # rigid_contact_impulse runs after slip and sees v_z=0 (the
+        # restitution kick has nothing to bounce off of).  This knob
+        # restores the bounce by recovering pre-p2g2p v_z and applying
+        # `v_z = -restitution * v_z_pre` for fragment particles inside
+        # the floor band.  0.0 disables.
+        self.fragment_floor_restitution = max(0.0, min(0.95, float(
+            fp.get('fragment_floor_restitution', 0.0))))
+        # Force-promote remaining base particles after AT2 halt + stable
+        # registry.  When True, label==0 particles that survived crack-
+        # connected closure are partitioned into spatial chunks and
+        # graduate as new fragments (one v_com kick + tumble per chunk).
+        # Required for "complete pulverization" prompts where the user
+        # wants ZERO base remnant.  0/False keeps base intact.
+        self.force_promote_base_after_halt = bool(
+            fp.get('force_promote_base_after_halt', False))
+        self.force_promote_grid_n = int(
+            fp.get('force_promote_grid_n', 4))
+        self.force_promote_base_min_size = int(
+            fp.get('force_promote_base_min_size', 12))
+        self.force_promote_base_min_stable_frames = int(
+            fp.get('force_promote_base_min_stable_frames', 4))
+        # c_max threshold for the AT2 halt + force-promote gate.
+        # 0.40 covers the plateau range observed across 2K-150K runs
+        # (some scales saturate near 0.55, others plateau near 0.45).
+        # The stable-registry check still gates premature firing.
+        self.force_promote_c_max_threshold = float(
+            fp.get('force_promote_c_max_threshold', 0.40))
         self.fragment_physical_max_speed = float(
             fp.get('fragment_physical_max_speed', shape_defaults.get("fragment_max_speed", 0.35)))
         self.shape_matching_enabled = bool(
@@ -1164,8 +1225,18 @@ class ManifoldSimulator(
         # the physical fragment registry is non-empty AND the registry
         # count is stable (frame-to-frame change <= 1).
         skip_at2 = False
+        c_max_now = (
+            float(self.fracture_field.c.max().item())
+            if self.fracture_field.c is not None else 0.0
+        )
+        # Use the same c_max threshold as force-promote so the halt
+        # detection + base damage clamp + force-promote all fire on the
+        # same condition.  At higher particle counts c_max plateaus
+        # below 1.0 (graph spreads thinner), so 0.999 is too strict.
+        c_max_threshold = float(getattr(
+            self, "force_promote_c_max_threshold", 0.40))
         if (self.fracture_field.c is not None
-                and float(self.fracture_field.c.max().item()) >= 0.999
+                and c_max_now >= c_max_threshold
                 and self._physical_fragment_labels is not None
                 and bool((self._physical_fragment_labels > 0).any())):
             cur_count = int((self._physical_fragment_labels > 0).unique().numel())
@@ -1173,6 +1244,24 @@ class ManifoldSimulator(
             if prev_count >= 0 and abs(cur_count - prev_count) <= 1:
                 skip_at2 = True
             self._at2_halt_prev_count = cur_count
+
+        # AT2 halt + stable registry -> clamp damage on the still-cohesive
+        # base body to zero.  Without this, the residual damage field on
+        # label-0 particles keeps degrading their MPM stiffness, so under
+        # grid coupling base particles slowly drift / leak (visible as
+        # individual splats popping out of the cohesive remnant).  Once
+        # the registry is stable the visible cracks are baked into the
+        # fragment labels; any residual damage on label-0 is post-
+        # saturation noise that should not weaken the base body.
+        if (skip_at2
+                and self._surface_indices is not None
+                and self.fracture_field.c is not None
+                and self.fracture_field.c.shape[0] == self._surface_indices.shape[0]):
+            base_surf_mask = (
+                self._physical_fragment_labels[self._surface_indices] == 0
+            )
+            if bool(base_surf_mask.any()):
+                self.fracture_field.c[base_surf_mask] = 0.0
 
         if not skip_at2:
             old_front_substeps = int(getattr(self.fracture_field, "front_substeps", 1))

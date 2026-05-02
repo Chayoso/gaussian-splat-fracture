@@ -84,6 +84,18 @@ class FragmentPhysicsMixin:
                 # and the impulse direction is locally consistent with
                 # the actual fracture mechanics.
                 self._apply_griffith_release_impulse(mask)
+                # NET rigid-body release on top of Griffith.  Griffith uses
+                # +/- random signs per particle, so it sums to ~0 at the
+                # COM and produces only internal puff (immediately erased
+                # by shape match).  This adds a NET v_com kick along the
+                # fragment-from-base radial direction plus a perpendicular
+                # tumble omega -- analogous to the existing unified
+                # impact-time rigid response, applied per fragment at
+                # graduation.  Survives shape match because it is COM-level
+                # motion, not per-particle dispersion: fragment shapes
+                # remain rigid (paper claim 3 untouched) while the chunk
+                # actually translates and tumbles after detaching.
+                self._apply_unified_fragment_release(mask)
 
             persistent[mask] = persistent_label
             state = self._physical_fragment_states.get(
@@ -114,7 +126,16 @@ class FragmentPhysicsMixin:
             state["age"] = int(state.get("age", 0)) + 1
             self._physical_fragment_states[persistent_label] = state
 
-        if self.crack_connected_release_only:
+        # Revert too-small fragments back to base.  Skipped when
+        # `force_promote_base_after_halt` is active: under that mode we
+        # want EVERY particle to end up with a non-zero label, and
+        # reverting small fragments to 0 just reintroduces the base
+        # remnant that force-promote is trying to eliminate.  Without
+        # this skip, every frame the revert loop produces fresh
+        # label==0 particles that force-promote already finished
+        # cleaning up.
+        if (self.crack_connected_release_only
+                and not bool(getattr(self, "force_promote_base_after_halt", False))):
             for label in persistent.unique(sorted=True).tolist():
                 if label <= 0:
                     continue
@@ -122,6 +143,48 @@ class FragmentPhysicsMixin:
                 if int(mask.sum().item()) < self.fragment_physical_min_size:
                     persistent[mask] = 0
                     self._physical_fragment_states.pop(int(label), None)
+
+        # Force-promote any remaining base particles after AT2 halt +
+        # registry stable for K frames.  The crack-connected closure
+        # logic only graduates fragments whose boundary forms a closed
+        # ring -- particles in regions never reached by crack
+        # propagation stay label==0 forever as a "base remnant".  For
+        # complete pulverization we want zero remnant: partition the
+        # remaining base spatially into chunks, each becoming a new
+        # fragment with its own COM-level release impulse.  Style
+        # presets that want the base preserved (radial_shatter when
+        # the prompt does NOT imply complete pulverization) leave
+        # `force_promote_base_after_halt = False`.
+        if bool(getattr(self, "force_promote_base_after_halt", False)):
+            persistent = self._maybe_force_promote_base_remnant(persistent)
+            # Belt-and-suspenders: even if force-promote already ran,
+            # any label==0 particles still present after this point
+            # need to be eliminated for "complete pulverization".  Some
+            # graph-fragment passes split persistent labels in ways
+            # that can leave a few orphan label-0 particles between
+            # frames; catch-all-attach them to the nearest non-base
+            # fragment unconditionally on every frame.
+            still_base = persistent == 0
+            n_still = int(still_base.sum().item())
+            if n_still > 0 and bool((persistent > 0).any()):
+                base_idx = torch.where(still_base)[0]
+                non_base_idx = torch.where(persistent > 0)[0]
+                if non_base_idx.numel() > 0:
+                    base_pos = self.x_mpm[base_idx]
+                    non_base_pos = self.x_mpm[non_base_idx]
+                    # Chunked nearest-neighbor to bound memory.
+                    chunk = 4096
+                    new_labels = torch.zeros(
+                        base_idx.numel(), dtype=persistent.dtype,
+                        device=persistent.device,
+                    )
+                    for start in range(0, base_idx.numel(), chunk):
+                        end = min(start + chunk, base_idx.numel())
+                        d2 = ((base_pos[start:end].unsqueeze(1)
+                               - non_base_pos.unsqueeze(0)) ** 2).sum(-1)
+                        nearest = d2.argmin(dim=1)
+                        new_labels[start:end] = persistent[non_base_idx[nearest]]
+                    persistent[base_idx] = new_labels
 
         self._physical_fragment_labels = persistent
         if bool((persistent > 0).any()):
@@ -210,6 +273,281 @@ class FragmentPhysicsMixin:
 
         self.v_mpm[idx] = self.v_mpm[idx] + impulse
 
+    @torch.no_grad()
+    def _maybe_force_promote_base_remnant(self, persistent: Tensor) -> Tensor:
+        """Partition remaining label==0 particles into spatial chunks
+        once AT2 has halted and the registry has been stable for K
+        frames.  Each chunk becomes a new fragment with a Griffith +
+        unified release impulse, so the entire body decomposes into
+        flying chunks rather than retaining a coherent base remnant.
+        """
+        # Halt + stable detection: rely on _at2_halt_prev_count being
+        # set by the simulator's _step_fracture_field.  We require
+        # several frames of stable count before triggering, so the
+        # promotion happens once per run after fragmentation truly
+        # settles (not in the middle of active propagation).
+        cur_nonbase = int((persistent > 0).unique().numel())
+        prev_nonbase = int(getattr(self, "_force_promote_prev_count", -1))
+        stable = (prev_nonbase >= 0 and abs(cur_nonbase - prev_nonbase) <= 1)
+        self._force_promote_prev_count = cur_nonbase
+        if not stable:
+            self._force_promote_stable_frames = 0
+            return persistent
+        self._force_promote_stable_frames = (
+            int(getattr(self, "_force_promote_stable_frames", 0)) + 1
+        )
+        if int(self._force_promote_stable_frames) < int(
+                getattr(self, "force_promote_base_min_stable_frames", 4)):
+            return persistent
+        # Damage threshold for force-promote gate.  We don't require full
+        # AT2 saturation (c_max >= 0.999) because at higher particle
+        # counts the global c_max often plateaus around 0.6-0.7 even
+        # though local crack-front propagation has settled.  Registry
+        # stability + significant local damage is enough to trigger
+        # promotion.
+        c_max_threshold = float(getattr(
+            self, "force_promote_c_max_threshold", 0.40))
+        if (getattr(self, "fracture_field", None) is None
+                or self.fracture_field.c is None
+                or float(self.fracture_field.c.max().item()) < c_max_threshold):
+            return persistent
+
+        base_mask = persistent == 0
+        n_base = int(base_mask.sum().item())
+        if n_base == 0:
+            return persistent
+
+        # First-time grid partitioning of the bulk base remnant.
+        # Subsequent calls only run the catch-all attach pass to mop up
+        # any new label==0 particles that emerge during fragment
+        # housekeeping.
+        promoted_count = 0
+        initial_done = bool(getattr(self, "_initial_force_promote_done", False))
+        if not initial_done and n_base >= int(
+                getattr(self, "force_promote_base_min_size", 12)):
+            base_idx = torch.where(base_mask)[0]
+            base_pos = self.x_mpm[base_idx]
+            bbox_min = base_pos.min(dim=0).values
+            bbox_max = base_pos.max(dim=0).values
+            bbox_size = (bbox_max - bbox_min).clamp(min=1e-6)
+
+            grid_n = max(2, int(getattr(self, "force_promote_grid_n", 4)))
+            cell = ((base_pos - bbox_min) / (bbox_size / grid_n)).long()
+            cell = cell.clamp(min=0, max=grid_n - 1)
+            flat_cell = (
+                cell[:, 0] * (grid_n * grid_n)
+                + cell[:, 1] * grid_n
+                + cell[:, 2]
+            )
+
+            unique_cells = flat_cell.unique()
+            for cell_id in unique_cells.tolist():
+                local_mask = flat_cell == cell_id
+                local_count = int(local_mask.sum().item())
+                if local_count < self.fragment_physical_min_size:
+                    continue
+                global_idx = base_idx[local_mask]
+                new_label = self._next_physical_fragment_id
+                self._next_physical_fragment_id += 1
+                persistent[global_idx] = new_label
+                full_mask = torch.zeros_like(persistent, dtype=torch.bool)
+                full_mask[global_idx] = True
+                birth_com = self.x_mpm[global_idx].mean(dim=0).detach().clone()
+                self._physical_fragment_states[new_label] = {
+                    "age": 0,
+                    "release_score": 1.0,
+                    "support_lost": True,
+                    "birth_com": birth_com,
+                    "birth_base_com": birth_com.clone(),
+                    "release_dir": None,
+                    "spin_axis": None,
+                }
+                self._apply_griffith_release_impulse(full_mask)
+                self._apply_unified_fragment_release(full_mask)
+                promoted_count += 1
+            self._initial_force_promote_done = True
+
+        # Residual catch-all: any base particles that landed in cells
+        # too small to promote individually (grid binning leaves
+        # singletons in sparse cells) get collected into ONE residual
+        # fragment.  Without this, the verifier sees label==0 leftovers
+        # and complete pulverization is incomplete.
+        leftover_mask = persistent == 0
+        n_leftover = int(leftover_mask.sum().item())
+        if n_leftover >= max(2, self.fragment_physical_min_size // 2):
+            new_label = self._next_physical_fragment_id
+            self._next_physical_fragment_id += 1
+            global_idx = torch.where(leftover_mask)[0]
+            persistent[global_idx] = new_label
+            full_mask = torch.zeros_like(persistent, dtype=torch.bool)
+            full_mask[global_idx] = True
+            birth_com = self.x_mpm[global_idx].mean(dim=0).detach().clone()
+            self._physical_fragment_states[new_label] = {
+                "age": 0,
+                "release_score": 1.0,
+                "support_lost": True,
+                "birth_com": birth_com,
+                "birth_base_com": birth_com.clone(),
+                "release_dir": None,
+                "spin_axis": None,
+            }
+            self._apply_griffith_release_impulse(full_mask)
+            self._apply_unified_fragment_release(full_mask)
+            promoted_count += 1
+        elif n_leftover > 0 and bool((persistent > 0).any()):
+            # Too few leftovers to form a fragment (singletons / pairs).
+            # Attach each to its nearest non-base fragment so the body
+            # is fully labelled.
+            non_base_mask = persistent > 0
+            non_base_idx = torch.where(non_base_mask)[0]
+            non_base_pos = self.x_mpm[non_base_idx]
+            leftover_idx = torch.where(leftover_mask)[0]
+            leftover_pos = self.x_mpm[leftover_idx]
+            d2 = ((leftover_pos.unsqueeze(1) - non_base_pos.unsqueeze(0)) ** 2).sum(-1)
+            nearest = d2.argmin(dim=1)
+            persistent[leftover_idx] = persistent[non_base_idx[nearest]]
+
+        n_after = int((persistent == 0).sum().item())
+        if promoted_count > 0 or (n_leftover > 0 and n_after < n_base):
+            print(
+                f"  [force-promote-base] promoted {promoted_count} chunks "
+                f"({n_base} -> {n_after} base remaining)"
+            )
+        return persistent
+
+    @torch.no_grad()
+    def _apply_unified_fragment_release(self, mask: Tensor) -> None:
+        """At fragment graduation, apply a NET rigid-body release impulse.
+
+        Two NET (COM-level) components, both surviving shape match because
+        they are NOT per-particle dispersion:
+
+          - v_com kick along the (frag_com - base_com) radial direction:
+            the chunk slides outward as a rigid body.
+          - omega tumble around the horizontal axis perpendicular to the
+            radial direction: the chunk also rotates as it slides.
+
+        This is the per-fragment-at-graduation analogue of the existing
+        whole-body-at-impact "unified rigid-body impact response"
+        (`unified_impact_impulse_scale` + `unified_impact_tumble_scale`),
+        and it is what allows fragment COMs to actually translate after
+        detaching.  Without it the only NET force on a fragment is gravity
+        (Griffith per-particle KE has +/- random signs and sums to ~0 at
+        the COM, so it produces internal puff that shape match immediately
+        erases without any net translation).
+
+        Per-particle Griffith (paper claim 3) is unchanged -- this only
+        adds COM-level rigid-body motion, so fragment shapes stay rigid.
+        """
+        v_com_gain = float(getattr(self, "fragment_release_v_com_gain", 0.0))
+        tumble_gain = float(getattr(self, "fragment_release_tumble_gain", 0.0))
+        if v_com_gain <= 0.0 and tumble_gain <= 0.0:
+            return
+        if not bool(mask.any()):
+            return
+
+        idx = torch.where(mask)[0]
+        if idx.numel() < 4:
+            return
+
+        frag_x = self.x_mpm[idx]
+        frag_com = frag_x.mean(dim=0)
+
+        # Base reference for the radial outward direction.  Exclude the
+        # fragment we are graduating (still labeled 0 in the not-yet-
+        # committed registry) so it doesn't pull the base COM toward
+        # itself.  Fall back to impact center, then to global COM.
+        base_com: Optional[Tensor] = None
+        labels = self._physical_fragment_labels
+        if labels is not None and labels.shape[0] == self.x_mpm.shape[0]:
+            base_mask = (labels == 0) & (~mask)
+            if bool(base_mask.any()):
+                base_com = self.x_mpm[base_mask].mean(dim=0)
+        if base_com is None and hasattr(self, "_impact_center"):
+            base_com = self._impact_center.to(frag_com.device, frag_com.dtype)
+        if base_com is None:
+            base_com = self.x_mpm.mean(dim=0)
+
+        radial = frag_com - base_com
+
+        # XY-only radial direction so fragments scatter LATERALLY rather
+        # than all flying straight up: in a centered drop the
+        # impact_center sits directly below the body COM, so the raw 3D
+        # radial vector is nearly pure +Z and every fragment gets the
+        # same skyward kick (the visible result is "everything blasts up
+        # then falls back" -- a "주저앉는" collapse, not a "흩날린다"
+        # scatter).  Decompose into a horizontal radial direction (XY)
+        # and a small explicit upward boost so the dominant motion is
+        # lateral spread with a brief arc.
+        radial_xy = radial.clone()
+        radial_xy[2] = 0.0
+        radial_xy_norm = float(radial_xy.norm().item())
+        if radial_xy_norm < 1e-6:
+            # Fragment sits exactly on the body axis (frag_com_xy ==
+            # base_com_xy).  Pick a deterministic-but-fragment-specific
+            # horizontal direction so otherwise-degenerate fragments
+            # still scatter laterally instead of all collecting at the
+            # body axis.
+            import math
+            seed = int(self._next_physical_fragment_id) * 9173 + 41
+            gen = torch.Generator(device="cpu")
+            gen.manual_seed(seed)
+            theta = float(torch.rand(1, generator=gen).item()) * 6.283185
+            radial_xy = torch.tensor(
+                [math.cos(theta), math.sin(theta), 0.0],
+                device=radial.device, dtype=radial.dtype,
+            )
+            radial_xy_norm = 1.0
+        radial_xy_unit = radial_xy / radial_xy_norm
+        radial_unit = radial_xy_unit  # used downstream for tumble axis
+
+        max_speed = max(float(getattr(self, "fragment_physical_max_speed", 2.0)),
+                        0.05)
+        # Lateral kick magnitude = full v_com_gain.  Upward boost is a
+        # fraction of that, configurable per style.  Total kick magnitude
+        # is clamped to max_speed.
+        upward_frac = float(getattr(self, "fragment_release_upward_fraction", 0.30))
+        upward_frac = max(0.0, min(upward_frac, 1.0))
+        v_com_lateral = v_com_gain
+        v_com_up = v_com_gain * upward_frac
+        kick_mag = float((v_com_lateral * v_com_lateral
+                          + v_com_up * v_com_up) ** 0.5)
+        if kick_mag > max_speed:
+            scale = max_speed / kick_mag
+            v_com_lateral *= scale
+            v_com_up *= scale
+        if v_com_lateral > 0.0 or v_com_up > 0.0:
+            v_com_kick = radial_xy_unit * v_com_lateral
+            v_com_kick = v_com_kick.clone()
+            v_com_kick[2] = v_com_kick[2] + v_com_up
+            self.v_mpm[idx] = self.v_mpm[idx] + v_com_kick.unsqueeze(0)
+        v_com_mag = float((v_com_lateral * v_com_lateral
+                           + v_com_up * v_com_up) ** 0.5)
+
+        # Tumble: omega along the horizontal axis perpendicular to the
+        # radial direction.  Magnitude scales with v_com (tumble couples
+        # to translation -- a chunk that slides farther also spins more)
+        # and inversely with object size so the tumble period is
+        # consistent across mesh extents.
+        if tumble_gain > 0.0 and v_com_mag > 0.0:
+            up = torch.tensor([0.0, 0.0, 1.0],
+                              device=radial.device, dtype=radial.dtype)
+            spin_axis = torch.cross(radial_unit, up, dim=0)
+            spin_norm = float(spin_axis.norm().item())
+            if spin_norm > 1e-6:
+                spin_axis = spin_axis / spin_norm
+                obj_size = float(
+                    (self.x_mpm.max(dim=0).values
+                     - self.x_mpm.min(dim=0).values).max()
+                )
+                obj_size = max(obj_size, 1e-3)
+                omega_mag = tumble_gain * v_com_mag / obj_size
+                omega = spin_axis * omega_mag
+                rel = self.x_mpm[idx] - frag_com.unsqueeze(0)
+                v_rot = torch.cross(
+                    omega.unsqueeze(0).expand_as(rel), rel, dim=1)
+                self.v_mpm[idx] = self.v_mpm[idx] + v_rot
+
     def _step_fragmented_physics(self, stress: Tensor, dt: float):
         """Single global MPM step with per-fragment label tracking.
 
@@ -229,11 +567,84 @@ class FragmentPhysicsMixin:
         # the same grid).  Inter-fragment forces propagate naturally
         # through the grid, and base + fragments inherit the same
         # post-impact velocity field.
+        # Save pre-p2g2p fragment z-velocity so we can apply per-particle
+        # bounce on the floor.  The MPM grid uses a "slip" BC at the
+        # ground plane which zeros out the normal velocity component as
+        # part of p2g2p, so by the time the per-fragment shape-match
+        # rigid contact impulse runs the z-velocity is already 0 and the
+        # restitution kick has nothing to bounce off of (this is why
+        # fragment ground bounces were invisible despite restitution=0.5
+        # in style profiles).  We restore the bounce after p2g2p by
+        # detecting fragment particles that approach the floor and
+        # rewriting v_z = -restitution * v_z_pre.
+        v_z_pre_for_bounce = None
+        floor_restitution = float(getattr(self, "fragment_floor_restitution", 0.0))
+        if floor_restitution > 0.0 and getattr(self, "_gravity_drop_contacted", False):
+            v_z_pre_for_bounce = self.v_mpm[:, 2].clone()
+
         self.x_mpm, self.v_mpm, self.C, self.F = self.mpm.p2g2p(
             self.x_mpm, self.v_mpm, self.C, self.F, stress)
 
+        if v_z_pre_for_bounce is not None:
+            ground_z = float(getattr(self, "_gravity_drop_ground_z", 0.05))
+            band = max(2.0 * float(self.mpm.dx), 1e-4)
+            at_floor = self.x_mpm[:, 2] <= ground_z + band
+            was_descending = v_z_pre_for_bounce < -1e-3
+            is_fragment = mpm_frag_ids > 0
+            bounce_mask = at_floor & was_descending & is_fragment
+            if bool(bounce_mask.any()):
+                self.v_mpm[bounce_mask, 2] = (
+                    -floor_restitution * v_z_pre_for_bounce[bounce_mask]
+                )
+
+        # Fragment-only damping override.  The global mpm.damping
+        # (post_impact_damping=0.95 per substep for brittle materials)
+        # is tuned to suppress base-body elastic vibration after impact
+        # but also bleeds the velocity of detached fragments, so a
+        # per-fragment rigid release impulse decays to background
+        # within a few substeps and the visual reads as soft "powder
+        # falling" rather than glass-like "shards flying".  Fragments
+        # are shape-matched to rigid (no elastic vibration to suppress)
+        # so we can safely undo the damping for fragment-labeled
+        # particles only -- their effective per-substep damping is
+        # 1.0, the base body keeps its 0.95.
+        damping = float(self.mpm.damping)
+        if 0.0 < damping < 1.0:
+            mask = mpm_frag_ids > 0
+            if bool(mask.any()):
+                self.v_mpm[mask] = self.v_mpm[mask] / damping
+
+        self._apply_fragment_extra_gravity(mpm_frag_ids, dt)
         self._apply_physical_fragment_release_drift(mpm_frag_ids, dt)
         self.mpm.time += dt
+
+    @torch.no_grad()
+    def _apply_fragment_extra_gravity(self, mpm_frag_ids: Tensor, dt: float) -> None:
+        """Per-substep extra downward acceleration applied to fragment
+        particles only.
+
+        The global ``post_impact_gravity_z`` + ``post_impact_damping``
+        (default 0.95 / substep for brittle materials) are tuned for the
+        cohesive base body: aggressive damping kills residual elastic
+        vibration after impact.  That damping also bleeds the gravity-
+        induced velocity of small detached fragments so they visually
+        appear to fall under a weaker effective gravity than the base.
+
+        This adds a per-substep extra downward velocity impulse to
+        fragment-labeled particles only -- analogous in spirit to the
+        runtime ``post_impact_gravity_z`` override but applied
+        additively per fragment.  Base body falling kinematics are
+        unchanged.  ``fragment_extra_gravity_z = 0`` disables.
+        """
+        extra_g = float(getattr(self, "fragment_extra_gravity_z", 0.0))
+        if abs(extra_g) < 1e-8:
+            return
+        if mpm_frag_ids is None:
+            return
+        mask = mpm_frag_ids > 0
+        if not bool(mask.any()):
+            return
+        self.v_mpm[mask, 2] = self.v_mpm[mask, 2] + extra_g * float(dt)
 
     def _apply_physical_fragment_release_drift(self, mpm_frag_ids: Tensor, dt: float) -> None:
         """Apply a small physical gap / release drift to support-lost fragments."""

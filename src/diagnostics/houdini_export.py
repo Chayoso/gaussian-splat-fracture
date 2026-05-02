@@ -276,7 +276,13 @@ def export_simulator_state(
     # assignment when sizes diverge.
     physical_labels = getattr(simulator, "_physical_fragment_labels", None)
     surface_indices = getattr(simulator, "_surface_indices", None)
-    fid_np = np.zeros(n, dtype=np.int32)
+    # Initialize fid to -1 ("no mapping") so densified Gaussian slots
+    # without a corresponding surface particle aren't conflated with
+    # genuine label==0 base body particles.  Any fid <= 0 is hidden by
+    # the viewer's B-key, so phantom slots stay correctly hidden.  We
+    # write -1 (rather than 0) so downstream code that distinguishes
+    # base from phantom can do so on the sign of fid.
+    fid_np = np.full(n, -1, dtype=np.int32)
     if (physical_labels is not None
             and surface_indices is not None
             and physical_labels.numel() > 0):

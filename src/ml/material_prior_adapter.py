@@ -377,7 +377,11 @@ SENTENCE_STYLE_RULES = (
             "manifold.cut_hard_break_threshold": 0.42,
             "manifold.authoritative_cut_threshold": 0.22,
             "manifold.crack_connected_release_only": True,
-            "manifold.strict_closure_max_released_ratio": 0.16,
+            # No explicit released-ratio cap: spiderweb's visual is
+            # carried by the fracture_mult (low branching_bias, wide
+            # bands) and crack_connected_release_only=True, not by a
+            # hand-tuned release cap.  Material physics decides the
+            # actual release ratio.
             "manifold.open_crack_release_enable": False,
             "manifold.open_crack_release_max_patches": 0,
             "manifold.open_crack_release_threshold": 1.0,
@@ -542,8 +546,6 @@ SENTENCE_STYLE_RULES = (
             "manifold.shape_match_strength": 0.97,
             "manifold.shape_match_fragment_strength": 0.97,
             "manifold.shape_match_velocity_blend": 0.0,
-            "manifold.fragment_physical_max_speed": 2.40,
-            "manifold.rigid_contact_restitution": 0.0,
             # Unified impact impulse (rigid-body form): horizontal v_com
             # slide along body-COM-to-impact-center offset + tumble omega
             # around the perpendicular horizontal axis.  Per-particle
@@ -564,6 +566,32 @@ SENTENCE_STYLE_RULES = (
             # fracture surface.
             "manifold.fragment_griffith_release_gain": 0.001,
             "manifold.fragment_griffith_downward_bias": 0.3,
+            # Per-fragment-at-graduation NET rigid-body release.  Griffith
+            # gives stress-correct per-particle KE but sums to ~0 at the
+            # COM (signed +/- per particle), so without a NET COM kick the
+            # detached fragments just inherit the parent's downward MPM
+            # velocity and fall straight down -- visually they "pop, then
+            # stop, then drop".  v_com_gain=0.55 m/s is in the same band
+            # as the whole-body unified impact slide (0.05 * v_impact ~
+            # 1.75 m/s) but per-fragment it scales naturally smaller.
+            # tumble_gain=1.6 yields ~2.2 rad/s spin for a 0.4-unit mesh,
+            # i.e. a visible roll over ~3 seconds before damping.
+            # Baseline scatter values are calibrated for a GLASS-TIER
+            # reference material (E=70 GPa, Gc=5 J/m^2 -> brittleness 1.0).
+            # _apply_material_scatter_scaling multiplies these by the
+            # actual material's brittleness, so ceramic / concrete /
+            # rubber inherit reduced scatter without retuning the style.
+            # Lateral scatter — radial_shatter is the pre-pulverization
+            # tier so spread is significant but less than full pulverize.
+            "manifold.fragment_release_v_com_gain": 5.0,
+            "manifold.fragment_release_tumble_gain": 1.4,
+            "manifold.fragment_release_upward_fraction": 0.30,
+            "manifold.fragment_extra_gravity_z": -600.0,
+            "manifold.fragment_physical_max_speed": 12.0,
+            # Per-particle floor bounce override (recovers bounce that
+            # the MPM "slip" BC would otherwise eat).  0.45 gives a
+            # crisp half-velocity rebound for glass-tier shards.
+            "manifold.fragment_floor_restitution": 0.45,
             # Post-impact gravity matches the free-fall magnitude so
             # acceleration is uniform across impact (no visible
             # "hovering" after contact).  Stronger damping (0.95) plus
@@ -647,12 +675,43 @@ SENTENCE_STYLE_RULES = (
             "manifold.shape_match_strength": 0.97,
             "manifold.shape_match_fragment_strength": 0.97,
             "manifold.shape_match_velocity_blend": 0.0,
-            "manifold.fragment_physical_max_speed": 3.20,
-            "manifold.rigid_contact_restitution": 0.0,
             "manifold.unified_impact_impulse_scale": 0.05,
             "manifold.unified_impact_tumble_scale": 0.20,
             "manifold.fragment_griffith_release_gain": 0.0020,
             "manifold.fragment_griffith_downward_bias": 0.20,
+            # Stronger NET COM release than radial_shatter -- complete
+            # pulverization is the explosive end of the brittle spectrum,
+            # so each shard carries away more of the released elastic
+            # energy as bulk translational + rotational KE.
+            # Baseline scatter values calibrated for glass-tier (brittleness 1.0).
+            # complete_pulverization is the explosive end of the spectrum --
+            # higher v_com gain than radial_shatter (a glass shatter prompt
+            # with the "completely pulverized" wording should produce a
+            # visibly more dramatic explosion than the same prompt with
+            # "shattering into many sharp radial cracks").
+            # Explosive lateral scatter: v_com_gain is the XY-radial
+            # speed (m/s) the chunk takes away from the impact axis.
+            # 8 m/s + max_speed 18 lets fragments traverse ~25% of the
+            # world over their flight, which reads as "흩날린다" rather
+            # than "주저앉는다".  upward_fraction 0.25 = brief arc lift,
+            # the dominant motion is horizontal.
+            "manifold.fragment_release_v_com_gain": 8.0,
+            "manifold.fragment_release_tumble_gain": 1.5,
+            "manifold.fragment_release_upward_fraction": 0.25,
+            "manifold.fragment_extra_gravity_z": 0.0,
+            "manifold.fragment_physical_max_speed": 18.0,
+            # Per-particle floor bounce override (recovers from slip BC).
+            # 0.85 = nearly elastic glass shard bounce.
+            "manifold.fragment_floor_restitution": 0.85,
+            # Force the cohesive base remnant to graduate into chunks
+            # after AT2 halts: complete pulverization should leave NO
+            # base remnant visible.  Each chunk gets a Griffith +
+            # unified release impulse on graduation, so the body fully
+            # decomposes into flying chunks rather than retaining a
+            # coherent base mesh shape.
+            "manifold.force_promote_base_after_halt": True,
+            "manifold.force_promote_grid_n": 4,
+            "manifold.force_promote_base_min_stable_frames": 3,
             "manifold.post_impact_gravity_z": -3500.0,
             "manifold.post_impact_damping": 0.95,
             "manifold.curvature_weight": 0.4,
@@ -721,7 +780,11 @@ SENTENCE_STYLE_RULES = (
             "manifold.fragment_persistent_min_size_ratio": 0.0040,
             "manifold.fragment_primary_cut_ratio": 0.66,
             "manifold.fragment_fallback_cut_ratio": 0.52,
-            "manifold.strict_closure_max_released_ratio": 0.18,
+            # No explicit released-ratio cap: single_smooth's visual is
+            # carried by the fracture_mult (high tau_init, narrow
+            # branching, drive_quantile=0.86) so cracks rarely propagate
+            # to fragment-graduation in the first place.  Material
+            # physics decides the actual release ratio.
             "manifold.open_crack_release_max_patches": 2,
             "manifold.open_crack_release_threshold": 0.44,
             "manifold.brittle_release_intensity": 0.90,
@@ -1609,15 +1672,19 @@ class MaterialPriorAdapter:
             return out
 
         cap_by_family = {
-            # Raised from 0.68 to 0.92 so the `radial_shatter` style
-            # can produce true "complete shatter": only ~8% base
-            # remnant instead of 32%.  Other sharp_brittle styles
-            # (spiderweb, single_smooth) clamp themselves lower in
-            # their own runtime overrides, so they are unaffected.
-            "sharp_brittle": 0.92,
-            "brittle_moderate": 0.46,
-            "rough_quasi_brittle": 0.42,
-            "neutral_reference": 0.35,
+            # All family caps removed (1.00 = no cap).  The released
+            # ratio is now an EMERGENT property of the underlying
+            # material physics (E, Gc, nu, rho via fracture toughness,
+            # damage propagation thresholds, and support gates).  Brittle
+            # materials with low Gc (glass) self-pulverize fully; tough
+            # materials with high Gc (concrete) self-limit at lower
+            # ratios because cracks stop propagating before the body is
+            # fully released.  No style-level or family-level hand-tuned
+            # release cap is imposed.
+            "sharp_brittle": 1.00,
+            "brittle_moderate": 1.00,
+            "rough_quasi_brittle": 1.00,
+            "neutral_reference": 1.00,
         }
         family_cap = cap_by_family.get(family_name, 0.35)
         requested_cap = float(
@@ -1638,6 +1705,64 @@ class MaterialPriorAdapter:
             "manifold.splitting_enabled": False,
         })
         out = MaterialPriorAdapter._apply_family_runtime_caps(out, family_name)
+        return out
+
+    @staticmethod
+    def _apply_material_scatter_scaling(
+        runtime: Dict[str, object],
+        physics_prior: Dict[str, float],
+    ) -> Dict[str, object]:
+        """Scale fragment-scatter knobs by a material brittleness factor.
+
+        Style runtime dicts set BASELINE scatter magnitudes calibrated
+        for a glass-tier brittleness reference (E=70 GPa, Gc=5 J/m^2).
+        This pass multiplies the scatter knobs by
+
+            brittleness = sqrt(E/Gc) / sqrt(E_glass / Gc_glass)
+
+        clipped to ``[0, 1.5]``.  Glass keeps the baseline (factor 1.0);
+        ceramic (Gc ~50) drops to ~0.32; concrete (E=30 GPa, Gc ~100)
+        to ~0.15; rubber (diffuse_damage) goes to ~0.  This is what makes
+        the same `radial_shatter` style produce explosive scatter on
+        glass and chunky slow-moving shards on concrete -- the "scatter
+        magnitude is an emergent material property" claim.
+
+        Knobs scaled:
+          - fragment_release_v_com_gain (NET radial v_com kick)
+          - fragment_release_tumble_gain (NET tumble)
+          - fragment_griffith_release_gain (per-particle Griffith KE)
+          - fragment_extra_gravity_z (post-impact damping compensation;
+            scales with brittleness because tougher materials have
+            less explosive release energy to compensate for in the
+            first place)
+
+        Knobs NOT scaled (their tuning is independent of brittleness):
+          - fragment_physical_max_speed (an upper-bound clamp; bumped
+            in the style profile if needed)
+          - shape_match_*  (per-fragment rigidity)
+        """
+        out = dict(runtime)
+        try:
+            E = max(float(physics_prior.get("E", 0.0)), 1.0)
+            Gc = max(float(physics_prior.get("Gc", 1.0)), 1e-3)
+        except (TypeError, ValueError):
+            return out
+        E_ref, Gc_ref = 70.0e9, 5.0
+        brittleness = float(np.sqrt(E / Gc) / np.sqrt(E_ref / Gc_ref))
+        brittleness = max(0.0, min(brittleness, 1.5))
+        scatter_keys = (
+            "manifold.fragment_release_v_com_gain",
+            "manifold.fragment_release_tumble_gain",
+            "manifold.fragment_griffith_release_gain",
+            "manifold.fragment_extra_gravity_z",
+        )
+        for key in scatter_keys:
+            if key in out:
+                try:
+                    out[key] = float(out[key]) * brittleness
+                except (TypeError, ValueError):
+                    continue
+        out["manifold.material_brittleness"] = brittleness
         return out
 
     def apply_sentence_style(
@@ -1667,6 +1792,8 @@ class MaterialPriorAdapter:
             family = str(material_prior.get("family", "neutral_reference"))
             runtime = self._enforce_crack_connected_fragment_runtime(runtime, family)
             runtime = self._enforce_metal_no_fracture(runtime, family, text)
+            runtime = self._apply_material_scatter_scaling(
+                runtime, dict(material_prior.get("physics", {})))
             runtime["manifold.sentence_style"] = style_name
             out["runtime"] = runtime
             out["sentence_style"] = style_name
@@ -1683,6 +1810,8 @@ class MaterialPriorAdapter:
         runtime.update(dict(style.get("runtime", {})))
         runtime = self._enforce_crack_connected_fragment_runtime(runtime, family)
         runtime = self._enforce_metal_no_fracture(runtime, family, text)
+        runtime = self._apply_material_scatter_scaling(
+            runtime, dict(material_prior.get("physics", {})))
         runtime["manifold.sentence_style"] = style_name
 
         out = dict(material_prior)
