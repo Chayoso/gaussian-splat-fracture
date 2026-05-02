@@ -271,6 +271,23 @@ class FragmentPhysicsMixin:
             target_norm = magnitude.unsqueeze(-1).clamp(min=0.0)
             impulse = impulse * (target_norm / cur_norm).clamp(max=1.0)
 
+        # Remove the COM-net of the Griffith impulse so the per-particle
+        # dispersion (paper claim 3: random +/- sign, sqrt(stress)
+        # magnitude along principal eigenvector) is preserved while the
+        # NET COM kick is exactly zero by construction.  Without this
+        # subtraction, finite-N variance in the random ± signs would
+        # leak into the fragment's COM velocity (variance ~ 1/sqrt(N)
+        # of the per-particle magnitude), giving small fragments an
+        # occasional rogue net kick that visually reads as a single
+        # particle "튕김" -- a CUDA-non-deterministic artefact since
+        # the per-particle seed is keyed on `_next_physical_fragment_id`
+        # which can shift between runs.  The unified rigid-body
+        # release is the correct vehicle for NET COM motion; Griffith
+        # is the correct vehicle for per-particle dispersion.  This
+        # preserves both interpretations cleanly.
+        if impulse.shape[0] > 0:
+            impulse = impulse - impulse.mean(dim=0, keepdim=True)
+
         self.v_mpm[idx] = self.v_mpm[idx] + impulse
 
     @torch.no_grad()
