@@ -185,19 +185,35 @@ def main() -> int:
             max_lateral = max(max_lateral, float(frag_dxy.max()))
     print(f"max lateral (XY) displacement / frame: {max_lateral:.5f}")
 
-    # Also: spread of final fragment positions vs initial.
-    fid_first = first.get("fragment_id")
+    # Spread metric: PEAK XY bbox across all frames vs first frame.
+    # Last-frame measurement under-reports because fragments have
+    # mostly settled by then; the explosive-scatter signature is the
+    # bbox at the peak of their flight arc.
     P_first = first.get("P")
-    if P_first is not None and fid_last is not None:
+    spread_growth_peak = 0.0
+    spread_growth_last = 0.0
+    if P_first is not None:
         n_min = min(P_first.shape[0] // 3 if P_first.ndim == 1 else P_first.shape[0], n)
         first_P = P_first.reshape(-1, 3)[:n_min]
+        bbox_first_xy = (first_P[:, :2].max(axis=0) - first_P[:, :2].min(axis=0)).clip(min=1e-6)
+        for f in files:
+            g = read_geo(f)
+            if "P" not in g or "fragment_id" not in g:
+                continue
+            cur_P = g["P"].reshape(-1, 3)
+            cur_fid = g["fragment_id"].reshape(-1)
+            frag_P = cur_P[cur_fid > 0]
+            if frag_P.size == 0:
+                continue
+            bbox_cur_xy = frag_P[:, :2].max(axis=0) - frag_P[:, :2].min(axis=0)
+            growth = float((bbox_cur_xy / bbox_first_xy).max())
+            if growth > spread_growth_peak:
+                spread_growth_peak = growth
         last_P_n = P_last.reshape(-1, 3)[:n_min]
-        bbox_first = first_P.max(axis=0) - first_P.min(axis=0)
         bbox_last = last_P_n.max(axis=0) - last_P_n.min(axis=0)
-        spread_growth = float((bbox_last[:2] / bbox_first[:2].clip(min=1e-6)).max())
-        print(f"XY bbox spread growth (last/first): {spread_growth:.2f}")
-    else:
-        spread_growth = 0.0
+        spread_growth_last = float((bbox_last[:2] / bbox_first_xy).max())
+        print(f"XY bbox spread growth: peak={spread_growth_peak:.2f}  last={spread_growth_last:.2f}")
+    spread_growth = spread_growth_peak
 
     if max_lateral < 5e-4:
         issues.append(f"NO_LATERAL_SCATTER (max XY dxy = {max_lateral:.6f})")
