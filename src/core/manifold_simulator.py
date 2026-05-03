@@ -397,37 +397,14 @@ class ManifoldSimulator(
             fp.get('fragment_physical_spin_gain', shape_defaults.get("fragment_spin_gain", 0.0)))
         self.fragment_release_jitter = max(0.0, float(
             fp.get('fragment_release_jitter', 0.0)))
-        # Griffith-style stress-driven release at fragment graduation.
-        # 0.0 disables (uniform release_velocity hack remains active);
-        # > 0 enables per-particle KE injection scaled by local sqrt(stress)
-        # along the principal tensile direction.
-        self.fragment_griffith_release_gain = max(0.0, float(
-            fp.get('fragment_griffith_release_gain', 0.0)))
-        self.fragment_griffith_downward_bias = max(0.0, min(1.0, float(
-            fp.get('fragment_griffith_downward_bias', 0.0))))
-        # Per-fragment-at-graduation NET rigid-body release.  Complements
-        # Griffith (which uses +/- random signs per particle and so sums
-        # to ~0 at the COM): this adds a NET COM translation + tumble that
-        # survives shape match.  Analogous to the whole-body unified
-        # impact response but applied at fragment graduation.
-        # `fragment_release_v_com_gain` is the m/s magnitude of the v_com
-        # kick along the radial (frag_com - base_com) direction; clamped
-        # to fragment_physical_max_speed.  0.0 disables.
+        # Voronoi Mode-I bond opening kick magnitude (m/s).  Each broken
+        # bond gives equal-and-opposite kicks of magnitude
+        # `v_com_gain * sqrt(bond_stress_at_break)` to its two cells
+        # along the bond direction.  Clamped to
+        # `fragment_physical_max_speed`.  0.0 disables (cells separate
+        # purely from inherited body velocity + gravity).
         self.fragment_release_v_com_gain = max(0.0, float(
             fp.get('fragment_release_v_com_gain', 0.0)))
-        # `fragment_release_tumble_gain` is dimensionless; the resulting
-        # angular speed is `tumble_gain * v_com_mag / obj_size`, so a
-        # value of ~1.5 produces a few rad/s for a 0.4-unit mesh and a
-        # 0.5 m/s slide.  0.0 disables.
-        self.fragment_release_tumble_gain = max(0.0, float(
-            fp.get('fragment_release_tumble_gain', 0.0)))
-        # Fraction of v_com_gain applied as an upward Z boost on top of
-        # the XY-radial lateral kick, so fragments arc up briefly before
-        # falling rather than just shooting straight out the side.  The
-        # XY component carries the dominant "explosive scatter" feel;
-        # upward fraction controls arc height.
-        self.fragment_release_upward_fraction = max(0.0, min(1.0, float(
-            fp.get('fragment_release_upward_fraction', 0.30))))
         # Position offset (MPM-space) along kick direction at fragment
         # graduation; decouples chunk from cohesive base body in the
         # shared MPM grid so the kick survives grid gather/scatter.
@@ -444,15 +421,6 @@ class ManifoldSimulator(
         # freely.  Increase to 60-100 for fast brittle fall.
         self.particle_speed_cap = max(1.0, float(
             fp.get('particle_speed_cap', 10.0)))
-        # Per-unit-impact-speed kick scaling.  Effective kick =
-        # `v_com_gain * max(impact_scale_min, impact_scale_per_unit *
-        # impact_speed)`, capped at `fragment_physical_max_speed`.
-        # Default 0.05 + 0.0 floor: at impact_speed=20, kick = 1.0
-        # of the v_com_gain; at impact_speed=5, kick = 0.25.
-        self.fragment_release_impact_scale_per_unit = max(0.0, float(
-            fp.get('fragment_release_impact_scale_per_unit', 0.05)))
-        self.fragment_release_impact_scale_min = max(0.0, float(
-            fp.get('fragment_release_impact_scale_min', 0.0)))
         # Extra per-substep downward acceleration on fragment-labeled
         # particles only; additive on top of the global post-impact
         # gravity (`post_impact_gravity_z`).  Compensates for the fact
@@ -471,26 +439,6 @@ class ManifoldSimulator(
         # the floor band.  0.0 disables.
         self.fragment_floor_restitution = max(0.0, min(0.95, float(
             fp.get('fragment_floor_restitution', 0.0))))
-        # Force-promote remaining base particles after AT2 halt + stable
-        # registry.  When True, label==0 particles that survived crack-
-        # connected closure are partitioned into spatial chunks and
-        # graduate as new fragments (one v_com kick + tumble per chunk).
-        # Required for "complete pulverization" prompts where the user
-        # wants ZERO base remnant.  0/False keeps base intact.
-        self.force_promote_base_after_halt = bool(
-            fp.get('force_promote_base_after_halt', False))
-        self.force_promote_grid_n = int(
-            fp.get('force_promote_grid_n', 4))
-        self.force_promote_base_min_size = int(
-            fp.get('force_promote_base_min_size', 12))
-        self.force_promote_base_min_stable_frames = int(
-            fp.get('force_promote_base_min_stable_frames', 4))
-        # c_max threshold for the AT2 halt + force-promote gate.
-        # 0.40 covers the plateau range observed across 2K-150K runs
-        # (some scales saturate near 0.55, others plateau near 0.45).
-        # The stable-registry check still gates premature firing.
-        self.force_promote_c_max_threshold = float(
-            fp.get('force_promote_c_max_threshold', 0.40))
         self.fragment_physical_max_speed = float(
             fp.get('fragment_physical_max_speed', shape_defaults.get("fragment_max_speed", 0.35)))
         self.shape_matching_enabled = bool(
@@ -1274,12 +1222,11 @@ class ManifoldSimulator(
             float(self.fracture_field.c.max().item())
             if self.fracture_field.c is not None else 0.0
         )
-        # Use the same c_max threshold as force-promote so the halt
-        # detection + base damage clamp + force-promote all fire on the
-        # same condition.  At higher particle counts c_max plateaus
-        # below 1.0 (graph spreads thinner), so 0.999 is too strict.
-        c_max_threshold = float(getattr(
-            self, "force_promote_c_max_threshold", 0.40))
+        # AT2 halt threshold for the registry-stable base damage clamp.
+        # At higher particle counts c_max plateaus below 1.0 (graph
+        # spreads thinner), so 0.999 would be too strict; 0.40 covers
+        # the plateau range observed across 2K-150K runs.
+        c_max_threshold = 0.40
         if (self.fracture_field.c is not None
                 and c_max_now >= c_max_threshold
                 and self._physical_fragment_labels is not None
@@ -1843,9 +1790,19 @@ class ManifoldSimulator(
             self._init_voronoi_tessellation()
 
     def _init_voronoi_tessellation(self):
-        """Tessellate the body into Voronoi cells at the impact moment."""
+        """Tessellate the body into Voronoi cells at the impact moment.
+
+        Voronoi parameters are scaled by impact KE so a slow drop
+        produces partial fracture (few large chunks, base remnant) and
+        a fast drop produces full pulverization (many small chunks, no
+        base).  The scaling factor is
+        ``min(1.0, impact_speed / voronoi_impact_speed_ref)``, applied
+        to ``n_cells`` and ``impact_shock_radius``, and to
+        ``force_shrink_max_frac`` inversely (slow = larger residual
+        base = larger force_shrink_max_frac).
+        """
         from src.fracture.voronoi_decomposer import VoronoiDecomposer
-        n_cells = int(self.fracture_cfg.get('voronoi_n_cells', 200))
+        n_cells_full = int(self.fracture_cfg.get('voronoi_n_cells', 200))
         distribution = str(self.fracture_cfg.get(
             'voronoi_seed_distribution', 'impact_biased'))
         bond_thr = float(self.fracture_cfg.get(
@@ -1853,8 +1810,25 @@ class ManifoldSimulator(
         impact_center = getattr(self, '_impact_center', None)
         anisotropy_axis = getattr(self, '_voronoi_anisotropy_axis', None)
         seed = int(self.fracture_cfg.get('voronoi_seed', 1234))
-        force_shrink = float(self.fracture_cfg.get(
+        force_shrink_full = float(self.fracture_cfg.get(
             'voronoi_force_shrink_max_frac', 0.0))
+
+        # Impact-energy scaling: factor in [min_factor, 1.0].
+        ref_speed = float(self.fracture_cfg.get(
+            'voronoi_impact_speed_ref', 30.0))
+        min_factor = float(self.fracture_cfg.get(
+            'voronoi_impact_min_factor', 0.20))
+        impact_speed = float(getattr(self, '_soft_impact_speed', ref_speed))
+        ke_factor = max(min_factor, min(1.0, impact_speed / max(ref_speed, 1e-3)))
+        n_cells = max(8, int(n_cells_full * ke_factor))
+        # force_shrink scales INVERSELY: slow impact -> larger residual
+        # base remains.  full=0.05 (5% base cap) at hard impact; relaxed
+        # toward 0.5 (50% base allowed) at slow impact.
+        force_shrink = force_shrink_full + (1.0 - ke_factor) * 0.45
+        force_shrink = min(0.6, max(0.0, force_shrink))
+        print(f"  [Voronoi] impact_speed={impact_speed:.2f} ke_factor={ke_factor:.2f} "
+              f"n_cells={n_cells} (full={n_cells_full}) "
+              f"force_shrink={force_shrink:.2f} (full={force_shrink_full:.2f})")
         self.voronoi = VoronoiDecomposer(
             n_cells=n_cells,
             distribution=distribution,
@@ -2026,78 +2000,6 @@ class ManifoldSimulator(
             self.x_mpm[idx_a] = self.x_mpm[idx_a] + (-direction * offset_scale).unsqueeze(0)
             self.x_mpm[idx_b] = self.x_mpm[idx_b] + (direction * offset_scale).unsqueeze(0)
 
-    @torch.no_grad()
-    def _apply_voronoi_cell_release(self, cell_id, cell_mask):
-        """Apply NET kick to a cell when its bonds break.  Direction =
-        cell PCA-thin-axis projected away from impact center; magnitude
-        scales with impact speed so a slow drop produces a soft break,
-        a hard drop a violent shatter (matches physical intuition that
-        kinetic-energy release from a brittle body is proportional to
-        the impact KE).  Inherited body velocity is preserved so the
-        chunk continues its post-impact fall trajectory rather than
-        being teleported into a purely-lateral kick frame."""
-        v_com_gain = float(getattr(self, 'fragment_release_v_com_gain', 0.0))
-        if v_com_gain <= 0.0:
-            return
-        idx = torch.where(cell_mask)[0]
-        if idx.numel() < 4:
-            return
-        thin_axis = self.voronoi.cell_pca_thin_axis(cell_id, self.x_mpm)
-        if thin_axis is None:
-            return
-        # Sign: project away from impact center so kick is outward.
-        impact_center = getattr(self, '_impact_center', None)
-        if impact_center is not None:
-            ic = impact_center.to(thin_axis.device, thin_axis.dtype)
-            cell_com = self.x_mpm[idx].mean(dim=0)
-            outward = cell_com - ic
-            if float(torch.dot(thin_axis, outward).item()) < 0.0:
-                thin_axis = -thin_axis
-        # XY-only direction (lateral scatter); small upward boost.
-        kick_dir = thin_axis.clone()
-        kick_dir[2] = 0.0
-        kn = float(kick_dir.norm().item())
-        if kn < 1e-6:
-            return
-        kick_dir = kick_dir / kn
-        upward_frac = float(getattr(
-            self, 'fragment_release_upward_fraction', 0.10))
-        max_speed = max(float(getattr(
-            self, 'fragment_physical_max_speed', 30.0)), 0.05)
-
-        # Scale kick magnitude by the impact speed (free-fall velocity at
-        # ground contact).  v_com_gain is now interpreted as the kick
-        # magnitude PER UNIT IMPACT SPEED, with a minimum floor and the
-        # `fragment_physical_max_speed` cap.  Slow drop -> small kick;
-        # hard drop -> large kick.  This eliminates the "공중 터짐"
-        # artefact where a slowly-falling body still explodes at fixed
-        # high kick magnitude.
-        impact_speed = float(getattr(self, '_soft_impact_speed', 0.0))
-        impact_speed = max(impact_speed, 1e-3)
-        speed_scale_min = float(getattr(
-            self, 'fragment_release_impact_scale_min', 0.0))
-        speed_scale = max(speed_scale_min, impact_speed
-                          * float(getattr(
-                              self,
-                              'fragment_release_impact_scale_per_unit',
-                              0.05)))
-        v_target = min(v_com_gain * speed_scale, max_speed)
-        v_lateral = v_target
-        v_up = v_lateral * max(0.0, min(1.0, upward_frac))
-        v_kick = kick_dir * v_lateral
-        v_kick = v_kick.clone()
-        v_kick[2] = v_kick[2] + v_up
-        self.v_mpm[idx] = self.v_mpm[idx] + v_kick.unsqueeze(0)
-        # Position offset so the cell's particles separate from the
-        # still-cohesive base body in shared MPM grid cells.  Without
-        # this the heavy-base velocity field swallows the kick when the
-        # grid is gathered back and the chunk barely moves.
-        offset_scale = float(getattr(
-            self, 'fragment_release_position_offset', 0.0))
-        if offset_scale > 0.0:
-            kick_norm = float(v_kick.norm()) + 1e-6
-            offset_vec = v_kick / kick_norm * offset_scale
-            self.x_mpm[idx] = self.x_mpm[idx] + offset_vec.unsqueeze(0)
 
     # ================================================================
     # Seismic loading

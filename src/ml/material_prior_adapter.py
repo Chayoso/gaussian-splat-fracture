@@ -564,8 +564,6 @@ SENTENCE_STYLE_RULES = (
             # gain=0.001 puts the kick in the 0-2.4 m/s band consistent
             # with v_impact ~35 stored elastic energy converted at the
             # fracture surface.
-            "manifold.fragment_griffith_release_gain": 0.001,
-            "manifold.fragment_griffith_downward_bias": 0.3,
             # Per-fragment-at-graduation NET rigid-body release.  Griffith
             # gives stress-correct per-particle KE but sums to ~0 at the
             # COM (signed +/- per particle), so without a NET COM kick the
@@ -583,11 +581,18 @@ SENTENCE_STYLE_RULES = (
             # rubber inherit reduced scatter without retuning the style.
             # Lateral scatter — radial_shatter is the pre-pulverization
             # tier so spread is significant but less than full pulverize.
-            "manifold.fragment_release_v_com_gain": 5.0,
-            "manifold.fragment_release_tumble_gain": 1.4,
-            "manifold.fragment_release_upward_fraction": 0.30,
-            "manifold.fragment_extra_gravity_z": -600.0,
-            "manifold.fragment_physical_max_speed": 12.0,
+            "manifold.fragment_release_v_com_gain": 20.0,
+            "manifold.fragment_physical_max_speed": 50.0,
+            # Voronoi pre-fracture: partial pulverization for radial_shatter.
+            "manifold.voronoi_enable": True,
+            "manifold.voronoi_n_cells": 80,
+            "manifold.voronoi_seed_distribution": "impact_biased",
+            "manifold.voronoi_bond_break_threshold": 0.20,
+            "manifold.voronoi_bond_aging_per_frame": 0.005,
+            "manifold.voronoi_impact_shock_radius": 0.12,
+            "manifold.voronoi_cascade_radius": 1.0,
+            "manifold.voronoi_force_shrink_max_frac": 0.40,
+            "manifold.particle_speed_cap": 60.0,
             # Per-particle floor bounce override (recovers bounce that
             # the MPM "slip" BC would otherwise eat).  0.45 gives a
             # crisp half-velocity rebound for glass-tier shards.
@@ -677,8 +682,6 @@ SENTENCE_STYLE_RULES = (
             "manifold.shape_match_velocity_blend": 0.0,
             "manifold.unified_impact_impulse_scale": 0.05,
             "manifold.unified_impact_tumble_scale": 0.20,
-            "manifold.fragment_griffith_release_gain": 0.0020,
-            "manifold.fragment_griffith_downward_bias": 0.20,
             # Stronger NET COM release than radial_shatter -- complete
             # pulverization is the explosive end of the brittle spectrum,
             # so each shard carries away more of the released elastic
@@ -695,25 +698,24 @@ SENTENCE_STYLE_RULES = (
             # world over their flight, which reads as "흩날린다" rather
             # than "주저앉는다".  upward_fraction 0.25 = brief arc lift,
             # the dominant motion is horizontal.
-            "manifold.fragment_release_v_com_gain": 8.0,
-            "manifold.fragment_release_tumble_gain": 1.5,
-            "manifold.fragment_release_upward_fraction": 0.25,
-            "manifold.fragment_extra_gravity_z": 0.0,
-            "manifold.fragment_physical_max_speed": 18.0,
+            "manifold.fragment_release_v_com_gain": 35.0,
+            "manifold.fragment_physical_max_speed": 50.0,
             # Per-particle floor bounce override (recovers from slip BC).
-            # 0.85 = nearly elastic glass shard bounce.
-            "manifold.fragment_floor_restitution": 0.85,
-            # Force the cohesive base remnant to graduate into chunks
-            # after AT2 halts: complete pulverization should leave NO
-            # base remnant visible.  Each chunk gets a Griffith +
-            # unified release impulse on graduation, so the body fully
-            # decomposes into flying chunks rather than retaining a
-            # coherent base mesh shape.
-            "manifold.force_promote_base_after_halt": True,
-            "manifold.force_promote_grid_n": 4,
-            "manifold.force_promote_base_min_stable_frames": 3,
-            "manifold.post_impact_gravity_z": -3500.0,
-            "manifold.post_impact_damping": 0.95,
+            # 0.50 = moderate glass shard bounce.
+            "manifold.fragment_floor_restitution": 0.50,
+            # Voronoi pre-fracture: full pulverization, no base remnant.
+            "manifold.voronoi_enable": True,
+            "manifold.voronoi_n_cells": 250,
+            "manifold.voronoi_seed_distribution": "impact_biased",
+            "manifold.voronoi_bond_break_threshold": 0.15,
+            "manifold.voronoi_bond_aging_per_frame": 0.008,
+            "manifold.voronoi_impact_shock_radius": 0.15,
+            "manifold.voronoi_cascade_radius": 1.0,
+            "manifold.voronoi_force_shrink_max_frac": 0.05,
+            "manifold.fragment_release_position_offset": 0.05,
+            "manifold.particle_speed_cap": 80.0,
+            "manifold.post_impact_gravity_z": -4500.0,
+            "manifold.post_impact_damping": 0.999,
             "manifold.curvature_weight": 0.4,
             "manifold.fragment_boundary_cut_min_ratio": 0.45,
             "manifold.shard_enable": False,
@@ -1728,13 +1730,9 @@ class MaterialPriorAdapter:
         magnitude is an emergent material property" claim.
 
         Knobs scaled:
-          - fragment_release_v_com_gain (NET radial v_com kick)
-          - fragment_release_tumble_gain (NET tumble)
-          - fragment_griffith_release_gain (per-particle Griffith KE)
-          - fragment_extra_gravity_z (post-impact damping compensation;
-            scales with brittleness because tougher materials have
-            less explosive release energy to compensate for in the
-            first place)
+          - fragment_release_v_com_gain (Mode-I bond-opening kick magnitude)
+          - voronoi_impact_shock_radius (impact shock-front radius;
+            harder material = smaller shock zone)
 
         Knobs NOT scaled (their tuning is independent of brittleness):
           - fragment_physical_max_speed (an upper-bound clamp; bumped
@@ -1752,9 +1750,7 @@ class MaterialPriorAdapter:
         brittleness = max(0.0, min(brittleness, 1.5))
         scatter_keys = (
             "manifold.fragment_release_v_com_gain",
-            "manifold.fragment_release_tumble_gain",
-            "manifold.fragment_griffith_release_gain",
-            "manifold.fragment_extra_gravity_z",
+            "manifold.voronoi_impact_shock_radius",
         )
         for key in scatter_keys:
             if key in out:
