@@ -305,7 +305,13 @@ class FragmentPhysicsMixin:
         # settles (not in the middle of active propagation).
         cur_nonbase = int((persistent > 0).unique().numel())
         prev_nonbase = int(getattr(self, "_force_promote_prev_count", -1))
-        stable = (prev_nonbase >= 0 and abs(cur_nonbase - prev_nonbase) <= 1)
+        # Tolerance on registry-count change between frames before declaring
+        # "stable".  Default 1 was too strict under aggressive scatter
+        # (count jumps by 5-10/frame so diff<=1 never holds).
+        stab_tol = int(getattr(
+            self, "force_promote_stability_tolerance", 1))
+        stable = (prev_nonbase >= 0
+                  and abs(cur_nonbase - prev_nonbase) <= stab_tol)
         self._force_promote_prev_count = cur_nonbase
         if not stable:
             self._force_promote_stable_frames = 0
@@ -329,7 +335,24 @@ class FragmentPhysicsMixin:
                 or float(self.fracture_field.c.max().item()) < c_max_threshold):
             return persistent
 
-        base_mask = persistent == 0
+        # Identify the bulk to partition.  Originally only label==0, but
+        # under aggressive scatter natural graduations may absorb the
+        # whole body into one giant persistent label, leaving n_base==0
+        # yet body still cohesive.  Treat any label with count >=
+        # split_threshold_frac * total_particles as bulk too.
+        split_thresh_frac = float(getattr(
+            self, "force_promote_split_threshold_frac", 0.0))
+        n_total = int(persistent.shape[0])
+        bulk_label_mask = (persistent == 0)
+        if split_thresh_frac > 0.0:
+            split_thresh = int(max(2, split_thresh_frac * n_total))
+            labels, counts = persistent.unique(return_counts=True)
+            for lab, cnt in zip(labels.tolist(), counts.tolist()):
+                if lab == 0:
+                    continue
+                if int(cnt) >= split_thresh:
+                    bulk_label_mask = bulk_label_mask | (persistent == lab)
+        base_mask = bulk_label_mask
         n_base = int(base_mask.sum().item())
         if n_base == 0:
             return persistent
@@ -470,22 +493,64 @@ class FragmentPhysicsMixin:
         frag_x = self.x_mpm[idx]
         frag_com = frag_x.mean(dim=0)
 
-        # Base reference for the radial outward direction.  Exclude the
-        # fragment we are graduating (still labeled 0 in the not-yet-
-        # committed registry) so it doesn't pull the base COM toward
-        # itself.  Fall back to impact center, then to global COM.
+        # Kick reference point.  Default = base body COM (radial-from-COM
+        # produces a circular shockwave-style pattern: every chunk
+        # leaves the body radially outward, which reads as "explosion"
+        # not "fracture").  Setting `kick_source = "impact_center"`
+        # roots the kick at the floor-contact point instead, so chunks
+        # near the impact are blown outward strongly while chunks above
+        # the impact get weaker, mostly-tangential pushes -- matching
+        # how a real falling glass shatters from the bottom up.
+        kick_source = str(getattr(
+            self, "fragment_release_kick_source", "base_com"))
         base_com: Optional[Tensor] = None
-        labels = self._physical_fragment_labels
-        if labels is not None and labels.shape[0] == self.x_mpm.shape[0]:
-            base_mask = (labels == 0) & (~mask)
-            if bool(base_mask.any()):
-                base_com = self.x_mpm[base_mask].mean(dim=0)
-        if base_com is None and hasattr(self, "_impact_center"):
-            base_com = self._impact_center.to(frag_com.device, frag_com.dtype)
+        if kick_source == "impact_center" and hasattr(self, "_impact_center"):
+            ic = self._impact_center
+            if ic is not None:
+                base_com = ic.to(frag_com.device, frag_com.dtype)
         if base_com is None:
-            base_com = self.x_mpm.mean(dim=0)
+            labels = self._physical_fragment_labels
+            if labels is not None and labels.shape[0] == self.x_mpm.shape[0]:
+                base_mask = (labels == 0) & (~mask)
+                if bool(base_mask.any()):
+                    base_com = self.x_mpm[base_mask].mean(dim=0)
+            if base_com is None and hasattr(self, "_impact_center"):
+                ic = getattr(self, "_impact_center", None)
+                if ic is not None:
+                    base_com = ic.to(frag_com.device, frag_com.dtype)
+            if base_com is None:
+                base_com = self.x_mpm.mean(dim=0)
 
         radial = frag_com - base_com
+
+        # Natural-fracture kick direction blend.  Pure radial-from-COM
+        # produces a perfect-circle "explosion" pattern (every chunk
+        # leaves the body radially outward at the same speed).  Real
+        # brittle fracture is irregular: chunks push off along the
+        # local crack-surface normal, which for a force-promoted spatial
+        # chunk approximates to its own PCA *thin* direction (smallest
+        # principal axis).  Blend the two so we keep some outward bias
+        # but break the circular uniformity.
+        natural_blend = float(getattr(
+            self, "fragment_release_natural_blend", 0.0))
+        natural_dir_xy: Optional[Tensor] = None
+        if natural_blend > 0.0 and idx.numel() >= 6:
+            try:
+                centered = frag_x - frag_com.unsqueeze(0)
+                cov = centered.t() @ centered / max(idx.numel(), 1)
+                eigvals, eigvecs = torch.linalg.eigh(cov)
+                # eigvals ascending; smallest = thin direction = surface normal
+                thin = eigvecs[:, 0]
+                # Sign: align with radial (so it points outward, not inward)
+                if float(torch.dot(thin, radial).item()) < 0.0:
+                    thin = -thin
+                tnt_xy = thin.clone()
+                tnt_xy[2] = 0.0
+                tnt_norm = float(tnt_xy.norm().item())
+                if tnt_norm > 1e-6:
+                    natural_dir_xy = tnt_xy / tnt_norm
+            except RuntimeError:
+                natural_dir_xy = None
 
         # XY-only radial direction so fragments scatter LATERALLY rather
         # than all flying straight up: in a centered drop the
@@ -516,6 +581,45 @@ class FragmentPhysicsMixin:
             )
             radial_xy_norm = 1.0
         radial_xy_unit = radial_xy / radial_xy_norm
+        # Per-chunk angular jitter + magnitude variance to break the
+        # perfect-circle "explosion ring" pattern.  Same chunk's seed
+        # produces same direction across runs (so reproducibility holds).
+        chunk_jitter = float(getattr(
+            self, "fragment_release_chunk_jitter", 0.0))
+        chunk_speed_variance = float(getattr(
+            self, "fragment_release_chunk_speed_variance", 0.0))
+        speed_scale = 1.0
+        if chunk_jitter > 0.0 or chunk_speed_variance > 0.0:
+            import math
+            seed = int(self._next_physical_fragment_id) * 17389 + 23
+            gen = torch.Generator(device="cpu")
+            gen.manual_seed(seed)
+            if chunk_jitter > 0.0:
+                d_theta = (float(torch.rand(1, generator=gen).item())
+                           - 0.5) * 2.0 * chunk_jitter * math.pi
+                cos_t, sin_t = math.cos(d_theta), math.sin(d_theta)
+                rotated = torch.tensor([
+                    cos_t * float(radial_xy_unit[0])
+                    - sin_t * float(radial_xy_unit[1]),
+                    sin_t * float(radial_xy_unit[0])
+                    + cos_t * float(radial_xy_unit[1]),
+                    0.0,
+                ], device=radial.device, dtype=radial.dtype)
+                radial_xy_unit = rotated
+            if chunk_speed_variance > 0.0:
+                # Multiplicative speed factor in [1-v, 1+v].
+                speed_scale = 1.0 + (
+                    (float(torch.rand(1, generator=gen).item()) - 0.5)
+                    * 2.0 * chunk_speed_variance
+                )
+        # Blend in the per-chunk natural-fracture direction (PCA thin
+        # axis) so we don't get a perfect-circle explosion pattern.
+        if natural_dir_xy is not None and natural_blend > 0.0:
+            blended = ((1.0 - natural_blend) * radial_xy_unit
+                       + natural_blend * natural_dir_xy)
+            blended_norm = float(blended.norm().item())
+            if blended_norm > 1e-6:
+                radial_xy_unit = blended / blended_norm
         radial_unit = radial_xy_unit  # used downstream for tumble axis
 
         max_speed = max(float(getattr(self, "fragment_physical_max_speed", 2.0)),
@@ -525,8 +629,23 @@ class FragmentPhysicsMixin:
         # is clamped to max_speed.
         upward_frac = float(getattr(self, "fragment_release_upward_fraction", 0.30))
         upward_frac = max(0.0, min(upward_frac, 1.0))
-        v_com_lateral = v_com_gain
-        v_com_up = v_com_gain * upward_frac
+        # Distance falloff: scale kick magnitude by `(d0 / (d0 + dist))`
+        # where d0 is a characteristic body half-extent.  Far-from-source
+        # chunks get less kick (they're "less affected by the impact").
+        dist_falloff = float(getattr(
+            self, "fragment_release_distance_falloff", 0.0))
+        falloff_scale = 1.0
+        if dist_falloff > 0.0:
+            d_to_source = float((frag_com - base_com).norm().item())
+            body_extent = float(
+                (self.x_mpm.max(dim=0).values
+                 - self.x_mpm.min(dim=0).values).max().item()
+            )
+            d0 = max(0.5 * body_extent, 1e-3)
+            raw = d0 / (d0 + d_to_source)
+            falloff_scale = 1.0 - dist_falloff + dist_falloff * raw
+        v_com_lateral = v_com_gain * speed_scale * falloff_scale
+        v_com_up = v_com_gain * upward_frac * speed_scale * falloff_scale
         kick_mag = float((v_com_lateral * v_com_lateral
                           + v_com_up * v_com_up) ** 0.5)
         if kick_mag > max_speed:
@@ -538,6 +657,20 @@ class FragmentPhysicsMixin:
             v_com_kick = v_com_kick.clone()
             v_com_kick[2] = v_com_kick[2] + v_com_up
             self.v_mpm[idx] = self.v_mpm[idx] + v_com_kick.unsqueeze(0)
+            # Position offset along kick direction so the fragment is
+            # physically separated from the still-cohesive base body.
+            # In global single-grid MPM, fragment + base share grid cells
+            # immediately after graduation, so the heavy-base velocity
+            # field swallows the fragment kick when the grid is gathered
+            # back -- kick decays from 25 m/s to <1 m/s in one frame.
+            # An offset of ~grid-spacing puts fragment particles in
+            # distinct cells, breaking that velocity-coupling.
+            offset_scale = float(getattr(
+                self, "fragment_release_position_offset", 0.0))
+            if offset_scale > 0.0:
+                kick_norm = float(v_com_kick.norm()) + 1e-6
+                offset_vec = v_com_kick / kick_norm * offset_scale
+                self.x_mpm[idx] = self.x_mpm[idx] + offset_vec.unsqueeze(0)
         v_com_mag = float((v_com_lateral * v_com_lateral
                            + v_com_up * v_com_up) ** 0.5)
 

@@ -1,0 +1,20 @@
+{
+  "manifold.fragment_release_v_com_gain": 25.0,
+  "manifold.fragment_release_tumble_gain": 4.0,
+  "manifold.fragment_release_upward_fraction": 0.10,
+  "manifold.fragment_physical_max_speed": 60.0,
+  "manifold.fragment_floor_restitution": 0.85,
+  "manifold.force_promote_grid_n": 10,
+  "manifold.post_impact_damping": 0.9998,
+  "manifold.fragment_physical_min_size": 3,
+  "manifold.fragment_release_position_offset": 0.110,
+  "manifold.force_promote_stability_tolerance": 999,
+  "manifold.force_promote_base_min_stable_frames": 1,
+  "manifold.force_promote_split_threshold_frac": 0.10,
+  "manifold.fragment_physical_overlap_threshold": 0.05,
+  "manifold.fragment_release_natural_blend": 0.65,
+  "manifold.fragment_release_chunk_jitter": 0.10,
+  "manifold.fragment_release_chunk_speed_variance": 0.80,
+  "manifold.fragment_release_kick_source": "base_com",
+  "manifold.fragment_release_distance_falloff": 0.40
+}

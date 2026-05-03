@@ -427,6 +427,51 @@ class ManifoldSimulator(
         # upward fraction controls arc height.
         self.fragment_release_upward_fraction = max(0.0, min(1.0, float(
             fp.get('fragment_release_upward_fraction', 0.30))))
+        # Position offset (MPM-space units) applied along the kick
+        # direction at fragment graduation, decoupling the chunk from
+        # the still-cohesive base body in shared MPM grid cells.
+        self.fragment_release_position_offset = max(0.0, float(
+            fp.get('fragment_release_position_offset', 0.0)))
+        # Tolerance on per-frame registry-count change before declaring
+        # stable for force-promote gate.
+        self.force_promote_stability_tolerance = max(0, int(
+            fp.get('force_promote_stability_tolerance', 1)))
+        # Persistent labels owning >= this fraction of total particles
+        # are added to the force-promote bulk for partitioning alongside
+        # label==0.  Disabled (0.0) by default.  Set 0.05-0.15 to break
+        # the "whole-body single-label" failure mode that absorbs the
+        # body into one cohesive label under aggressive scatter.
+        self.force_promote_split_threshold_frac = max(0.0, min(1.0, float(
+            fp.get('force_promote_split_threshold_frac', 0.0))))
+        # Blend [0..1] between radial-from-body-com kick (0.0 = pure
+        # circle explosion) and per-chunk PCA-thin-axis kick (1.0 =
+        # pure local-fracture-normal, irregular).  ~0.4-0.6 produces
+        # naturally-scattered chunks at varied radii instead of a
+        # uniform shockwave ring.
+        self.fragment_release_natural_blend = max(0.0, min(1.0, float(
+            fp.get('fragment_release_natural_blend', 0.0))))
+        # Per-chunk angular jitter on the kick direction.  0.0 = pure
+        # radial; 0.25 = +/- 45 deg deviation per chunk.  Breaks the
+        # uniform "circular shockwave" pattern when set ~0.15-0.30.
+        self.fragment_release_chunk_jitter = max(0.0, min(0.5, float(
+            fp.get('fragment_release_chunk_jitter', 0.0))))
+        # Per-chunk multiplicative speed variance on the kick magnitude.
+        # 0.0 = uniform; 0.5 = chunk speed in [0.5x, 1.5x] of base.
+        # Produces near vs far chunks (high radial_cv) instead of all
+        # chunks at the same radius (perfect ring).
+        self.fragment_release_chunk_speed_variance = max(0.0, min(0.9, float(
+            fp.get('fragment_release_chunk_speed_variance', 0.0))))
+        # Kick source: 'base_com' (default) or 'impact_center'.  Latter
+        # roots the radial-outward kick at the floor-contact point so
+        # impact-zone chunks fly hardest while top chunks get weaker
+        # tangential pushes -- realistic bottom-up shatter pattern.
+        self.fragment_release_kick_source = str(
+            fp.get('fragment_release_kick_source', 'base_com'))
+        # Scale kick magnitude by inverse distance to kick source: fragments
+        # near the source get full kick, fragments far away get reduced.
+        # 0.0 = uniform, 1.0 = strong inverse falloff.
+        self.fragment_release_distance_falloff = max(0.0, min(1.0, float(
+            fp.get('fragment_release_distance_falloff', 0.0))))
         # Extra per-substep downward acceleration on fragment-labeled
         # particles only; additive on top of the global post-impact
         # gravity (`post_impact_gravity_z`).  Compensates for the fact
