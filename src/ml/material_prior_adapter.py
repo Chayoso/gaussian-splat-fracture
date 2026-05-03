@@ -714,6 +714,13 @@ SENTENCE_STYLE_RULES = (
             "manifold.voronoi_force_shrink_max_frac": 0.05,
             "manifold.fragment_release_position_offset": 0.05,
             "manifold.particle_speed_cap": 80.0,
+            # Aggressive angular damping for residual base + fragments.
+            # static_omega=25 puts kinetic damping (0.985) only above
+            # 25 rad/s; everything else gets strong static damping
+            # (0.5/frame), killing residual-base spin from impact tumble
+            # within ~5-10 frames so the central fragment doesn't keep
+            # spinning indefinitely.
+            "manifold.shape_match_static_omega": 25.0,
             "manifold.post_impact_gravity_z": -4500.0,
             "manifold.post_impact_damping": 0.999,
             "manifold.curvature_weight": 0.4,
