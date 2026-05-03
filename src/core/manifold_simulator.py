@@ -15,6 +15,7 @@ Key difference from HybridCrackSimulator:
     - Crack normals and opening are first-class state
 """
 
+import numpy as np
 import torch
 from torch import Tensor
 from typing import Dict, Optional
@@ -427,6 +428,31 @@ class ManifoldSimulator(
         # upward fraction controls arc height.
         self.fragment_release_upward_fraction = max(0.0, min(1.0, float(
             fp.get('fragment_release_upward_fraction', 0.30))))
+        # Position offset (MPM-space) along kick direction at fragment
+        # graduation; decouples chunk from cohesive base body in the
+        # shared MPM grid so the kick survives grid gather/scatter.
+        self.fragment_release_position_offset = max(0.0, float(
+            fp.get('fragment_release_position_offset', 0.0)))
+        # Velocity-clamp scale: 1.0 = standard CFL-safe cap; >1.0 lets
+        # fragments fall faster than the dx/dt limit (use with caution
+        # under aggressive gravity, may cause numerical jitter).
+        self.velocity_cap_scale = max(0.1, float(
+            fp.get('velocity_cap_scale', 1.0)))
+        # Per-particle speed magnitude cap (m/s).  Default 10 was too
+        # conservative for brittle pulverization under strong gravity
+        # (-4500+); fragments stall at 10 m/s instead of falling
+        # freely.  Increase to 60-100 for fast brittle fall.
+        self.particle_speed_cap = max(1.0, float(
+            fp.get('particle_speed_cap', 10.0)))
+        # Per-unit-impact-speed kick scaling.  Effective kick =
+        # `v_com_gain * max(impact_scale_min, impact_scale_per_unit *
+        # impact_speed)`, capped at `fragment_physical_max_speed`.
+        # Default 0.05 + 0.0 floor: at impact_speed=20, kick = 1.0
+        # of the v_com_gain; at impact_speed=5, kick = 0.25.
+        self.fragment_release_impact_scale_per_unit = max(0.0, float(
+            fp.get('fragment_release_impact_scale_per_unit', 0.05)))
+        self.fragment_release_impact_scale_min = max(0.0, float(
+            fp.get('fragment_release_impact_scale_min', 0.0)))
         # Extra per-substep downward acceleration on fragment-labeled
         # particles only; additive on top of the global post-impact
         # gravity (`post_impact_gravity_z`).  Compensates for the fact
@@ -530,6 +556,12 @@ class ManifoldSimulator(
 
         # Render-only shards are disabled in the fragment-separation phase.
         self.splitting_enabled = False
+
+        # --- Voronoi pre-fracture (lazy-init at impact) ---
+        self.voronoi = None
+        self._voronoi_cell_graduated = []
+        self._voronoi_prev_components = None
+        self._voronoi_anisotropy_axis = None
 
         # --- MPM state ---
         self.x_mpm = None
@@ -758,6 +790,10 @@ class ManifoldSimulator(
         finally:
             self._fracture_burst_active = False
 
+        # --- Voronoi pre-fracture update (if enabled) ---
+        if (getattr(self, 'voronoi', None) is not None
+                and self._gravity_drop_contacted):
+            self._step_voronoi_fracture()
         # --- Fragment detection ---
         if (not fragment_detected_in_burst
                 and self.fragment_manager is not None
@@ -850,10 +886,16 @@ class ManifoldSimulator(
         self._apply_shape_matching(dt)
         self._apply_soft_elastic_squash(dt)
 
-        # Velocity & F clamping
-        v_limit = 0.4 * self.mpm.dx / dt
+        # Velocity & F clamping.  Standard MPM safety cap = 0.4 * dx/dt
+        # (CFL-safe).  Override with `velocity_cap_scale` to relax it
+        # when fragments need to fall under strong gravity faster than
+        # the default cap (e.g. brittle pulverization).
+        velocity_cap_scale = float(getattr(
+            self, "velocity_cap_scale", 1.0))
+        v_limit = velocity_cap_scale * 0.4 * self.mpm.dx / dt
         if self._gravity_drop and self._gravity_drop_contacted:
-            v_limit = min(v_limit, 80.0)
+            # Allow up to 8x the post-impact cap (was 80 m/s hard cap).
+            v_limit = min(v_limit, 8.0 * 80.0 * velocity_cap_scale)
         self.v_mpm = self.v_mpm.clamp(-v_limit, v_limit)
         self.F = self.F.clamp(-1.5 if self._gravity_drop_contacted else -2.0,
                                1.5 if self._gravity_drop_contacted else 2.0)
@@ -864,11 +906,14 @@ class ManifoldSimulator(
         c_wave = (s_max / density_eff) ** 0.5
         self._last_cfl = c_wave * dt / self.mpm.dx if c_wave > 0 else 0
 
-        # Speed limit
+        # Speed limit (per-particle magnitude cap).  Default 10 m/s
+        # is conservative for soft elastic body; brittle pulverization
+        # under strong gravity needs higher to avoid stalled fragments.
+        speed_cap = float(getattr(self, "particle_speed_cap", 10.0))
         v_mag = self.v_mpm.norm(dim=1)
-        too_fast = v_mag > 10.0
+        too_fast = v_mag > speed_cap
         if too_fast.any():
-            scale = 10.0 / v_mag[too_fast].clamp(min=1e-8)
+            scale = speed_cap / v_mag[too_fast].clamp(min=1e-8)
             self.v_mpm[too_fast] *= scale.unsqueeze(-1)
 
         step = self._physics_step
@@ -1787,6 +1832,272 @@ class ManifoldSimulator(
         default_damping = 0.995 if self.material_family == "diffuse_damage" else 0.975
         self.mpm.damping = float(self.fracture_cfg.get('post_impact_damping', default_damping))
         print(f"  [POST-IMPACT] gravity→[0,0,{g_vec[2].item():.0f}] damping→{self.mpm.damping:.3f}")
+
+        # Voronoi pre-fracture tessellation: at impact, partition the
+        # body into N seed-conditioned cells.  AT2 damage propagates
+        # through the cell-bond network; cells whose bonds break end up
+        # as fragments (PCA-thin-axis kick + inherited body velocity).
+        # Replaces the spatial-grid force-promote partition with a
+        # geometry-aware decomposition.
+        if bool(self.fracture_cfg.get('voronoi_enable', False)):
+            self._init_voronoi_tessellation()
+
+    def _init_voronoi_tessellation(self):
+        """Tessellate the body into Voronoi cells at the impact moment."""
+        from src.fracture.voronoi_decomposer import VoronoiDecomposer
+        n_cells = int(self.fracture_cfg.get('voronoi_n_cells', 200))
+        distribution = str(self.fracture_cfg.get(
+            'voronoi_seed_distribution', 'impact_biased'))
+        bond_thr = float(self.fracture_cfg.get(
+            'voronoi_bond_break_threshold', 0.40))
+        impact_center = getattr(self, '_impact_center', None)
+        anisotropy_axis = getattr(self, '_voronoi_anisotropy_axis', None)
+        seed = int(self.fracture_cfg.get('voronoi_seed', 1234))
+        force_shrink = float(self.fracture_cfg.get(
+            'voronoi_force_shrink_max_frac', 0.0))
+        self.voronoi = VoronoiDecomposer(
+            n_cells=n_cells,
+            distribution=distribution,
+            bond_break_threshold=bond_thr,
+            impact_center=impact_center,
+            anisotropy_axis=anisotropy_axis,
+            seed=seed,
+            force_shrink_max_frac=force_shrink,
+        )
+        self.voronoi.tessellate(self.x_mpm)
+        # Track per-cell graduation state so we apply the unified release
+        # impulse exactly once per cell (when its connected component
+        # first detaches from the largest base component).
+        self._voronoi_cell_graduated = [False] * self.voronoi.n_cells
+        # Map cell -> component last frame; when component changes for a
+        # cell it has graduated.  Initialize all to None.
+        self._voronoi_prev_components = None
+        print(f"  [Voronoi] Tessellated into {self.voronoi.n_cells} cells "
+              f"(distribution={distribution}, n_bonds={len(self.voronoi.cell_adjacency)})")
+
+    @torch.no_grad()
+    def _step_voronoi_fracture(self):
+        """Per-frame Voronoi update: damage -> bond breakage -> components.
+
+        Flow:
+          1. Get per-MPM-particle damage via `_get_volumetric_damage`.
+          2. Update bond breakage on the Voronoi cell-bond network.
+          3. Compute connected components.  A cell whose component
+             flipped from "base" (largest) to "isolated" since last
+             frame is "newly graduated" -> apply unified release.
+          4. Write component ids back to `_physical_fragment_labels`
+             so downstream code (rendering, fragment_manager) sees the
+             same labels.
+        """
+        if self.voronoi is None or self.x_mpm is None:
+            return
+        damage = self._get_volumetric_damage()
+        if damage.numel() != self.x_mpm.shape[0]:
+            return
+        bond_aging = float(self.fracture_cfg.get(
+            'voronoi_bond_aging_per_frame', 0.0))
+        impact_radius = float(self.fracture_cfg.get(
+            'voronoi_impact_shock_radius', 0.0))
+        cascade_radius = float(self.fracture_cfg.get(
+            'voronoi_cascade_radius', 0.0))
+        newly_broken = self.voronoi.update_bond_breakage(
+            damage,
+            bond_aging=bond_aging,
+            impact_center=getattr(self, '_impact_center', None),
+            impact_radius=impact_radius,
+            cascade_radius=cascade_radius,
+        )
+        # Mode-I bond opening: each newly-broken bond gives a pair of
+        # equal-and-opposite kicks to its two cells along the bond
+        # direction (Newton 3rd / opening crack physics).  This
+        # replaces the older per-cell radial-from-impact kick which
+        # produced uniform circular explosion patterns.
+        for (a, b, stress) in newly_broken:
+            self._apply_bond_opening_kick(a, b, stress)
+        comp_per_cell = self.voronoi.connected_components()  # cell -> comp id
+        per_particle = self.voronoi.particle_fragment_ids()  # base=0, frag=1..K
+        # Detect newly-graduated cells: any cell whose component is now
+        # non-base AND was base last frame (or first frame).
+        # Mode-I bond opening kicks already applied above (paired,
+        # Newton-3rd, along bond normal); the legacy per-cell radial
+        # graduation kick is intentionally not invoked anymore -- it
+        # produced the uniform "circular shockwave" pattern that read
+        # as explosion rather than fracture.  We still track which
+        # cells have graduated for telemetry.
+        prev = self._voronoi_prev_components
+        n_grad = 0
+        for cell_id in range(self.voronoi.n_cells):
+            cur_comp = int(comp_per_cell[cell_id]) if cell_id < len(comp_per_cell) else -1
+            prev_comp = int(prev[cell_id]) if (
+                prev is not None and cell_id < len(prev)) else -1
+            if cur_comp != prev_comp and not self._voronoi_cell_graduated[cell_id]:
+                self._voronoi_cell_graduated[cell_id] = True
+                n_grad += 1
+        self._voronoi_prev_components = comp_per_cell.tolist()
+
+        # Write component-based fragment ids into the persistent registry.
+        # This replaces graph-segmentation labels for downstream code.
+        labels = torch.from_numpy(per_particle).to(
+            self.x_mpm.device, dtype=torch.long)
+        if labels.shape[0] == self.x_mpm.shape[0]:
+            self._physical_fragment_labels = labels
+            self._next_physical_fragment_id = int(labels.max().item()) + 1
+
+        if n_grad > 0:
+            n_components = int(per_particle.max() + 1) if per_particle.size else 1
+            print(f"  [Voronoi] {n_grad} cells graduated this frame "
+                  f"(components={n_components})")
+
+    @torch.no_grad()
+    def _apply_bond_opening_kick(self, cell_a: int, cell_b: int, stress: float):
+        """Mode-I crack opening: when a bond between cells a and b breaks,
+        apply a pair of equal-and-opposite kicks along the bond direction
+        ``(b - a)`` to the particles in each cell.  Magnitude scales with
+        the bond's released strain energy ~sqrt(stress), bounded by
+        ``fragment_physical_max_speed``.
+
+        Physics intuition (Griffith mode-I):
+          - At a brittle bond rupture, the elastic strain energy stored
+            in the bond is released as kinetic energy of the two
+            adjacent surfaces moving APART along the bond normal.
+          - Energy partition: half goes to side A, half to side B
+            (Newton's 3rd / equal mass approximation).
+          - v_open = sqrt(2 * energy_per_unit_mass) ~ sqrt(stress / rho)
+          - Direction = unit vector from cell_a to cell_b (opening
+            normal at the bond's plane).
+
+        This produces *anisotropic* per-cell motion (each cell's kick
+        depends on which bonds broke around it, not its position
+        relative to the body COM), which is the natural-fracture
+        signature -- fragments push off where they were CONNECTED, not
+        away from a common origin.
+        """
+        if self.voronoi is None or self.voronoi.cell_centers is None:
+            return
+        gain = float(getattr(self, "fragment_release_v_com_gain", 0.0))
+        if gain <= 0.0:
+            return
+        max_speed = max(float(getattr(
+            self, "fragment_physical_max_speed", 30.0)), 0.05)
+
+        ca_np = self.voronoi.cell_centers[cell_a]
+        cb_np = self.voronoi.cell_centers[cell_b]
+        direction_np = cb_np - ca_np
+        n = float(np.linalg.norm(direction_np))
+        if n < 1e-6:
+            return
+        direction_np = direction_np / n
+        direction = torch.from_numpy(direction_np).to(
+            self.x_mpm.device, self.x_mpm.dtype)
+
+        # Magnitude: sqrt(stress) gives the right energy scaling.  When
+        # the break is force-shrink/cascade-driven (stress=0), we still
+        # want a tiny opening kick so the bond geometrically separates,
+        # so we floor at `min_open_kick`.
+        min_open_kick = float(getattr(
+            self, "fragment_release_min_open_kick", 0.5))
+        v_open = max(min_open_kick, gain * (float(stress) ** 0.5))
+        v_open = min(v_open, max_speed)
+
+        idx_a = torch.where(
+            torch.from_numpy(self.voronoi.cell_assignment == cell_a)
+            .to(self.x_mpm.device)
+        )[0]
+        idx_b = torch.where(
+            torch.from_numpy(self.voronoi.cell_assignment == cell_b)
+            .to(self.x_mpm.device)
+        )[0]
+        if idx_a.numel() == 0 or idx_b.numel() == 0:
+            return
+
+        # Newton 3rd: equal-and-opposite along the bond normal.
+        kick_b = direction * v_open
+        kick_a = -direction * v_open
+        self.v_mpm[idx_a] = self.v_mpm[idx_a] + kick_a.unsqueeze(0)
+        self.v_mpm[idx_b] = self.v_mpm[idx_b] + kick_b.unsqueeze(0)
+
+        # Position offset along the bond direction so the cells are
+        # geometrically separated in the shared MPM grid.  Without
+        # this the heavy-base velocity field swallows the kicks via
+        # grid coupling within one P2G2P step.
+        offset_scale = float(getattr(
+            self, "fragment_release_position_offset", 0.0))
+        if offset_scale > 0.0:
+            self.x_mpm[idx_a] = self.x_mpm[idx_a] + (-direction * offset_scale).unsqueeze(0)
+            self.x_mpm[idx_b] = self.x_mpm[idx_b] + (direction * offset_scale).unsqueeze(0)
+
+    @torch.no_grad()
+    def _apply_voronoi_cell_release(self, cell_id, cell_mask):
+        """Apply NET kick to a cell when its bonds break.  Direction =
+        cell PCA-thin-axis projected away from impact center; magnitude
+        scales with impact speed so a slow drop produces a soft break,
+        a hard drop a violent shatter (matches physical intuition that
+        kinetic-energy release from a brittle body is proportional to
+        the impact KE).  Inherited body velocity is preserved so the
+        chunk continues its post-impact fall trajectory rather than
+        being teleported into a purely-lateral kick frame."""
+        v_com_gain = float(getattr(self, 'fragment_release_v_com_gain', 0.0))
+        if v_com_gain <= 0.0:
+            return
+        idx = torch.where(cell_mask)[0]
+        if idx.numel() < 4:
+            return
+        thin_axis = self.voronoi.cell_pca_thin_axis(cell_id, self.x_mpm)
+        if thin_axis is None:
+            return
+        # Sign: project away from impact center so kick is outward.
+        impact_center = getattr(self, '_impact_center', None)
+        if impact_center is not None:
+            ic = impact_center.to(thin_axis.device, thin_axis.dtype)
+            cell_com = self.x_mpm[idx].mean(dim=0)
+            outward = cell_com - ic
+            if float(torch.dot(thin_axis, outward).item()) < 0.0:
+                thin_axis = -thin_axis
+        # XY-only direction (lateral scatter); small upward boost.
+        kick_dir = thin_axis.clone()
+        kick_dir[2] = 0.0
+        kn = float(kick_dir.norm().item())
+        if kn < 1e-6:
+            return
+        kick_dir = kick_dir / kn
+        upward_frac = float(getattr(
+            self, 'fragment_release_upward_fraction', 0.10))
+        max_speed = max(float(getattr(
+            self, 'fragment_physical_max_speed', 30.0)), 0.05)
+
+        # Scale kick magnitude by the impact speed (free-fall velocity at
+        # ground contact).  v_com_gain is now interpreted as the kick
+        # magnitude PER UNIT IMPACT SPEED, with a minimum floor and the
+        # `fragment_physical_max_speed` cap.  Slow drop -> small kick;
+        # hard drop -> large kick.  This eliminates the "공중 터짐"
+        # artefact where a slowly-falling body still explodes at fixed
+        # high kick magnitude.
+        impact_speed = float(getattr(self, '_soft_impact_speed', 0.0))
+        impact_speed = max(impact_speed, 1e-3)
+        speed_scale_min = float(getattr(
+            self, 'fragment_release_impact_scale_min', 0.0))
+        speed_scale = max(speed_scale_min, impact_speed
+                          * float(getattr(
+                              self,
+                              'fragment_release_impact_scale_per_unit',
+                              0.05)))
+        v_target = min(v_com_gain * speed_scale, max_speed)
+        v_lateral = v_target
+        v_up = v_lateral * max(0.0, min(1.0, upward_frac))
+        v_kick = kick_dir * v_lateral
+        v_kick = v_kick.clone()
+        v_kick[2] = v_kick[2] + v_up
+        self.v_mpm[idx] = self.v_mpm[idx] + v_kick.unsqueeze(0)
+        # Position offset so the cell's particles separate from the
+        # still-cohesive base body in shared MPM grid cells.  Without
+        # this the heavy-base velocity field swallows the kick when the
+        # grid is gathered back and the chunk barely moves.
+        offset_scale = float(getattr(
+            self, 'fragment_release_position_offset', 0.0))
+        if offset_scale > 0.0:
+            kick_norm = float(v_kick.norm()) + 1e-6
+            offset_vec = v_kick / kick_norm * offset_scale
+            self.x_mpm[idx] = self.x_mpm[idx] + offset_vec.unsqueeze(0)
 
     # ================================================================
     # Seismic loading

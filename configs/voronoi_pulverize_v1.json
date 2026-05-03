@@ -1,0 +1,21 @@
+{
+  "manifold.voronoi_enable": true,
+  "manifold.voronoi_n_cells": 250,
+  "manifold.voronoi_seed_distribution": "impact_biased",
+  "manifold.voronoi_bond_break_threshold": 0.15,
+  "manifold.voronoi_bond_aging_per_frame": 0.008,
+  "manifold.voronoi_impact_shock_radius": 0.15,
+  "manifold.voronoi_cascade_radius": 1.0,
+  "manifold.voronoi_force_shrink_max_frac": 0.05,
+  "manifold.fragment_release_v_com_gain": 35.0,
+  "manifold.fragment_release_min_open_kick": 0.5,
+  "manifold.fragment_physical_max_speed": 50.0,
+  "manifold.fragment_floor_restitution": 0.40,
+  "manifold.post_impact_damping": 0.999,
+  "manifold.post_impact_gravity_z": -4500.0,
+  "manifold.fragment_physical_min_size": 3,
+  "manifold.fragment_release_position_offset": 0.05,
+  "manifold.shape_match_fragment_strength": 0.97,
+  "manifold.velocity_cap_scale": 4.0,
+  "manifold.particle_speed_cap": 80.0
+}

@@ -22,7 +22,20 @@ class FragmentPhysicsMixin:
         self._next_physical_fragment_id = 1
 
     def _update_physical_fragment_registry(self, raw_particle_labels: Tensor) -> Tensor:
-        """Persist released particle chunks even if graph labels later merge back."""
+        """Persist released particle chunks even if graph labels later merge back.
+
+        Bypassed when Voronoi pre-fracture is active: in that case the
+        official fragment labels come from the cell-bond connected
+        components, written directly to ``self._physical_fragment_labels``
+        by ``_step_voronoi_fracture``.  Returning that tensor here keeps
+        the simulator's per-fragment shape-match / kinetic-drift
+        bookkeeping consistent with Voronoi's view of the world.
+        """
+        if getattr(self, "voronoi", None) is not None:
+            self._ensure_physical_fragment_registry(
+                raw_particle_labels.shape[0], raw_particle_labels.device
+            )
+            return self._physical_fragment_labels.clone()
         self._ensure_physical_fragment_registry(raw_particle_labels.shape[0], raw_particle_labels.device)
         persistent = self._physical_fragment_labels.clone()
         active_raw = raw_particle_labels.unique(sorted=True)
