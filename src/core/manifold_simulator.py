@@ -1668,8 +1668,24 @@ class ManifoldSimulator(
         # damp internal jitter but the COM still translates and the body
         # still rolls sideways, exactly the "옆으로 뒹군다" the impact
         # would physically produce when the bunny lands off-center.
+        # Scale the unified impact rigid kick by the impact-energy
+        # factor so soft drops produce minimal whole-body kick + tumble.
+        # ke_factor here mirrors the Voronoi pipeline's scaling so the
+        # body, the bond breakage, and the Mode-I kicks are all
+        # gravity-energy-budgeted together.
+        ref_speed_eff = float(self.fracture_cfg.get(
+            'voronoi_impact_speed_ref', 70.0))
+        min_factor_eff = float(self.fracture_cfg.get(
+            'voronoi_impact_min_factor', 0.01))
+        ke_factor_eff = max(min_factor_eff, min(
+            1.0, impact_speed / max(ref_speed_eff, 1e-3)))
+        # ke^4 for unified rigid kick + tumble: at ke=0.62 -> 0.148
+        # multiplier (~7x reduction), at ke=0.3 -> 0.008 (~125x).
+        # Soft drops produce a tumble-free, kick-free landing -- the
+        # body simply rests on the floor without spinning or sliding.
+        ke4_eff = ke_factor_eff ** 4.0
         impulse_scale = float(self.fracture_cfg.get(
-            'unified_impact_impulse_scale', 0.0))
+            'unified_impact_impulse_scale', 0.0)) * ke4_eff
         if impulse_scale > 0.0 and impact_speed > 1e-3:
             # Direction of horizontal kick: from impact_center toward the
             # body COM (in XY).  Off-center landings naturally lean the
@@ -1719,7 +1735,7 @@ class ManifoldSimulator(
             # body rolls forward in the slide direction).  axis = z x horiz
             # -> (-h_y, h_x, 0) which curls the top of the body forward.
             tumble_scale = float(self.fracture_cfg.get(
-                'unified_impact_tumble_scale', 0.0))
+                'unified_impact_tumble_scale', 0.0)) * ke4_eff
             if tumble_scale > 0.0:
                 omega_axis = torch.tensor(
                     [-float(horiz_dir[1]), float(horiz_dir[0]), 0.0],
@@ -1852,13 +1868,18 @@ class ManifoldSimulator(
             'voronoi_force_shrink_max_frac', 0.0))
 
         # Impact-energy scaling: factor in [min_factor, 1.0].
+        # ref_speed=70 maps z=0.8+ drops to ke=1.0 (full pulverization);
+        # smaller drops fall on a steep cubic curve so z=0.22 (ke~0.26)
+        # produces only a handful of cells.
         ref_speed = float(self.fracture_cfg.get(
-            'voronoi_impact_speed_ref', 30.0))
+            'voronoi_impact_speed_ref', 70.0))
         min_factor = float(self.fracture_cfg.get(
-            'voronoi_impact_min_factor', 0.05))
+            'voronoi_impact_min_factor', 0.01))
         impact_speed = float(getattr(self, '_soft_impact_speed', ref_speed))
         ke_factor = max(min_factor, min(1.0, impact_speed / max(ref_speed, 1e-3)))
-        n_cells = max(8, int(n_cells_full * ke_factor))
+        # Cubic scaling on n_cells: at ke=0.26 (z~0.22) -> ~4 cells,
+        # ke=0.6 (z~0.42) -> ~54 cells, ke=1.0 (z~0.8) -> full count.
+        n_cells = max(4, int(n_cells_full * (ke_factor ** 3)))
         # force_shrink scales INVERSELY and AGGRESSIVELY: at hard impact
         # (ke=1.0) we want full pulverization (5% base cap = the whole
         # body breaks).  At soft impact (ke=0.05-0.2) we want the body
@@ -1901,8 +1922,23 @@ class ManifoldSimulator(
         # intact under a gentle drop.
         bond_thr_full = float(self.fracture_cfg.get(
             'voronoi_bond_break_threshold', 0.15))
+        # sqrt(1-ke) gate: at ke=0.6 -> threshold 0.69, ke=0.05 ->
+        # threshold 0.98 (effectively unbreakable).
         self._voronoi_bond_thr_effective = (
-            bond_thr_full + (1.0 - ke_factor) * (1.0 - bond_thr_full))
+            bond_thr_full
+            + ((1.0 - ke_factor) ** 0.5) * (1.0 - bond_thr_full))
+        # Scale impact-time unified rigid kick + tumble + position
+        # offset by ke so soft drops produce minimal post-impact body
+        # disturbance.
+        self._voronoi_unified_impulse_scale_eff = (
+            float(self.fracture_cfg.get(
+                'unified_impact_impulse_scale', 0.05)) * ke2)
+        self._voronoi_unified_tumble_scale_eff = (
+            float(self.fracture_cfg.get(
+                'unified_impact_tumble_scale', 0.20)) * ke2)
+        self._voronoi_position_offset_eff = (
+            float(self.fracture_cfg.get(
+                'fragment_release_position_offset', 0.05)) * ke2)
         print(f"  [Voronoi] impact_speed={impact_speed:.2f} ke_factor={ke_factor:.2f} "
               f"n_cells={n_cells} (full={n_cells_full}) "
               f"force_shrink={force_shrink:.2f} (full={force_shrink_full:.2f}) "
@@ -2049,16 +2085,48 @@ class ManifoldSimulator(
         direction = torch.from_numpy(direction_np).to(
             self.x_mpm.device, self.x_mpm.dtype)
 
-        # Magnitude: sqrt(stress) gives the right energy scaling.  When
-        # the break is force-shrink/cascade-driven (stress=0), we still
-        # want a tiny opening kick so the bond geometrically separates,
-        # so we floor at `min_open_kick`.
-        min_open_kick = float(getattr(
-            self, "fragment_release_min_open_kick", 0.5))
-        # Scale by impact-energy factor so soft drops produce weaker
-        # opening kicks (visible scatter intensity tracks impact KE).
+        # Energy-conserving Mode-I bond opening: the released KE is
+        # bounded by the Griffith critical energy release rate Gc times
+        # the bond's surface area.  Each adjacent cell receives half
+        # the total energy, so its opening velocity is
+        #
+        #     v_open = sqrt(2 * (Gc * area / 2) / m_cell)
+        #            = sqrt(Gc * area / m_cell)
+        #
+        # This produces physically-correct kicks: for soda-lime glass
+        # (Gc ~ 9 J/m^2) with cell mass ~kg-scale, v_open is ~0.1-1 m/s,
+        # tiny compared to the impact-inherited body velocity
+        # (~10-40 m/s).  Result: gravity-driven fall dominates the
+        # visible motion and the brittle release is a small perturbation,
+        # matching real falling-glass physics.  The legacy
+        # gain*sqrt(stress) formula injected non-physical energy that
+        # produced an "explosion" feel.
+        Gc = float(getattr(self.elasticity, 'Gc', 9.0))
+        cell_count_a = int(np.sum(self.voronoi.cell_assignment == cell_a))
+        cell_count_b = int(np.sum(self.voronoi.cell_assignment == cell_b))
+        cell_count_min = max(1, min(cell_count_a, cell_count_b))
+        m_cell = float(self.mpm.p_mass) * cell_count_min
+        # Bond area heuristic: face of a cube whose volume = N_cell *
+        # particle_vol.  area ~ (m_cell / rho)^(2/3).
+        cell_vol = float(self.mpm.vol) * cell_count_min
+        bond_area = max(cell_vol ** (2.0 / 3.0), 1e-8)
+        v_open_griffith = float((Gc * bond_area / max(m_cell, 1e-8)) ** 0.5)
+        # Multiply by a user-tunable energy-conversion fraction so the
+        # released KE can be scaled per-style (default 1.0 = full
+        # Griffith-bounded release).
+        energy_frac = float(getattr(
+            self, "fragment_release_energy_fraction", 1.0))
+        v_open = v_open_griffith * (energy_frac ** 0.5)
+        # Apply impact-energy scaling on top: soft drops further dampen
+        # the released KE (the body just doesn't have enough kinetic
+        # energy to fully convert to fracture surface energy).
         kick_scale = float(getattr(self, "_voronoi_kick_scale", 1.0))
-        v_open = max(min_open_kick, gain * kick_scale * (float(stress) ** 0.5))
+        v_open = v_open * kick_scale
+        # Floor for force-shrink/cascade-driven breaks (stress=0) so
+        # bonds geometrically separate; cap at max_speed.
+        min_open_kick = float(getattr(
+            self, "fragment_release_min_open_kick", 0.1))
+        v_open = max(min_open_kick, v_open)
         v_open = min(v_open, max_speed)
 
         idx_a = torch.where(
@@ -2083,7 +2151,8 @@ class ManifoldSimulator(
         # this the heavy-base velocity field swallows the kicks via
         # grid coupling within one P2G2P step.
         offset_scale = float(getattr(
-            self, "fragment_release_position_offset", 0.0))
+            self, "_voronoi_position_offset_eff",
+            getattr(self, "fragment_release_position_offset", 0.0)))
         if offset_scale > 0.0:
             self.x_mpm[idx_a] = self.x_mpm[idx_a] + (-direction * offset_scale).unsqueeze(0)
             self.x_mpm[idx_b] = self.x_mpm[idx_b] + (direction * offset_scale).unsqueeze(0)
