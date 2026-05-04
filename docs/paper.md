@@ -3,6 +3,184 @@
 Working title and abstract candidates for the SIGGRAPH Asia
 submission.  Updated as the writing progresses.
 
+## v12 — Title + Abstract (current architecture: Voronoi + Griffith Mode-I + ke-budgeted scatter)
+
+### Title (unchanged)
+
+> **Sentence to Shatter: Language-Conditioned Brittle Fracture on
+> Gaussian Splat Manifolds**
+
+### Abstract (~240 words)
+
+> We present **Sentence to Shatter**, a language-conditioned brittle
+> fracture animation system on 3D Gaussian Splat scenes.  Given a
+> natural-language description (e.g., *"soda-lime glass object
+> completely pulverized into hundreds of tiny shards"* or *"vulcanized
+> rubber object under localized impact"*), our system produces
+> physically-faithful fracture animation directly on the input splat
+> manifold, with scatter intensity that tracks the physical impact
+> energy of the drop and morphology that tracks the prompt's stated
+> crack style.
+>
+> The system rests on a single unifying principle: a
+> **gravity-energy-budgeted brittle fracture** in which one impact-
+> energy factor $k_e\!=\!\mathrm{clip}(v_*/v_{\mathrm{ref}}, k_{\min}, 1)$
+> simultaneously controls cell topology, bond strength, and rigid
+> kinematics — derived from a shared physical KE budget rather than
+> tuned per phenomenon.
+>
+> Four facets follow: (i) a **Voronoi pre-fracture substrate** of
+> impact-biased cells joined by an explicit bond network, providing
+> a discrete fragment topology atop a shared MPM grid; (ii) **energy-
+> conserving Mode-I bond opening** bounded by the Griffith critical
+> energy release rate
+> $v_{\mathrm{open}} = \sqrt{G_c\,A_{\mathrm{bond}}/m_{\mathrm{cell}}}$,
+> which replaces ad-hoc release kicks with a physically-bounded
+> opening velocity that is small relative to gravity-inherited body
+> velocity; (iii) **stress-wave bond-breakage gating** that propagates
+> a wave radius from the impact center each frame, producing
+> temporally-coherent crack-front advance; and (iv) a **drop-height-
+> budgeted scatter remap** ($n_{\mathrm{cells}}\!\propto\!k_e^3$,
+> $\tau_b^{\mathrm{eff}}\!\propto\!\sqrt{1-k_e}$, rigid impulse
+> $\propto\!k_e^4$) whose exponents follow from KE-to-fracture-area
+> scaling rather than parameter search.
+>
+> Sentence conditioning operates through **two independent channels**:
+> a CLIP-MaterialDB nearest-neighbor lookup recovers material physics
+> ($E$, $G_c$, $\nu$, family bounds), while a learned StyleHead MLP
+> selects among five canonical crack morphologies (radial shatter,
+> spiderweb branching, single smooth, chunky crumble, diffuse
+> microcrack) — so the same sentence sets both *what the body is made
+> of* and *how its cracks should look*.  We export per-frame state as
+> Houdini-native geometry for path-traced rendering, and validate
+> across drop heights $\{0.22, 0.42, 0.80\}$ at 2K and 10K particle
+> densities.
+
+### Pipeline (overview)
+
+The system runs as a six-stage chain on a single shared MPM grid:
+
+1. **Input.**  A 3D Gaussian Splat scene (per-Gaussian position $p_i$,
+   covariance $\Sigma_i$, opacity $\alpha_i$, RGB $c_i$) plus a
+   natural-language prompt $s$.
+
+2. **Material prior (CLIP $\to$ runtime).**  CLIP encodes $s$ to a
+   512-d embedding; cosine retrieval over `MaterialDB` yields the
+   material family (`sharp_brittle`, `brittle_moderate`,
+   `rough_quasi_brittle`, `neutral_reference`, `diffuse_damage`) and
+   an auxiliary StyleHead emits a sentence-style profile.  These
+   together set the simulator's runtime parameters: full-strength
+   Voronoi cell count $N_{\mathrm{cells,full}}$, bond-break threshold
+   $\tau_b$, post-impact gravity $g_{\mathrm{post}}$, damping, and
+   the rigid-kick budget.
+
+3. **Free fall.**  The body integrates gravity on the shared MPM grid
+   without contact.  COM linear velocity accumulates; deformation
+   gradient $F$ is preserved across substeps.
+
+4. **Impact $\to$ Voronoi tessellation.**  At the first floor contact
+   we compute the impact speed $v_*$ and form an impact-energy factor
+   $k_e = \mathrm{clip}(v_*/v_{\mathrm{ref}}, k_{\min}, 1)$.  We seed
+   $N_{\mathrm{cells}} = \max(4, \lfloor N_{\mathrm{full}}\,k_e^3 \rfloor)$
+   Voronoi cells (impact-biased distribution + optional anisotropy
+   axis), assign each MPM particle to its nearest cell, and build the
+   bond graph between adjacent cells.  Concurrently, an effective
+   bond threshold $\tau_b^{\mathrm{eff}} = \tau_b + \sqrt{1-k_e}\,(1-\tau_b)$
+   makes soft drops nearly unbreakable.
+
+5. **Stress-wave bond breakage + Mode-I release.**  Each frame, a
+   wave radius $r_w \mathrel{+}= c_w\,k_e^2$ grows from the impact
+   center.  A bond $(a,b)$ breaks when its midpoint lies inside $r_w$
+   AND its accumulated stress damage exceeds $\tau_b^{\mathrm{eff}}$.
+   On break, paired Newton-third-law kicks of magnitude
+   $v_{\mathrm{open}} = \sqrt{G_c\,A_{\mathrm{bond}}/m_{\mathrm{cell}}}$
+   open the bond along its inter-cell direction.  $v_{\mathrm{open}}$
+   is bounded by Griffith $G_c$, so the kick is tiny relative to the
+   $\sim\!40$ m/s body velocity at hard impact, and falling dominates
+   the visible motion.
+
+6. **Continued MPM + render export.**  The body continues on the
+   shared MPM grid with slip boundary conditions on lateral walls
+   and floor (zero normal velocity component into walls; see
+   `mpm_model.grid_update`).  Per-fragment shape matching keeps each
+   chunk rigid via SVD-recovered $R$.  Per-frame splat state is
+   exported as gzipped Houdini JSON (`frame_NNNN.geo.gz`) carrying
+   $P, C_d, \alpha, \mathtt{scale}, \mathtt{orient}, \mathtt{fragment\_id},
+   \mathtt{damage}$ for path-traced Karma rendering.
+
+### Algorithmic contributions (4 claims)
+
+1. **Voronoi pre-fracture substrate** — a cell-and-bond network
+   formed at impact time on top of a shared global MPM grid,
+   replacing per-fragment grids and emergent-only fragment detection.
+   Implementation: `VoronoiDecomposer` + `_init_voronoi_tessellation`.
+
+2. **Griffith-bounded Mode-I bond opening** — released opening
+   velocity $v_{\mathrm{open}}=\sqrt{G_c A_{\mathrm{bond}}/m_{\mathrm{cell}}}$,
+   energy-conserving by construction.  Bonds open with a tiny kick
+   compared to the $\sim\!40$ m/s body velocity at hard impact, so
+   gravity dominates the visible motion.  Implementation:
+   `_apply_bond_opening_kick`.
+
+3. **Stress-wave bond-breakage gating** — explicit wave radius growing
+   each frame from the impact center; bonds outside the front are
+   excluded regardless of accumulated damage, producing temporally-
+   coherent crack-front advance.  Implementation:
+   `VoronoiDecomposer.update_bond_breakage(wave_speed_per_frame)`.
+
+4. **Drop-height-budgeted scatter remap** — single impact-energy
+   factor $k_e$ scales the entire fracture cascade with monomial
+   exponents *derived* from a shared KE budget (not tuned):
+   $n_{\mathrm{cells}}\!\propto\!k_e^3$ from
+   $A_{\mathrm{tot}}\!\propto\!KE$ and $A_{\mathrm{tot}}\!\propto\!n^{2/3}$;
+   $\tau_b^{\mathrm{eff}}\!\propto\!\sqrt{1-k_e}$ (Cottrell-style
+   driving-stress offset); $\{c_w, r_{\mathrm{shock}}\}\!\propto\!k_e^2$;
+   $\{\text{rigid kick}, \text{tumble}\}\!\propto\!k_e^4$ from
+   momentum × energy.  Verified to give 5 fragments at $z\!=\!0.22$
+   vs 77 at $z\!=\!0.80$ on the same 2K-particle bunny.
+
+### Supporting system contribution: dual-channel sentence conditioning
+
+The same sentence simultaneously controls **two orthogonal axes** of
+the simulation, through two independent learned channels:
+
+* **Material physics channel** — CLIP encodes the prompt and a
+  cosine retrieval over `MaterialDB` returns the top-K nearest
+  materials.  Their physics priors (Young's modulus $E$, fracture
+  toughness $G_c$, Poisson $\nu$) are softmax-weighted and
+  log-averaged.  The predicted material family
+  ($\{$`sharp_brittle`, `brittle_moderate`, `rough_quasi_brittle`,
+  `neutral_reference`, `diffuse_damage`$\}$) imposes hard caps:
+  *e.g.*, when the family is `neutral_reference` and the prompt
+  contains a metal token (`steel`, `iron`, ...), the front
+  propagator is force-disabled regardless of the explicit phrasing
+  — honoring the physics that steel does not brittle-fracture under
+  this drop regime even when the prompt asks for "radial cracks".
+
+* **Crack-style channel** — a learned StyleHead MLP
+  ($\mathrm{CLIP}_{512}\!\to\!128\!\to\!5$) trained on weak
+  supervision from a 228-sentence template corpus selects among five
+  canonical morphologies: radial shatter, spiderweb branching,
+  single smooth, chunky crumble, diffuse microcrack.  When the
+  head's top-class probability exceeds $0.55$, its prediction sets
+  the runtime overrides for cell-seed distribution, anisotropy axis,
+  bond-break threshold, and force-shrink fraction; otherwise a
+  keyword-rule fallback applies.  At inference the MLP generalizes
+  beyond the rule's token list — *e.g.*, *"the bottle disintegrated
+  into many radial pieces"* routes to `radial_shatter` at
+  $p\!=\!0.996$ even though neither *radial* nor *shatter* appears
+  in any rule.
+
+The two channels are independent: the material prior knows nothing
+about crack style, and the style head knows nothing about Young's
+modulus.  The product *(material × style)* is what allows the same
+sentence to set both *what the body is made of* and *how its cracks
+should look*, with adversarial pairings (*"rubber object that
+shatters into glass shards"*) revealing the dual-channel structure
+in ablation.
+
+---
+
 ## v30 LOCKED — Title + Abstract (final draft, post sim-architecture lock)
 
 ### Title (locked)
