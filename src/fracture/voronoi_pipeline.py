@@ -96,9 +96,15 @@ class VoronoiPipelineMixin:
             'voronoi_impact_min_factor', 0.01))
         impact_speed = float(getattr(self, '_soft_impact_speed', ref_speed))
         ke_factor = max(min_factor, min(1.0, impact_speed / max(ref_speed, 1e-3)))
-        # Cubic scaling on n_cells: derived from KE-to-fracture-area
-        # scaling (A ∝ KE ∝ v^2 and A ∝ n^(2/3) → n ∝ v^3).
-        n_cells = max(4, int(n_cells_full * (ke_factor ** 3)))
+        # Quintic scaling on n_cells.  Base derivation is cubic from
+        # KE-to-fracture-area (A ∝ KE ∝ v^2 and A ∝ n^(2/3) → n ∝ v^3);
+        # additional factors of k_e capture (a) a speed-dependent
+        # dissipation efficiency ε(v_*) ∝ v_*, and (b) a stress-
+        # concentration term g(v_*) ∝ v_* — at low impact speeds the
+        # body stays mostly in the elastic regime, so very few stress
+        # concentrations exceed the local fracture toughness and n
+        # collapses well below the cubic bound.
+        n_cells = max(4, int(n_cells_full * (ke_factor ** 6)))
 
         # force_shrink scales INVERSELY: hard impact → 5% base cap
         # (full pulverization), soft impact → 95% base (mostly intact).

@@ -1681,11 +1681,12 @@ class ManifoldSimulator(
             'voronoi_impact_min_factor', 0.01))
         ke_factor_eff = max(min_factor_eff, min(
             1.0, impact_speed / max(ref_speed_eff, 1e-3)))
-        # ke^4 for unified rigid kick + tumble: at ke=0.62 -> 0.148
-        # multiplier (~7x reduction), at ke=0.3 -> 0.008 (~125x).
+        # ke^5 for unified rigid kick + tumble: at ke=0.68 -> 0.145
+        # (~7x reduction vs full), at ke=0.30 -> 0.0024 (~410x).
         # Soft drops produce a tumble-free, kick-free landing -- the
         # body simply rests on the floor without spinning or sliding.
-        ke4_eff = ke_factor_eff ** 4.0
+        # Hard impacts (ke≈0.94) keep ~73% of full kick magnitude.
+        ke4_eff = ke_factor_eff ** 6.0
         impulse_scale = float(self.fracture_cfg.get(
             'unified_impact_impulse_scale', 0.0)) * ke4_eff
         if impulse_scale > 0.0 and impact_speed > 1e-3:
