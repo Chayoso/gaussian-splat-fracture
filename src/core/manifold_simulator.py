@@ -1611,7 +1611,22 @@ class ManifoldSimulator(
             ground_world = self.mapper.mpm_to_world(
                 torch.tensor([0.0, 0.0, float(self._gravity_drop_ground_z)],
                              device=xyz.device, dtype=xyz.dtype))[2].item()
-            xyz[:, 2] = xyz[:, 2].clamp(min=ground_world)
+            # Account for the Gaussian splat ellipsoid extent: each
+            # splat is rendered as a 3D ellipsoid whose lower extent
+            # can dip below the particle center by up to half its
+            # max scale value.  Clamp the centre to be at least
+            # `ground_world + splat_z_buffer` so the splat doesn't
+            # visually tunnel through the floor mesh in the viewer.
+            splat_z_buffer = 0.0
+            try:
+                if self.gaussians._scaling is not None:
+                    scaling = torch.exp(self.gaussians._scaling.data)
+                    splat_z_buffer = float(0.5 * scaling[:, 2].max().item())
+                    splat_z_buffer = min(splat_z_buffer, 0.02)
+            except Exception:
+                splat_z_buffer = 0.0
+            floor_visual = ground_world + splat_z_buffer
+            xyz[:, 2] = xyz[:, 2].clamp(min=floor_visual)
 
     # ================================================================
     # Impact handling
@@ -1891,18 +1906,23 @@ class ManifoldSimulator(
         damage = self._get_volumetric_damage()
         if damage.numel() != self.x_mpm.shape[0]:
             return
-        bond_aging = float(self.fracture_cfg.get(
-            'voronoi_bond_aging_per_frame', 0.0))
-        impact_radius = float(self.fracture_cfg.get(
-            'voronoi_impact_shock_radius', 0.0))
+        bond_aging = float(getattr(
+            self, '_voronoi_bond_aging_effective',
+            self.fracture_cfg.get('voronoi_bond_aging_per_frame', 0.0)))
+        impact_radius = float(getattr(
+            self, '_voronoi_shock_radius_effective',
+            self.fracture_cfg.get('voronoi_impact_shock_radius', 0.0)))
         cascade_radius = float(self.fracture_cfg.get(
             'voronoi_cascade_radius', 0.0))
+        wave_speed = float(self.fracture_cfg.get(
+            'voronoi_wave_speed_per_frame', 0.0))
         newly_broken = self.voronoi.update_bond_breakage(
             damage,
             bond_aging=bond_aging,
             impact_center=getattr(self, '_impact_center', None),
             impact_radius=impact_radius,
             cascade_radius=cascade_radius,
+            wave_speed_per_frame=wave_speed,
         )
         # Mode-I bond opening: each newly-broken bond gives a pair of
         # equal-and-opposite kicks to its two cells along the bond

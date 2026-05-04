@@ -271,6 +271,7 @@ class VoronoiDecomposer:
         impact_center: Optional[Tensor] = None,
         impact_radius: float = 0.0,
         cascade_radius: float = 0.0,
+        wave_speed_per_frame: float = 0.0,
     ) -> List[Tuple[int, int, float]]:
         """Mark bonds broken when avg damage on their boundary exceeds
         the threshold.  Three break criteria, OR'd together:
@@ -298,14 +299,41 @@ class VoronoiDecomposer:
         newly_broken_bonds: List[Tuple[int, int, float]] = []
 
         ic_np = None
-        if impact_center is not None and impact_radius > 0.0:
+        if impact_center is not None:
             if isinstance(impact_center, Tensor):
                 ic_np = impact_center.detach().cpu().numpy().astype(np.float32)
             else:
                 ic_np = np.asarray(impact_center, dtype=np.float32)
 
+        # Stress-wave fracture propagation: at each call, grow the
+        # `_wave_radius` from impact_center by `wave_speed_per_frame`.
+        # ONLY bonds whose midpoint is within `_wave_radius` are allowed
+        # to break this frame.  Bonds outside the wave stay intact even
+        # if their damage/aging would otherwise let them break.  This
+        # produces a fracture FRONT propagating outward from the impact
+        # zone over time -- "shatter from the bottom up" -- rather than
+        # uniform simultaneous breakage everywhere.
+        if wave_speed_per_frame > 0.0:
+            self._wave_radius = float(getattr(
+                self, "_wave_radius", float(impact_radius))) + float(
+                wave_speed_per_frame)
+        else:
+            # Wave gating disabled: any bond can break this frame.
+            self._wave_radius = float("inf")
+
         for bond_key, bond_idx in self._bond_boundary_idx.items():
             if self.bond_broken.get(bond_key, False):
+                continue
+            # Stress-wave gate: bonds outside the propagating wave-front
+            # cannot break this frame, regardless of damage/aging.
+            in_wave = True
+            if (ic_np is not None and self.cell_centers is not None
+                    and self._wave_radius != float("inf")):
+                a, b = bond_key
+                mid = 0.5 * (self.cell_centers[a] + self.cell_centers[b])
+                in_wave = (float(np.linalg.norm(mid - ic_np))
+                           < float(self._wave_radius))
+            if not in_wave:
                 continue
             if bond_idx.size == 0:
                 self.bond_broken[bond_key] = True
@@ -316,7 +344,8 @@ class VoronoiDecomposer:
                 self.bond_broken[bond_key] = True
                 newly_broken_bonds.append((bond_key[0], bond_key[1], avg_dmg))
                 continue
-            if ic_np is not None and self.cell_centers is not None:
+            if (ic_np is not None and impact_radius > 0.0
+                    and self.cell_centers is not None):
                 a, b = bond_key
                 mid = 0.5 * (self.cell_centers[a] + self.cell_centers[b])
                 if float(np.linalg.norm(mid - ic_np)) < impact_radius:

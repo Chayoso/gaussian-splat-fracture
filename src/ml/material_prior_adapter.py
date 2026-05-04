@@ -713,8 +713,20 @@ SENTENCE_STYLE_RULES = (
             "manifold.voronoi_n_cells": 250,
             "manifold.voronoi_seed_distribution": "impact_biased",
             "manifold.voronoi_bond_break_threshold": 0.15,
-            "manifold.voronoi_bond_aging_per_frame": 0.008,
-            "manifold.voronoi_impact_shock_radius": 0.15,
+            # Time-driven bond aging disabled in favor of stress-wave
+            # propagation: bonds outside the wave can't break by aging,
+            # they wait for the wave-front to reach them.  This produces
+            # impact-zone-first fracture (gradient breakage) instead of
+            # uniform simultaneous breakage everywhere (which reads as
+            # "explosion" not "shatter").
+            "manifold.voronoi_bond_aging_per_frame": 0.0,
+            "manifold.voronoi_impact_shock_radius": 0.10,
+            # Wave propagation speed: bonds within `_wave_radius` of
+            # impact_center can break each frame; radius grows by this
+            # much per call.  0.025 = wave reaches body extent (~0.4)
+            # in ~16 frames, matching the typical 30-60 frame post-
+            # impact window.
+            "manifold.voronoi_wave_speed_per_frame": 0.025,
             "manifold.voronoi_cascade_radius": 1.0,
             "manifold.voronoi_force_shrink_max_frac": 0.05,
             "manifold.fragment_release_position_offset": 0.05,
