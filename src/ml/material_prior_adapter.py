@@ -698,22 +698,27 @@ SENTENCE_STYLE_RULES = (
             # world over their flight, which reads as "흩날린다" rather
             # than "주저앉는다".  upward_fraction 0.25 = brief arc lift,
             # the dominant motion is horizontal.
-            "manifold.fragment_release_v_com_gain": 15.0,
-            "manifold.fragment_physical_max_speed": 30.0,
+            "manifold.fragment_release_v_com_gain": 35.0,
+            "manifold.fragment_physical_max_speed": 50.0,
             # Per-particle floor bounce override (recovers from slip BC).
-            # 0.40 = moderate glass shard bounce.
-            "manifold.fragment_floor_restitution": 0.40,
-            # Voronoi pre-fracture: moderate pulverization (less explosive).
+            # 0.50 = moderate glass shard bounce.
+            # Floor restitution disabled: slip BC at the Z=0 wall now
+            # handles the floor, and combining the two creates a yo-yo
+            # (slip kills v_z at the wall; restitution then injects
+            # +v_z from saved pre-step velocity, sending the particle
+            # back up; gravity pulls it down again; cycle).
+            "manifold.fragment_floor_restitution": 0.0,
+            # Voronoi pre-fracture: full pulverization, no base remnant.
             "manifold.voronoi_enable": True,
-            "manifold.voronoi_n_cells": 150,
+            "manifold.voronoi_n_cells": 250,
             "manifold.voronoi_seed_distribution": "impact_biased",
-            "manifold.voronoi_bond_break_threshold": 0.20,
-            "manifold.voronoi_bond_aging_per_frame": 0.005,
-            "manifold.voronoi_impact_shock_radius": 0.10,
+            "manifold.voronoi_bond_break_threshold": 0.15,
+            "manifold.voronoi_bond_aging_per_frame": 0.008,
+            "manifold.voronoi_impact_shock_radius": 0.15,
             "manifold.voronoi_cascade_radius": 1.0,
-            "manifold.voronoi_force_shrink_max_frac": 0.10,
-            "manifold.fragment_release_position_offset": 0.03,
-            "manifold.particle_speed_cap": 40.0,
+            "manifold.voronoi_force_shrink_max_frac": 0.05,
+            "manifold.fragment_release_position_offset": 0.05,
+            "manifold.particle_speed_cap": 80.0,
             # Aggressive angular damping for residual base + fragments.
             # static_omega=25 puts kinetic damping (0.985) only above
             # 25 rad/s; everything else gets strong static damping

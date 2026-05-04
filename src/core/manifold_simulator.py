@@ -607,6 +607,12 @@ class ManifoldSimulator(
         """Enable 2-phase gravity drop mode."""
         self._gravity_drop = True
         self._gravity_drop_ground_z = ground_z
+        # Propagate the ground level to the MPM core so its slip-BC
+        # floor matches the simulator's collision floor (otherwise
+        # the viewer's auto-detected floor and the physics floor
+        # disagree, and particles can tunnel below the visible
+        # ground before being stopped at the domain bottom).
+        self.mpm.ground_z = float(ground_z)
         self._gravity_drop_contacted = False
         device = self.mpm.gravity.device
         self._v_com = torch.zeros(3, device=device)
@@ -1590,6 +1596,23 @@ class ManifoldSimulator(
         self._last_render_state["interior_surface_count"] = int(
             getattr(self.visualizer, "_last_interior_count", 0)
         )
+
+        # Clamp final Gaussian positions so the visualizer's auto-detected
+        # floor matches the simulation's ground_z and particles don't
+        # appear to tunnel through the rendered floor mesh.  The
+        # visualizer applies crack-opening offsets that can push
+        # Gaussians slightly past the MPM domain bounds, which the MPM
+        # core's `clip_bound` doesn't catch (it operates only on x_mpm,
+        # not on Gaussian render positions).
+        if (self._gravity_drop_contacted
+                and self.gaussians is not None
+                and self.gaussians._xyz.data.shape[0] > 0):
+            xyz = self.gaussians._xyz.data
+            ground_world = self.mapper.mpm_to_world(
+                torch.tensor([0.0, 0.0, float(self._gravity_drop_ground_z)],
+                             device=xyz.device, dtype=xyz.dtype))[2].item()
+            xyz[:, 2] = xyz[:, 2].clamp(min=ground_world)
+
     # ================================================================
     # Impact handling
     # ================================================================

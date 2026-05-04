@@ -456,6 +456,63 @@ class MPMModel:
             alpha = (dist_to_boundary.unsqueeze(1) / absorb_width).clamp(0, 1)
             damping_factor = alpha ** 2  # quadratic falloff: 0 at edge, 1 at interior
             self.grid_mv = torch.where(absorb_mask, self.grid_mv * damping_factor, self.grid_mv)
+
+        # Slip BC on the X/Y/Z domain walls: zero the wall-normal
+        # velocity component for any grid cell within `slip_band` cells
+        # of the boundary if its velocity points INTO the wall.  A
+        # narrow 1-cell band leaves room for fast particles to jump
+        # past the wall in a single substep (per-substep displacement
+        # = v*dt can exceed dx for v_com_gain >= 35 m/s), so use a
+        # 3-cell band by default to cover those cases.  Tangential
+        # motion is preserved (slip, not stick).  Without this BC,
+        # MPM's position-only clip_bound leaves the velocity intact
+        # so particles get pinned to walls indefinitely.
+        slip_band = max(1, int(getattr(self, "wall_slip_band_cells", 6)))
+        # Slip BC on X/Y lateral walls (lo + hi) and Z roof (top).
+        # The Z floor is handled separately just below using the
+        # simulator-set `gravity_drop_ground_z` so the slip BC
+        # position matches the actual game-floor position (otherwise
+        # the viewer's auto-detected floor and the physics floor
+        # disagree, and particles tunnel through to the domain bottom
+        # before being stopped).
+        for axis in (0, 1):
+            v_axis = self.grid_mv[:, axis]
+            wall_lo = grid_coords[:, axis] < float(slip_band)
+            wall_hi = grid_coords[:, axis] > (n - 1) - float(slip_band)
+            into_lo = wall_lo & (v_axis < 0.0)
+            into_hi = wall_hi & (v_axis > 0.0)
+            if bool(into_lo.any()):
+                self.grid_mv[into_lo, axis] = 0.0
+            if bool(into_hi.any()):
+                self.grid_mv[into_hi, axis] = 0.0
+        # Z roof
+        v_z = self.grid_mv[:, 2]
+        roof = grid_coords[:, 2] > (n - 1) - float(slip_band)
+        into_roof = roof & (v_z > 0.0)
+        if bool(into_roof.any()):
+            self.grid_mv[into_roof, 2] = 0.0
+        # Z floor: align with `gravity_drop_ground_z` (set by the
+        # simulator at impact).  Slip BC fires ONLY for cells AT or
+        # BELOW the ground level (idx <= ceil(ground_idx)).  A wider
+        # band ABOVE ground would freeze particles in mid-air before
+        # they reach the floor, since v_z=0 at any cell in the band
+        # propagates to fragment particles via shape match.  A 2-cell
+        # buffer is added so fast-falling particles that jump through
+        # the ground cell in one substep are still caught.
+        ground_z = float(getattr(self, "ground_z", 0.0))
+        if ground_z > 0.0:
+            ground_idx = ground_z * (n - 1)
+            floor_band = ground_idx + 2.0  # tight buffer
+            floor_mask = grid_coords[:, 2] < floor_band
+            into_floor = floor_mask & (v_z < 0.0)
+            if bool(into_floor.any()):
+                self.grid_mv[into_floor, 2] = 0.0
+        else:
+            # Fall back to standard wall slip on Z lo (domain bottom)
+            wall_lo_z = grid_coords[:, 2] < float(slip_band)
+            into_lo_z = wall_lo_z & (v_z < 0.0)
+            if bool(into_lo_z.any()):
+                self.grid_mv[into_lo_z, 2] = 0.0
         
     def pre_p2g_operation(self) -> None:
         pass
