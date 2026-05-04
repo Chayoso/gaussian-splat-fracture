@@ -493,17 +493,16 @@ class MPMModel:
             self.grid_mv[into_roof, 2] = 0.0
         # Z floor: align with `gravity_drop_ground_z` (set by the
         # simulator at impact).  Slip BC fires ONLY for cells AT or
-        # BELOW the ground level (idx <= ceil(ground_idx)).  A wider
-        # band ABOVE ground would freeze particles in mid-air before
-        # they reach the floor, since v_z=0 at any cell in the band
-        # propagates to fragment particles via shape match.  A 2-cell
-        # buffer is added so fast-falling particles that jump through
-        # the ground cell in one substep are still caught.
+        # BELOW the ground level.  No buffer above, otherwise particles
+        # are frozen in mid-air before they reach the floor (v_z=0 at
+        # any band cell propagates through shape match to fragment
+        # particles, making chunks hover just above ground).
+        # Sub-cell ground positions are handled by including the cell
+        # that contains the ground (idx <= floor(ground_idx + 1)).
         ground_z = float(getattr(self, "ground_z", 0.0))
         if ground_z > 0.0:
             ground_idx = ground_z * (n - 1)
-            floor_band = ground_idx + 2.0  # tight buffer
-            floor_mask = grid_coords[:, 2] < floor_band
+            floor_mask = grid_coords[:, 2] <= float(ground_idx)
             into_floor = floor_mask & (v_z < 0.0)
             if bool(into_floor.any()):
                 self.grid_mv[into_floor, 2] = 0.0

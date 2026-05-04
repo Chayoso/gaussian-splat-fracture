@@ -738,7 +738,7 @@ SENTENCE_STYLE_RULES = (
             # within ~5-10 frames so the central fragment doesn't keep
             # spinning indefinitely.
             "manifold.shape_match_static_omega": 25.0,
-            "manifold.post_impact_gravity_z": -4500.0,
+            "manifold.post_impact_gravity_z": -7500.0,
             "manifold.post_impact_damping": 0.999,
             "manifold.curvature_weight": 0.4,
             "manifold.fragment_boundary_cut_min_ratio": 0.45,

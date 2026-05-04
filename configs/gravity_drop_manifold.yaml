@@ -242,7 +242,7 @@ ground_plane:
 loading:
   type: "gravity_drop"
   fixed_gravity_z: -2000.0            # Strong gravity for fast impact
-  drop_scale: 0.33
+  drop_scale: 0.20
   drop_center_z: 0.7
   drop_rotation: [30.0, 20.0, 0.0]
 

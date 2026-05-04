@@ -1855,22 +1855,63 @@ class ManifoldSimulator(
         ref_speed = float(self.fracture_cfg.get(
             'voronoi_impact_speed_ref', 30.0))
         min_factor = float(self.fracture_cfg.get(
-            'voronoi_impact_min_factor', 0.20))
+            'voronoi_impact_min_factor', 0.05))
         impact_speed = float(getattr(self, '_soft_impact_speed', ref_speed))
         ke_factor = max(min_factor, min(1.0, impact_speed / max(ref_speed, 1e-3)))
         n_cells = max(8, int(n_cells_full * ke_factor))
-        # force_shrink scales INVERSELY: slow impact -> larger residual
-        # base remains.  full=0.05 (5% base cap) at hard impact; relaxed
-        # toward 0.5 (50% base allowed) at slow impact.
-        force_shrink = force_shrink_full + (1.0 - ke_factor) * 0.45
-        force_shrink = min(0.6, max(0.0, force_shrink))
+        # force_shrink scales INVERSELY and AGGRESSIVELY: at hard impact
+        # (ke=1.0) we want full pulverization (5% base cap = the whole
+        # body breaks).  At soft impact (ke=0.05-0.2) we want the body
+        # mostly INTACT (90%+ stays as base, only impact-zone chunks
+        # break off) to match real low-drop fracture intuition.
+        # force_shrink scales with (1-ke)^2 amplified by 2.0 so soft
+        # drops keep the body mostly intact (force_shrink approaches
+        # 0.95 = 95% of cells stay as base, only impact-zone chunks
+        # break free).  Hard drops keep force_shrink at the configured
+        # `force_shrink_max_frac` (default 0.05 = 5% base = full
+        # pulverization).
+        ke_inv = max(0.0, 1.0 - ke_factor)
+        force_shrink = force_shrink_full + ke_inv * 2.0
+        force_shrink = min(0.95, max(0.0, force_shrink))
+        # Mode-I bond-opening kick magnitude scaling.  Use a QUADRATIC
+        # function of ke_factor so the visible scatter intensity tracks
+        # impact KE more dramatically than a linear ke would: at ke=1.0
+        # full kicks, at ke=0.6 -> 0.36x scatter, at ke=0.3 -> 0.09x
+        # scatter.  This matches the user-perceptible "hard drop = wild
+        # scatter, soft drop = barely moves" visual gradient.
+        self._voronoi_kick_scale = float(ke_factor) ** 2.0
+        # Wave + impact-shock also scaled QUADRATICALLY so soft drops
+        # don't propagate the fracture front through the whole body --
+        # at ke=0.6 only 36% of the configured wave_speed reaches
+        # cells, so distant bonds stay intact.
+        wave_speed_full = float(self.fracture_cfg.get(
+            'voronoi_wave_speed_per_frame', 0.0))
+        shock_radius_full = float(self.fracture_cfg.get(
+            'voronoi_impact_shock_radius', 0.0))
+        bond_aging_full = float(self.fracture_cfg.get(
+            'voronoi_bond_aging_per_frame', 0.0))
+        ke2 = float(ke_factor) ** 2.0
+        self._voronoi_wave_speed_effective = wave_speed_full * ke2
+        self._voronoi_shock_radius_effective = shock_radius_full * ke2
+        self._voronoi_bond_aging_effective = bond_aging_full * ke2
+        # bond_break_threshold scales INVERSELY with ke: at hard impact
+        # (ke=1.0) bonds break easily (configured threshold).  At soft
+        # impact bonds need much more damage to break -- approaches
+        # 1.0 (impossible to break) as ke->0, so the body stays
+        # intact under a gentle drop.
+        bond_thr_full = float(self.fracture_cfg.get(
+            'voronoi_bond_break_threshold', 0.15))
+        self._voronoi_bond_thr_effective = (
+            bond_thr_full + (1.0 - ke_factor) * (1.0 - bond_thr_full))
         print(f"  [Voronoi] impact_speed={impact_speed:.2f} ke_factor={ke_factor:.2f} "
               f"n_cells={n_cells} (full={n_cells_full}) "
-              f"force_shrink={force_shrink:.2f} (full={force_shrink_full:.2f})")
+              f"force_shrink={force_shrink:.2f} (full={force_shrink_full:.2f}) "
+              f"wave={self._voronoi_wave_speed_effective:.4f} "
+              f"shock={self._voronoi_shock_radius_effective:.3f}")
         self.voronoi = VoronoiDecomposer(
             n_cells=n_cells,
             distribution=distribution,
-            bond_break_threshold=bond_thr,
+            bond_break_threshold=self._voronoi_bond_thr_effective,
             impact_center=impact_center,
             anisotropy_axis=anisotropy_axis,
             seed=seed,
@@ -1914,8 +1955,9 @@ class ManifoldSimulator(
             self.fracture_cfg.get('voronoi_impact_shock_radius', 0.0)))
         cascade_radius = float(self.fracture_cfg.get(
             'voronoi_cascade_radius', 0.0))
-        wave_speed = float(self.fracture_cfg.get(
-            'voronoi_wave_speed_per_frame', 0.0))
+        wave_speed = float(getattr(
+            self, '_voronoi_wave_speed_effective',
+            self.fracture_cfg.get('voronoi_wave_speed_per_frame', 0.0)))
         newly_broken = self.voronoi.update_bond_breakage(
             damage,
             bond_aging=bond_aging,
@@ -2013,7 +2055,10 @@ class ManifoldSimulator(
         # so we floor at `min_open_kick`.
         min_open_kick = float(getattr(
             self, "fragment_release_min_open_kick", 0.5))
-        v_open = max(min_open_kick, gain * (float(stress) ** 0.5))
+        # Scale by impact-energy factor so soft drops produce weaker
+        # opening kicks (visible scatter intensity tracks impact KE).
+        kick_scale = float(getattr(self, "_voronoi_kick_scale", 1.0))
+        v_open = max(min_open_kick, gain * kick_scale * (float(stress) ** 0.5))
         v_open = min(v_open, max_speed)
 
         idx_a = torch.where(
