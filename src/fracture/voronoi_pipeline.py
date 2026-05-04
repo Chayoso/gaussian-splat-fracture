@@ -42,6 +42,8 @@ The mixin reads / writes the following attributes on ``self``:
 
 from __future__ import annotations
 
+from typing import Dict
+
 import numpy as np
 import torch
 
@@ -225,6 +227,16 @@ class VoronoiPipelineMixin:
                 n_grad += 1
         self._voronoi_prev_components = comp_per_cell.tolist()
 
+        # Spatial-connectivity refinement: a cell-based fragment id
+        # binds particles that may have flown apart since impact.  For
+        # each cell-component, run a particle-level connected-component
+        # pass in *current* world space so a chunk that drifts away
+        # from the main mass gets its own fragment id (and hence its
+        # own colour in the renderer).  IDs are stabilised across
+        # frames via majority-overlap inheritance with the previous
+        # frame's labels.
+        per_particle = self._spatial_split_fragments(per_particle)
+
         labels = torch.from_numpy(per_particle).to(
             self.x_mpm.device, dtype=torch.long)
         if labels.shape[0] == self.x_mpm.shape[0]:
@@ -235,6 +247,120 @@ class VoronoiPipelineMixin:
             n_components = int(per_particle.max() + 1) if per_particle.size else 1
             print(f"  [Voronoi] {n_grad} cells graduated this frame "
                   f"(components={n_components})")
+
+    @torch.no_grad()
+    def _spatial_split_fragments(self, per_particle: np.ndarray) -> np.ndarray:
+        """Refine cell-based fragment ids with a particle-level CC pass.
+
+        A Voronoi cell is fixed at tessellation time, but its
+        particles may drift apart afterwards (e.g. a chunk detaches
+        and flies up while the rest of its cell stays on the floor).
+        Without refinement they keep the same fragment id and render
+        with the same colour, which reads as "a small piece floating
+        is the same fragment as the main body".
+
+        For each unique fragment id we build a kd-tree on the
+        particles' current positions and union-find groups within
+        ``eps``; each spatially-disjoint sub-component gets a fresh
+        fragment id.  Cluster ids are stabilised across frames via
+        majority-overlap inheritance with the previous frame's labels
+        (so a fragment keeps its render colour as long as ≥ 50% of
+        its particles came from the same prior id).  Cost is
+        O(N log N) per frame; tolerable at ≤ 50K particles.
+        """
+        from scipy.spatial import cKDTree
+        if per_particle.size == 0 or self.x_mpm is None:
+            return per_particle
+        positions = self.x_mpm.detach().cpu().numpy()
+        if positions.shape[0] != per_particle.size:
+            return per_particle
+        bbox_diag = float(np.linalg.norm(
+            positions.max(axis=0) - positions.min(axis=0)))
+        eps = float(self.fracture_cfg.get(
+            'voronoi_spatial_split_eps_frac', 0.025)) * bbox_diag
+        if eps <= 0.0:
+            return per_particle
+
+        # Pass 1: spatial-CC produces a *temporary* sub-id per
+        # particle, unique within this frame but not yet stabilised.
+        temp = np.zeros_like(per_particle)
+        next_temp = 1
+        for old_fid in np.unique(per_particle):
+            mask = per_particle == old_fid
+            idxs = np.where(mask)[0]
+            if idxs.size <= 1:
+                temp[idxs] = next_temp
+                next_temp += 1
+                continue
+            pts = positions[idxs]
+            kdt = cKDTree(pts)
+            parent = np.arange(idxs.size, dtype=np.int64)
+
+            def find(x: int) -> int:
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            for a, b in kdt.query_pairs(eps, output_type='ndarray'):
+                ra, rb = find(int(a)), find(int(b))
+                if ra != rb:
+                    parent[ra] = rb
+            roots = np.array([find(i) for i in range(idxs.size)],
+                             dtype=np.int64)
+            for r in np.unique(roots):
+                rmask = roots == r
+                if rmask.sum() <= 0:
+                    continue
+                temp[idxs[rmask]] = next_temp
+                next_temp += 1
+
+        # Pass 2: stabilise.  Inherit each new cluster's id from its
+        # majority overlap with the previous frame's labels; clusters
+        # without a sufficient overlap get fresh ids.
+        prev = getattr(self, '_spatial_split_prev_labels', None)
+        if prev is None or prev.shape != temp.shape:
+            self._spatial_split_prev_labels = temp.copy()
+            self._spatial_split_next_id = int(temp.max()) + 1
+            return temp
+
+        next_id = int(getattr(self, '_spatial_split_next_id',
+                              int(prev.max()) + 1))
+        used_ids: set = set()
+        cluster_to_final: Dict[int, int] = {}
+        # Process new clusters in size-descending order so the largest
+        # gets first claim on its preferred id (avoids two large new
+        # clusters fighting over the same prev-id).
+        cluster_ids, cluster_sizes = np.unique(temp, return_counts=True)
+        order = np.argsort(-cluster_sizes)
+        for ci in order:
+            cid = int(cluster_ids[ci])
+            mask = temp == cid
+            n_in = int(mask.sum())
+            if n_in == 0:
+                continue
+            prev_in = prev[mask]
+            uniq_prev, counts = np.unique(prev_in, return_counts=True)
+            best_idx = int(np.argmax(counts))
+            best_prev = int(uniq_prev[best_idx])
+            best_share = float(counts[best_idx] / max(n_in, 1))
+            inherit = (best_share >= 0.5
+                       and best_prev > 0
+                       and best_prev not in used_ids)
+            if inherit:
+                cluster_to_final[cid] = best_prev
+                used_ids.add(best_prev)
+            else:
+                cluster_to_final[cid] = next_id
+                used_ids.add(next_id)
+                next_id += 1
+
+        refined = np.zeros_like(temp)
+        for cid, fin_id in cluster_to_final.items():
+            refined[temp == cid] = fin_id
+        self._spatial_split_prev_labels = refined.copy()
+        self._spatial_split_next_id = next_id
+        return refined
 
     # ------------------------------------------------------------------
     # Mode-I bond opening (Griffith-bounded)
