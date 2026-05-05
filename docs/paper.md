@@ -46,48 +46,45 @@ The mechanical fracture pipeline is the supporting infrastructure
 that makes (1) and (2) physically faithful; it is not claimed as
 the headline contribution.
 
-## Abstract (~250 words)
+## Abstract (LOCKED — submission version)
 
-> We present **Sentence to Shatter**, the first language-conditioned
-> brittle fracture animation system on 3D Gaussian Splat scenes.
-> Given a natural-language description (e.g., *"soda-lime glass
-> object completely pulverized into hundreds of tiny shards"* or
-> *"vulcanized rubber object under localized impact"*), our system
-> produces physically-faithful fracture animation directly on the
-> input splat manifold, with material behaviour and crack morphology
-> independently driven by the prompt.
->
-> **Sentence conditioning operates through two orthogonal learned
-> channels.**  A CLIP–MaterialDB nearest-neighbour lookup recovers
-> the body's material physics ($E$, $G_c$, $\nu$, family bounds);
-> a learned StyleHead MLP selects among five canonical crack
-> morphologies (radial shatter, spiderweb branching, single smooth,
-> chunky crumble, diffuse microcrack).  The two channels are
-> independent: the material prior knows nothing of crack style, and
-> the style head knows nothing of Young's modulus.  Adversarial
-> prompts mixing material and style ("rubber that shatters into
-> glass shards") cleanly dissociate them — a property that a single
-> CLIP–LUT cannot represent.
->
-> **The fracture mechanics operate natively on the splat substrate.**
-> No mesh-to-grid retraining or tetrahedralisation is required: the
-> input Gaussians are sampled into a shared MPM grid, partitioned at
-> impact into a Voronoi cell-and-bond network, advanced by stress-
-> wave-gated bond breakage, and released by Griffith-bounded Mode-I
-> kicks
-> $v_{\mathrm{open}}=\sqrt{G_c\,A_{\mathrm{bond}}/m_{\mathrm{cell}}}$
-> — energy-conserving by construction, so falling motion dominates
-> the visible animation rather than ad-hoc release impulses.  An
-> impact-energy factor $k_e$ scales the entire cascade with monomial
-> exponents derived from a shared KE-to-fracture-area budget, so
-> there is no per-scene parameter retuning across drop heights or
-> impulse sources.  A per-frame spatial connected-components pass
-> with majority-overlap inheritance keeps render fragments clean and
-> temporally stable.
->
-> We export per-frame state as Houdini-native geometry for path-
-> traced Karma rendering, and validate across multiple impact-energy
-> regimes and material families.
+```latex
+\begin{abstract}
+We address the problem of controlling material-dependent fracture
+animations in 3D Gaussian Splat scenes from natural-language prompts.
+The same instruction to ``break'' should produce different crack
+patterns, fragment distributions, and damage behaviors for glass,
+concrete, and rubber, depending on material properties and impact
+conditions.  However, recent 3DGS dynamics and fracture methods do
+not expose such fracture behavior as a directly prompt-controllable
+interface.  We propose a splat-compatible framework that translates
+natural-language material and fracture descriptions into material-
+constrained fracture controls.
+
+Our key idea is to decompose each prompt into physical feasibility
+and morphological bias.  The physics channel uses CLIP--MaterialDB
+retrieval to estimate material properties and family constraints,
+defining the feasible fracture response.  The morphology channel
+uses a learned StyleHead MLP to predict controls for crack seeding,
+anisotropy, and breakage biases.  Thus, morphology does not override
+material response; it modulates crack and fragment patterns within
+the regime allowed by the material channel.  This separation keeps
+the two roles disentangled under conflicting prompts, such as rubber
+described with glass-like shattering.
+
+The controls are realized as 3DGS fracture animations without mesh
+reconstruction or tetrahedralization.  Input Gaussians become
+Gaussian-derived particles integrated on a shared MPM grid.  At
+impact, we construct a Voronoi cell-and-bond network adapted to
+impact location and energy, and use a Griffith energy budget to
+limit normal bond opening within material-imposed bounds.  Through
+visual comparisons against reference fracture imagery, comparisons
+with related 3DGS fracture methods, dual-channel ablations, and
+fragment statistics, we show material-distinct and prompt-controllable
+3DGS fracture behaviors across materials, morphologies, conflicts,
+and impact conditions.
+\end{abstract}
+```
 
 ## Pipeline (overview)
 

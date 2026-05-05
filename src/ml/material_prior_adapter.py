@@ -554,8 +554,13 @@ SENTENCE_STYLE_RULES = (
             # omega changes survive.  scale=0.05 + tumble=0.20 gives a
             # measured horizontal slide and a clear sideways roll for
             # the intact base remnant.
-            "manifold.unified_impact_impulse_scale": 0.05,
-            "manifold.unified_impact_tumble_scale": 0.20,
+            # Calmer impact-frame defaults propagated from
+            # complete_pulverization (v25e calmer-x3).  Frame-1
+            # stacking of rigid impulse + per-bond Mode-I kick was
+            # reading as a "pop"; the per-bond Mode-I gain dominates,
+            # so we drop it together with the rigid impulse.
+            "manifold.unified_impact_impulse_scale": 0.003,
+            "manifold.unified_impact_tumble_scale": 0.012,
             # Griffith stress-driven fragment release: per-particle KE
             # injection at fragment graduation, magnitude proportional
             # to sqrt(principal stress), direction along the principal
@@ -581,8 +586,9 @@ SENTENCE_STYLE_RULES = (
             # rubber inherit reduced scatter without retuning the style.
             # Lateral scatter — radial_shatter is the pre-pulverization
             # tier so spread is significant but less than full pulverize.
-            "manifold.fragment_release_v_com_gain": 20.0,
+            "manifold.fragment_release_v_com_gain": 6.0,
             "manifold.fragment_physical_max_speed": 50.0,
+            "manifold.fragment_release_position_offset": 0.012,
             # Voronoi pre-fracture: partial pulverization for radial_shatter.
             "manifold.voronoi_enable": True,
             "manifold.voronoi_n_cells": 80,
@@ -616,11 +622,20 @@ SENTENCE_STYLE_RULES = (
             "explode into dust", "exploded into hundreds",
             "exploding into hundreds of tiny shards",
             "obliterate", "obliterated", "totally shattered",
+            # Extended for ultra-brittle / high-cell-count prompts.
+            "thousands of fine", "thousands of tiny", "thousands of shards",
+            "fine glittering", "fine glittering shards", "fine shards",
+            "exploding into thousands", "ultra-brittle",
+            "instantly pulverized", "pulverized into a fine",
+            "into glass-like dust", "fine dust",
         ),
         "priority_tokens": (
             "pulverize", "pulverized", "ultra shatter",
             "shattered to dust", "exploded into hundreds",
             "totally shattered", "obliterated",
+            "thousands of fine", "thousands of tiny",
+            "exploding into thousands", "ultra-brittle",
+            "instantly pulverized", "fine glittering",
         ),
         "fracture_mult": {
             "tau_init": 0.78,            # easier to start cracks
@@ -787,6 +802,22 @@ SENTENCE_STYLE_RULES = (
             "manifold.open_crack_release_threshold": 0.36,
             "manifold.brittle_release_intensity": 1.35,
             "manifold.impact_release_gain": 1.18,
+            # Voronoi pre-fracture: chunky cells, fewer than full
+            # pulverization but more than single_smooth.  Concrete
+            # crumbling into rough fragments under impact lives here.
+            "manifold.voronoi_enable": True,
+            "manifold.voronoi_n_cells": 100,
+            "manifold.voronoi_seed_distribution": "impact_biased",
+            "manifold.voronoi_bond_break_threshold": 0.25,
+            "manifold.voronoi_bond_aging_per_frame": 0.0,
+            "manifold.voronoi_impact_shock_radius": 0.06,
+            "manifold.voronoi_wave_speed_per_frame": 0.020,
+            "manifold.voronoi_force_shrink_max_frac": 0.20,
+            "manifold.fragment_release_position_offset": 0.012,
+            "manifold.fragment_release_v_com_gain": 6.0,
+            "manifold.fragment_physical_max_speed": 30.0,
+            "manifold.unified_impact_impulse_scale": 0.003,
+            "manifold.unified_impact_tumble_scale": 0.012,
         },
     },
     {
@@ -1602,7 +1633,16 @@ class MaterialPriorAdapter:
         bound for fracture: even if the sentence asks for radial
         cracks, a steel/metal prompt produces no fragments because the
         material does not brittle-fracture under the simulated impact.
+
+        Ablation: setting ``FRACTURE_GS_DISABLE_FAMILY_CLAMP=1`` skips
+        this enforcement entirely, so the StyleHead's morphology
+        request is allowed to drive the runtime even when the material
+        physics says otherwise.  Used to *prove* the dual-channel
+        claim by showing how the system fails without the clamp.
         """
+        import os as _os
+        if _os.environ.get("FRACTURE_GS_DISABLE_FAMILY_CLAMP", "0") == "1":
+            return runtime
         if family != "neutral_reference":
             return runtime
         text_l = str(text or "").lower()
@@ -1622,6 +1662,18 @@ class MaterialPriorAdapter:
         out["manifold.shard_enable"] = False
         out["manifold.shard_count_scale"] = 0.0
         out["manifold.debris_motion_gain"] = 0.0
+        # Disable Voronoi pre-fracture pipeline as well — without this
+        # a sentence-style runtime can re-enable it (e.g., a "radial
+        # cracks" prompt sets voronoi_enable=True), and the Voronoi
+        # cell-bond network bypasses the ``successor_topk=0`` clamp
+        # because it operates outside the AT2 crack-front machinery.
+        # Metal/rubber/wood materials should produce zero fragments
+        # regardless of style channel.
+        out["manifold.voronoi_enable"] = False
+        out["manifold.voronoi_n_cells"] = 0
+        out["manifold.fragment_release_v_com_gain"] = 0.0
+        out["manifold.unified_impact_impulse_scale"] = 0.0
+        out["manifold.unified_impact_tumble_scale"] = 0.0
         return out
 
     @staticmethod
@@ -1695,7 +1747,19 @@ class MaterialPriorAdapter:
         Fragment labels are born only from crack-connected closure/ring logic.
         Family-level tip/branching caps are re-applied so style overrides
         cannot push them outside the family envelope.
+
+        Ablation: setting ``FRACTURE_GS_DISABLE_FAMILY_CLAMP=1`` skips
+        this enforcement entirely, letting the StyleHead's runtime
+        (e.g., from ``complete_pulverization``) take effect even on a
+        non-fragment-capable family like rubber/diffuse_damage.  Used
+        to *prove* the dual-channel hierarchy claim: with the clamp
+        disabled, "rubber shattering into glass-like shards" produces
+        broken-rubber output that is non-physical, demonstrating that
+        the clamp is what enforces material-physics priority.
         """
+        import os as _os
+        if _os.environ.get("FRACTURE_GS_DISABLE_FAMILY_CLAMP", "0") == "1":
+            return dict(runtime)
         out = dict(runtime)
         family_name = str(family or "neutral_reference")
         if family_name not in FRAGMENT_CAPABLE_FAMILIES:
@@ -1705,6 +1769,17 @@ class MaterialPriorAdapter:
             out["manifold.shard_enable"] = False
             out["manifold.shard_count_scale"] = 0.0
             out["manifold.debris_motion_gain"] = 0.0
+            # Hard-disable the Voronoi pre-fracture pipeline as well.
+            # Without this a sentence-style runtime that requested
+            # ``voronoi_enable=True`` (e.g. complete_pulverization)
+            # would still partition a rubber body into hundreds of
+            # cells and produce broken-rubber output that contradicts
+            # the diffuse_damage family's material physics.
+            out["manifold.voronoi_enable"] = False
+            out["manifold.voronoi_n_cells"] = 0
+            out["manifold.fragment_release_v_com_gain"] = 0.0
+            out["manifold.unified_impact_impulse_scale"] = 0.0
+            out["manifold.unified_impact_tumble_scale"] = 0.0
             out = MaterialPriorAdapter._apply_family_runtime_caps(out, family_name)
             return out
 
@@ -1871,6 +1946,7 @@ class MaterialPriorAdapter:
         self,
         topk_materials: Sequence[MaterialEntry],
         weights: Sequence[float],
+        text: str | None = None,
     ) -> Dict[str, object]:
         pairs = list(zip(topk_materials, weights))
         scores = {family: 0.0 for family in FAMILY_NAMES}
@@ -1891,6 +1967,28 @@ class MaterialPriorAdapter:
             family = "diffuse_damage"
         if family == "diffuse_damage" and scores["sharp_brittle"] + scores["brittle_moderate"] > 0.62:
             family = "brittle_moderate"
+
+        # Material-token override.  When the prompt contains an explicit
+        # material noun (e.g., "rubber", "wood", "steel") we trust that
+        # token over the weighted top-K vote.  Without this override an
+        # adversarial prompt like "vulcanized rubber shattering into
+        # glass-like shards" routes to brittle_moderate because four of
+        # the five top-K entries are glass — the explicit "rubber" word
+        # gets out-voted, and the dual-channel hierarchy claim breaks.
+        if text:
+            text_l = text.lower()
+            material_overrides = (
+                (("rubber", "vulcanized", "elastomer", "silicone",
+                  "foam", "sponge", "gel", "putty"), "diffuse_damage"),
+                (("steel", "iron", "titanium", "aluminum", "alloy",
+                  "metal", "copper", "brass", "bronze"), "neutral_reference"),
+                (("wood", "timber", "plywood", "oak", "pine",
+                  "balsa", "bamboo"), "neutral_reference"),
+            )
+            for tokens, override_family in material_overrides:
+                if any(tok in text_l for tok in tokens):
+                    family = override_family
+                    break
         return {
             "family": family,
             "scores": scores,
@@ -2009,7 +2107,7 @@ class MaterialPriorAdapter:
         adjusted_scores = scores_np + hint_logits
         weights = self.normalize_scores(adjusted_scores)
         physics = self.build_physics_prior(entries, weights)
-        family_prior = self.build_family_prior(entries, weights)
+        family_prior = self.build_family_prior(entries, weights, text=text)
         family = family_prior["family"]
         fracture = self.build_fracture_prior(entries, weights, physics, family)
         dominant_category = self.dominant_category(entries, weights)
