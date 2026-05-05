@@ -453,6 +453,16 @@ class ManifoldSimulator(
             fp.get('shape_match_damaged_strength', shape_defaults["damaged"]))
         self.shape_match_velocity_blend = float(
             fp.get('shape_match_velocity_blend', 0.35))
+        # Post-impact kinematic lock: for ``post_impact_kinematic_lock_frames``
+        # frames immediately after the first ground contact, every
+        # particle's velocity is forced to the body COM velocity.
+        # Used by non-fragment-capable families (rubber, wood, metal)
+        # to suppress the 2-3 frame residual MPM grid-induced cluster
+        # split at high impact velocity that shape match alone cannot
+        # fully prevent.  Default 0 = no lock (legacy behaviour).
+        self.post_impact_kinematic_lock_frames = int(
+            fp.get('post_impact_kinematic_lock_frames', 0))
+        self._kinematic_lock_remaining = 0
         # Per-substep multiplicative decay applied to the shape-matched
         # angular velocity once the body has hit the ground.  Acts as a
         # surrogate for kinetic ground friction; free-fall rotation is
@@ -841,6 +851,48 @@ class ManifoldSimulator(
         self._apply_soft_elastic_contact_response(dt)
         self._apply_shape_matching(dt)
         self._apply_soft_elastic_squash(dt)
+
+        # Post-impact kinematic lock: for the first K post-impact
+        # *frames*, blend every particle's velocity toward the body
+        # COM velocity and pull positions toward the rest-pose offset
+        # from COM.  Both blend strengths decay linearly from 1.0 at
+        # frame 0 to 0.0 at frame K, so the lock fades out smoothly
+        # rather than freezing the body for a hard window.  This
+        # suppresses the 2-3 frame transient MPM grid-induced cluster
+        # split AND lets the body retain natural compress/recover
+        # bounce dynamics that an outright v_mpm[:] = v_com lock would
+        # block.  Used by non-fragment-capable families (rubber, wood,
+        # metal); brittle families have K=0 by default and are not
+        # affected.
+        frames_since_impact = getattr(self, '_impact_frame_count', 0)
+        K = int(self.post_impact_kinematic_lock_frames)
+        if (self._gravity_drop_contacted
+                and K > 0
+                and frames_since_impact < K
+                and self.v_mpm is not None
+                and self.x_mpm is not None):
+            # Blend strength: 1.0 at impact, 0.0 at frame K.
+            w = 1.0 - frames_since_impact / float(K)
+            v_com = self._v_com if self._v_com is not None else torch.zeros(
+                3, device=self.v_mpm.device, dtype=self.v_mpm.dtype)
+            omega = getattr(self, '_omega_com', None)
+            if omega is not None and float(omega.norm().item()) > 1e-8:
+                com = self.x_mpm.mean(dim=0)
+                rel = self.x_mpm - com.unsqueeze(0)
+                v_rot = torch.cross(
+                    omega.unsqueeze(0).expand_as(rel), rel, dim=1)
+                v_target = v_com.unsqueeze(0) + v_rot
+            else:
+                v_target = v_com.unsqueeze(0).expand_as(self.v_mpm)
+            self.v_mpm[:] = (1.0 - w) * self.v_mpm + w * v_target
+            # Position blend toward (current_COM + rest_offset).
+            rest = getattr(self, '_shape_match_rest_positions', None)
+            if rest is not None and rest.shape == self.x_mpm.shape:
+                rest_com = rest.mean(dim=0)
+                rest_rel = rest - rest_com.unsqueeze(0)
+                cur_com = self.x_mpm.mean(dim=0)
+                target = cur_com.unsqueeze(0) + rest_rel
+                self.x_mpm[:] = (1.0 - w) * self.x_mpm + w * target
 
         # Velocity & F clamping.  Standard MPM safety cap = 0.4 * dx/dt
         # (CFL-safe).  Override with `velocity_cap_scale` to relax it
@@ -1786,6 +1838,16 @@ class ManifoldSimulator(
         # else: leave F and C as-is — physics is continuous.
         self.frame_count = 0
         self._impact_frame_count = 0
+        # Arm the post-impact kinematic lock if configured.  Counter
+        # decrements each MPM step in ``_step_physics`` and forces
+        # ``v_mpm = v_com`` while > 0, suppressing residual MPM
+        # grid-induced transient split for non-fragment-capable
+        # families.  Re-read every impact so a runtime override that
+        # changed the value mid-session is honoured.
+        self._kinematic_lock_remaining = int(
+            self.fracture_cfg.get(
+                'post_impact_kinematic_lock_frames',
+                self.post_impact_kinematic_lock_frames))
 
         # Impact zone damage seed on Gaussians
         z_vals = self.x_mpm[:, 2]

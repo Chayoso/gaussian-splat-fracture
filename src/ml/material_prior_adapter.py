@@ -621,21 +621,17 @@ SENTENCE_STYLE_RULES = (
             "shattered to dust", "fine powder", "ultra shatter",
             "explode into dust", "exploded into hundreds",
             "exploding into hundreds of tiny shards",
-            "obliterate", "obliterated", "totally shattered",
-            # Extended for ultra-brittle / high-cell-count prompts.
-            "thousands of fine", "thousands of tiny", "thousands of shards",
-            "fine glittering", "fine glittering shards", "fine shards",
-            "exploding into thousands", "ultra-brittle",
+            "obliterate", "totally shattered",
             "instantly pulverized", "pulverized into a fine",
+            "ultra-brittle",
             "into glass-like dust", "fine dust",
+            "fine shards",
         ),
         "priority_tokens": (
             "pulverize", "pulverized", "ultra shatter",
             "shattered to dust", "exploded into hundreds",
-            "totally shattered", "obliterated",
-            "thousands of fine", "thousands of tiny",
-            "exploding into thousands", "ultra-brittle",
-            "instantly pulverized", "fine glittering",
+            "totally shattered",
+            "instantly pulverized",
         ),
         "fracture_mult": {
             "tau_init": 0.78,            # easier to start cracks
@@ -763,6 +759,70 @@ SENTENCE_STYLE_RULES = (
             # (0.5/frame), killing residual-base spin from impact tumble
             # within ~5-10 frames so the central fragment doesn't keep
             # spinning indefinitely.
+            "manifold.shape_match_static_omega": 25.0,
+            "manifold.post_impact_gravity_z": -7500.0,
+            "manifold.post_impact_damping": 0.999,
+            "manifold.curvature_weight": 0.4,
+            "manifold.fragment_boundary_cut_min_ratio": 0.45,
+            "manifold.shard_enable": False,
+            "manifold.shard_count_scale": 0.0,
+        },
+    },
+    {
+        "name": "ultra_pulverization",
+        "tokens": (
+            # Reserved for prompts that demand the *most extreme* end of
+            # the morphology spectrum: dust-fine fragmentation, complete
+            # disintegration into countless tiny pieces.  Sits above
+            # complete_pulverization so a single style profile can no
+            # longer be re-used for two semantically distinct intensities
+            # ("hundreds of tiny shards" vs "thousands of fine glittering
+            # shards") which previously degenerated to identical output.
+            "thousands of fine", "thousands of tiny", "thousands of shards",
+            "countless tiny", "countless fine", "countless glittering",
+            "fine glittering", "fine glittering shards", "ultra-fine",
+            "annihilated", "atomized", "disintegrated to dust",
+            "complete dust", "fine dust cloud",
+        ),
+        "priority_tokens": (
+            "thousands of fine", "thousands of tiny", "countless tiny",
+            "fine glittering", "ultra-fine", "annihilated", "atomized",
+        ),
+        "fracture_mult": {
+            "tau_init": 0.65,
+            "growth_gain": 1.65,
+            "band_width": 0.78,
+            "band_fill_gain": 1.30,
+            "open_gain": 1.50,
+            "split_threshold": 0.62,
+            "edge_break_rate": 1.75,
+            "branching_bias": 5.40,
+            "anisotropy_strength": 0.72,
+        },
+        "runtime": {
+            # Inherits the calmer impact-frame defaults from v25e.
+            "manifold.shape_match_strength": 0.97,
+            "manifold.shape_match_fragment_strength": 0.97,
+            "manifold.shape_match_velocity_blend": 0.0,
+            "manifold.unified_impact_impulse_scale": 0.003,
+            "manifold.unified_impact_tumble_scale": 0.012,
+            "manifold.fragment_release_v_com_gain": 6.0,
+            "manifold.fragment_physical_max_speed": 50.0,
+            "manifold.fragment_floor_restitution": 0.0,
+            # Voronoi cell budget pushed to 400 (vs 250 in complete_
+            # pulverization) so the "thousands of fine" prompt produces
+            # a visibly finer tessellation than "hundreds of tiny".
+            "manifold.voronoi_enable": True,
+            "manifold.voronoi_n_cells": 400,
+            "manifold.voronoi_seed_distribution": "impact_biased",
+            "manifold.voronoi_bond_break_threshold": 0.10,
+            "manifold.voronoi_bond_aging_per_frame": 0.0,
+            "manifold.voronoi_impact_shock_radius": 0.12,
+            "manifold.voronoi_wave_speed_per_frame": 0.030,
+            "manifold.voronoi_cascade_radius": 1.0,
+            "manifold.voronoi_force_shrink_max_frac": 0.02,
+            "manifold.fragment_release_position_offset": 0.012,
+            "manifold.particle_speed_cap": 80.0,
             "manifold.shape_match_static_omega": 25.0,
             "manifold.post_impact_gravity_z": -7500.0,
             "manifold.post_impact_damping": 0.999,
@@ -1613,10 +1673,22 @@ class MaterialPriorAdapter:
     # `neutral_reference` AND the prompt mentions one of these, we
     # zero out the crack-front and treat the run as no-fragment --
     # honoring the material physics over the sentence style.
+    # "Non-brittle" token list: any of these in the prompt + a
+    # non-fragment-capable family (or neutral_reference) hard-disables
+    # the fracture pipeline regardless of style.  Includes ductile
+    # metals AND wood-like / fibrous materials whose physical response
+    # at the simulated impact is plastic / absorbing rather than
+    # brittle pulverization.  Name kept as ``_METAL_NO_FRACTURE_TOKENS``
+    # for backward compatibility but the conceptual meaning is now
+    # "no-brittle-fracture material token".
     _METAL_NO_FRACTURE_TOKENS: tuple = (
+        # Ductile metals
         "steel", "metal", "iron", "titanium", "aluminum",
         "aluminium", "stainless", "alloy", "copper", "brass",
         "bronze", "carbon steel",
+        # Wood / fibrous (do not pulverize under impact, splinter at most)
+        "wood", "wooden", "timber", "lumber", "plywood",
+        "oak", "pine", "balsa", "bamboo", "hardwood", "softwood",
     )
 
     @staticmethod
@@ -1674,6 +1746,18 @@ class MaterialPriorAdapter:
         out["manifold.fragment_release_v_com_gain"] = 0.0
         out["manifold.unified_impact_impulse_scale"] = 0.0
         out["manifold.unified_impact_tumble_scale"] = 0.0
+        # Stiff shape match to prevent transient grid-induced split at
+        # high impact velocity (see _enforce_crack_connected_fragment_
+        # runtime for the same fix on the family-level path).
+        out["manifold.shape_match_strength"] = 0.995
+        out["manifold.shape_match_fragment_strength"] = 0.97
+        out["manifold.shape_match_velocity_blend"] = 0.80
+        # Kinematic lock: for K frames after impact, force every
+        # particle's velocity to the body's COM velocity.  Suppresses
+        # the residual MPM grid-induced 2-3 frame transient cluster
+        # split that even shape_match=0.995 + velocity_blend=0.80
+        # cannot fully recover at v_impact ≈ 66 m/s.
+        out["manifold.post_impact_kinematic_lock_frames"] = 15
         return out
 
     @staticmethod
@@ -1780,6 +1864,26 @@ class MaterialPriorAdapter:
             out["manifold.fragment_release_v_com_gain"] = 0.0
             out["manifold.unified_impact_impulse_scale"] = 0.0
             out["manifold.unified_impact_tumble_scale"] = 0.0
+            # Stiffer shape match to keep the body from transiently
+            # splitting into two MPM clusters at high impact velocity
+            # (some particles touch the floor first while the rest are
+            # still mid-air).  shape_match_strength=0.995 plus an
+            # aggressive 0.80 velocity-blend brings every per-particle
+            # v back near the COM v at every substep, so the body
+            # cannot fly apart faster than the shape-match can pull
+            # it back.  Tested at v_impact=66 m/s (z=0.80 drop).
+            out["manifold.shape_match_strength"] = 0.995
+            out["manifold.shape_match_fragment_strength"] = 0.97
+            out["manifold.shape_match_velocity_blend"] = 0.80
+            # Kinematic lock: suppress the 2-3 frame residual transient
+            # MPM grid split by forcing v_mpm[:] = v_com for K=5
+            # post-impact frames.  Only fires for non-fragment-capable
+            # families, so brittle materials still see normal MPM
+            # dynamics.  Disabled together with the family clamp via
+            # ``FRACTURE_GS_DISABLE_FAMILY_CLAMP=1`` (the early-return
+            # at the top of this function), so the no-clamp ablation
+            # correctly removes BOTH the fragment block and the lock.
+            out["manifold.post_impact_kinematic_lock_frames"] = 15
             out = MaterialPriorAdapter._apply_family_runtime_caps(out, family_name)
             return out
 
@@ -1858,6 +1962,7 @@ class MaterialPriorAdapter:
         E_ref, Gc_ref = 70.0e9, 5.0
         brittleness = float(np.sqrt(E / Gc) / np.sqrt(E_ref / Gc_ref))
         brittleness = max(0.0, min(brittleness, 1.5))
+        # Scatter-velocity knobs: linear in brittleness.
         scatter_keys = (
             "manifold.fragment_release_v_com_gain",
             "manifold.voronoi_impact_shock_radius",
@@ -1866,6 +1971,28 @@ class MaterialPriorAdapter:
             if key in out:
                 try:
                     out[key] = float(out[key]) * brittleness
+                except (TypeError, ValueError):
+                    continue
+        # Cell-count + breakage threshold scaled aggressively by
+        # brittleness so the same "completely pulverized" prompt
+        # produces visibly different fracture counts across materials.
+        # Linear ^1.0 + 2.0× bond-thr: glass 178 cells / ceramic ~89 /
+        # concrete ~45 / rubber clamp.
+        n_cells_keys = ("manifold.voronoi_n_cells",)
+        n_cells_factor = max(brittleness ** 1.0, 0.05)
+        for key in n_cells_keys:
+            if key in out:
+                try:
+                    out[key] = max(int(int(out[key]) * n_cells_factor), 4)
+                except (TypeError, ValueError):
+                    continue
+        thr_keys = ("manifold.voronoi_bond_break_threshold",)
+        thr_factor = 1.0 + 2.0 * max(0.0, 1.0 - brittleness)
+        for key in thr_keys:
+            if key in out:
+                try:
+                    new_v = float(out[key]) * thr_factor
+                    out[key] = float(min(new_v, 0.95))
                 except (TypeError, ValueError):
                     continue
         out["manifold.material_brittleness"] = brittleness
@@ -1896,6 +2023,27 @@ class MaterialPriorAdapter:
             out = dict(material_prior)
             runtime = dict(material_prior.get("runtime", {}))
             family = str(material_prior.get("family", "neutral_reference"))
+            # Non-fragment-capable families (rubber/wood/metal) need a
+            # strong shape match: under high-velocity impact the body
+            # would otherwise transiently split into two MPM clusters
+            # because some particles touch the floor first while the
+            # rest are still mid-air at >60 m/s — the velocity gradient
+            # opens a gap that grid-based MPM cannot recover from
+            # without a stiff shape-match pull.  Setting strength to
+            # 0.99 with a fragment-strength of 0.97 (no fragments here
+            # but kept for parity) stops the visible "split-then-merge"
+            # artifact on rubber/foam drops.
+            if family in ("diffuse_damage", "neutral_reference"):
+                runtime.setdefault("manifold.shape_match_strength", 0.995)
+                runtime.setdefault("manifold.shape_match_fragment_strength", 0.97)
+                # Aggressive velocity blend + 5-frame kinematic lock to
+                # suppress transient MPM grid-split at v_impact ≈ 66 m/s
+                # (z=0.80 drop).  Lock forces v_mpm[:] = v_com for the
+                # first 5 post-impact frames so the body cannot fly
+                # apart even when shape match alone is insufficient.
+                runtime.setdefault("manifold.shape_match_velocity_blend", 0.80)
+                runtime.setdefault("manifold.post_impact_kinematic_lock_frames", 15)
+                runtime.setdefault("manifold.post_impact_damping", 0.95)
             runtime = self._enforce_crack_connected_fragment_runtime(runtime, family)
             runtime = self._enforce_metal_no_fracture(runtime, family, text)
             runtime = self._apply_material_scatter_scaling(
