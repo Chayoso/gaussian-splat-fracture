@@ -497,6 +497,8 @@ class FragmentPhysicsMixin:
             return 0.0
 
         try:
+            # Procrustes: optimal R such that current ≈ rest @ R + COM.
+            # cov = rest^T @ current; SVD U Σ V^T ⇒ rot = U V^T.
             cov = rest_centered.transpose(0, 1) @ current_centered
             u, _, vh = torch.linalg.svd(cov)
             rot = u @ vh
@@ -504,6 +506,42 @@ class FragmentPhysicsMixin:
                 u = u.clone()
                 u[:, -1] *= -1.0
                 rot = u @ vh
+
+            # Optional Müller 2005 affine extension: optimal linear
+            # transform A that maps centered rest to centered current
+            # via least-squares.  Polar-decomposed via SVD into
+            # rotation × symmetric stretch.  T = (1-β)·R + β·A blends
+            # rigid (β=0) and full affine (β=1).
+            affine_blend = float(getattr(self, 'shape_match_affine_blend', 0.0))
+            affine_blend = max(0.0, min(affine_blend, 1.0))
+            if affine_blend > 0.0:
+                P_mat = current_centered.transpose(0, 1) @ rest_centered  # 3x3
+                Q_mat = rest_centered.transpose(0, 1) @ rest_centered     # 3x3
+                eye3 = torch.eye(3, device=Q_mat.device, dtype=Q_mat.dtype)
+                Q_reg = Q_mat + 1e-6 * eye3 * float(Q_mat.diag().abs().max())
+                A_col = P_mat @ torch.linalg.inv(Q_reg)  # column-form A
+                # Clamp singular values to prevent runaway stretch.
+                # SVD: A = U Σ V^T.  We clamp Σ to [0.78, 1.0] so
+                # deformation is COMPRESSION-ONLY (max 22% squash per
+                # axis, no expansion).  This is the correct rubber
+                # impact regime: bunny squashes when hitting floor,
+                # never stretches taller than rest.  Without this,
+                # the affine fit captures impact stretch (top falling
+                # while bottom held) and amplifies it each frame.
+                u_a, s_a, vh_a = torch.linalg.svd(A_col)
+                # Configurable SV clamp (default [0.78, 1.0]).  Lower
+                # min allows more dramatic per-axis squash (rubber-
+                # like elasticity).  max=1.0 forbids stretching past
+                # rest size to prevent vertical run-away.
+                sv_min = float(getattr(self, 'shape_match_sv_min', 0.78))
+                sv_max = float(getattr(self, 'shape_match_sv_max', 1.00))
+                s_a = torch.clamp(s_a, min=sv_min, max=sv_max)
+                A_col = u_a @ torch.diag(s_a) @ vh_a
+                # In code's row-form convention, target = rest @ R_row.
+                # A in row form is A_col.T (rest_row @ A_col.T = current_row).
+                A_row = A_col.transpose(0, 1)
+                # Blend rigid (rot) with affine (A_row).
+                rot = (1.0 - affine_blend) * rot + affine_blend * A_row
         except RuntimeError:
             return 0.0
 

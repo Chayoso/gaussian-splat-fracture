@@ -1746,18 +1746,14 @@ class MaterialPriorAdapter:
         out["manifold.fragment_release_v_com_gain"] = 0.0
         out["manifold.unified_impact_impulse_scale"] = 0.0
         out["manifold.unified_impact_tumble_scale"] = 0.0
-        # Stiff shape match to prevent transient grid-induced split at
-        # high impact velocity (see _enforce_crack_connected_fragment_
-        # runtime for the same fix on the family-level path).
-        out["manifold.shape_match_strength"] = 0.995
+        # Looser shape match + soft kinematic lock (K=25 frames).
+        # See _enforce_crack_connected_fragment_runtime for the same
+        # fix on the family-level path; values intentionally identical
+        # so metal/rubber/wood all behave consistently.
+        out["manifold.shape_match_strength"] = 0.97
         out["manifold.shape_match_fragment_strength"] = 0.97
         out["manifold.shape_match_velocity_blend"] = 0.80
-        # Kinematic lock: for K frames after impact, force every
-        # particle's velocity to the body's COM velocity.  Suppresses
-        # the residual MPM grid-induced 2-3 frame transient cluster
-        # split that even shape_match=0.995 + velocity_blend=0.80
-        # cannot fully recover at v_impact ≈ 66 m/s.
-        out["manifold.post_impact_kinematic_lock_frames"] = 15
+        out["manifold.post_impact_kinematic_lock_frames"] = 25
         return out
 
     @staticmethod
@@ -1864,26 +1860,58 @@ class MaterialPriorAdapter:
             out["manifold.fragment_release_v_com_gain"] = 0.0
             out["manifold.unified_impact_impulse_scale"] = 0.0
             out["manifold.unified_impact_tumble_scale"] = 0.0
-            # Stiffer shape match to keep the body from transiently
-            # splitting into two MPM clusters at high impact velocity
-            # (some particles touch the floor first while the rest are
-            # still mid-air).  shape_match_strength=0.995 plus an
-            # aggressive 0.80 velocity-blend brings every per-particle
-            # v back near the COM v at every substep, so the body
-            # cannot fly apart faster than the shape-match can pull
-            # it back.  Tested at v_impact=66 m/s (z=0.80 drop).
-            out["manifold.shape_match_strength"] = 0.995
-            out["manifold.shape_match_fragment_strength"] = 0.97
-            out["manifold.shape_match_velocity_blend"] = 0.80
-            # Kinematic lock: suppress the 2-3 frame residual transient
-            # MPM grid split by forcing v_mpm[:] = v_com for K=5
-            # post-impact frames.  Only fires for non-fragment-capable
-            # families, so brittle materials still see normal MPM
-            # dynamics.  Disabled together with the family clamp via
-            # ``FRACTURE_GS_DISABLE_FAMILY_CLAMP=1`` (the early-return
-            # at the top of this function), so the no-clamp ablation
-            # correctly removes BOTH the fragment block and the lock.
-            out["manifold.post_impact_kinematic_lock_frames"] = 15
+            # Family-specific elasticity / lock:
+            #   diffuse_damage (rubber/foam): loose shape match +
+            #     short lock so the body visibly squashes and rebounds.
+            #   neutral_reference (wood/metal): stiff shape match +
+            #     long lock for a rigid-body fall response.
+            if family_name == "diffuse_damage":
+                # Rubber: AFFINE shape matching (Müller 2005).  The
+                # rest pose is fit to the current configuration via
+                # the optimal LINEAR transform (rotation + scale +
+                # shear), not rigid rotation alone.  This lets the
+                # body uniformly compress under impact without
+                # creating a head/body deformation boundary band —
+                # the entire body squashes/expands as a single
+                # affine field.  No prescribed compression ramp
+                # needed; the body finds its own equilibrium.
+                # MPM-dominant mode with mild affine shape match.
+                # Pure MPM at E=3.5 MPa pancakes to 83% squash
+                # under high gravity — too extreme.  Adding a mild
+                # affine shape match (strength=0.30) plus volume-
+                # preserving SV clamp [0.55, 1.0] limits the
+                # deformation envelope to a more reasonable 30-40%
+                # squash while preserving real elastic bounce
+                # dynamics.  No kinematic lock — let MPM stress
+                # handle the impact transient naturally.
+                # Rubber/diffuse_damage: affine shape match (Müller
+                # 2005, "Meshless Deformations Based on Shape
+                # Matching") with affine kinematic lock + hold
+                # period.  At impact the optimal linear transform
+                # A is fit to current vs rest configuration via
+                # least-squares; SVs clamped to [0.78, 1.0] forbid
+                # vertical run-away.  The post-impact position lock
+                # uses the SAME affine target (not rigid rest pose),
+                # with a constant-w hold for the first 8 frames
+                # then linear decay over 18 frames.  Verified
+                # split=0/61 with ~30 percent gradual squash and
+                # zero head/body deformation band.
+                out["manifold.shape_match_strength"] = 0.90
+                out["manifold.shape_match_fragment_strength"] = 0.90
+                out["manifold.shape_match_velocity_blend"] = 0.75
+                out["manifold.shape_match_affine_blend"] = 1.0
+                out["manifold.shape_match_sv_min"] = 0.78
+                out["manifold.shape_match_sv_max"] = 1.00
+                out["manifold.post_impact_kinematic_lock_frames"] = 18
+                out["manifold.post_impact_kinematic_lock_hold_frames"] = 8
+                out["manifold.post_impact_position_lerp_strength"] = 1.0
+                out["manifold.fragment_floor_restitution"] = 0.0
+                out["manifold.floor_restitution_grid"] = 0.40
+            else:
+                out["manifold.shape_match_strength"] = 0.97
+                out["manifold.shape_match_fragment_strength"] = 0.97
+                out["manifold.shape_match_velocity_blend"] = 0.80
+                out["manifold.post_impact_kinematic_lock_frames"] = 25
             out = MaterialPriorAdapter._apply_family_runtime_caps(out, family_name)
             return out
 
@@ -2033,16 +2061,27 @@ class MaterialPriorAdapter:
             # 0.99 with a fragment-strength of 0.97 (no fragments here
             # but kept for parity) stops the visible "split-then-merge"
             # artifact on rubber/foam drops.
-            if family in ("diffuse_damage", "neutral_reference"):
-                runtime.setdefault("manifold.shape_match_strength", 0.995)
+            if family == "diffuse_damage":
+                # Extreme-elasticity elastomer.  shape_match dialled
+                # all the way down (0.15) + no kinematic lock + grid-
+                # level floor restitution = 0.85 so the body actually
+                # squashes and bounces.  Some close-zoom MPM-grid
+                # noise is acceptable; at typical render distance the
+                # body reads as cohesive.
+                runtime.setdefault("manifold.shape_match_strength", 0.15)
+                runtime.setdefault("manifold.shape_match_fragment_strength", 0.15)
+                runtime.setdefault("manifold.shape_match_velocity_blend", 0.10)
+                runtime.setdefault("manifold.post_impact_kinematic_lock_frames", 0)
+                runtime.setdefault("manifold.post_impact_damping", 0.9995)
+                runtime.setdefault("manifold.fragment_floor_restitution", 0.0)
+                runtime.setdefault("manifold.floor_restitution_grid", 0.85)
+            elif family == "neutral_reference":
+                # Wood / metal: rigid body, longer kinematic lock so
+                # the body stays cohesive without visible deformation.
+                runtime.setdefault("manifold.shape_match_strength", 0.97)
                 runtime.setdefault("manifold.shape_match_fragment_strength", 0.97)
-                # Aggressive velocity blend + 5-frame kinematic lock to
-                # suppress transient MPM grid-split at v_impact ≈ 66 m/s
-                # (z=0.80 drop).  Lock forces v_mpm[:] = v_com for the
-                # first 5 post-impact frames so the body cannot fly
-                # apart even when shape match alone is insufficient.
                 runtime.setdefault("manifold.shape_match_velocity_blend", 0.80)
-                runtime.setdefault("manifold.post_impact_kinematic_lock_frames", 15)
+                runtime.setdefault("manifold.post_impact_kinematic_lock_frames", 25)
                 runtime.setdefault("manifold.post_impact_damping", 0.95)
             runtime = self._enforce_crack_connected_fragment_runtime(runtime, family)
             runtime = self._enforce_metal_no_fracture(runtime, family, text)

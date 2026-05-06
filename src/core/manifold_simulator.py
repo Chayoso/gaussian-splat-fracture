@@ -453,6 +453,26 @@ class ManifoldSimulator(
             fp.get('shape_match_damaged_strength', shape_defaults["damaged"]))
         self.shape_match_velocity_blend = float(
             fp.get('shape_match_velocity_blend', 0.35))
+        # Affine shape matching (Müller et al. 2005, "Meshless
+        # Deformations Based on Shape Matching").  When > 0, the
+        # closest *rigid* rotation R is interpolated with the optimal
+        # *affine* transform A computed via least-squares fit:
+        #     A = (sum p_i q_i^T) (sum q_i q_i^T)^-1
+        # T = (1 - blend) * R + blend * A.  blend=0 reproduces the
+        # rigid Procrustes shape match (legacy).  blend=1 enables full
+        # affine deformation modes (uniform compression / shear /
+        # scaling) which lets a body squash isotropically without
+        # creating a head/body deformation band — necessary for
+        # rubber-like soft impact.  Brittle families keep blend=0
+        # so fragments stay rigid in flight.
+        self.shape_match_affine_blend = float(
+            fp.get('shape_match_affine_blend', 0.0))
+        # SV clamp for affine deformation: per-axis stretch limits.
+        # Defaults [0.78, 1.0] = 22% max squash, no vertical run-away.
+        self.shape_match_sv_min = float(
+            fp.get('shape_match_sv_min', 0.78))
+        self.shape_match_sv_max = float(
+            fp.get('shape_match_sv_max', 1.00))
         # Post-impact kinematic lock: for ``post_impact_kinematic_lock_frames``
         # frames immediately after the first ground contact, every
         # particle's velocity is forced to the body COM velocity.
@@ -625,6 +645,11 @@ class ManifoldSimulator(
         # disagree, and particles can tunnel below the visible
         # ground before being stopped at the domain bottom).
         self.mpm.ground_z = float(ground_z)
+        # Optional grid-level restitution: when > 0, the slip BC
+        # reflects v_z (-e * v_z) instead of zeroing it, so soft
+        # elastomers actually bounce off the floor at the grid level.
+        self.mpm.floor_restitution_grid = float(
+            self.fracture_cfg.get('floor_restitution_grid', 0.0))
         self._gravity_drop_contacted = False
         device = self.mpm.gravity.device
         self._v_com = torch.zeros(3, device=device)
@@ -848,9 +873,49 @@ class ManifoldSimulator(
             self.x_mpm, self.v_mpm, self.C, self.F = self.mpm.p2g2p(
                 self.x_mpm, self.v_mpm, self.C, self.F, stress)
 
+        # Floor position clamp: the slip BC only zeros grid v_z, it
+        # does not stop particles from drifting below ``ground_z``
+        # within a single MPM step at high impact velocity.  Without
+        # this clamp the body bisects across the floor (top half
+        # above, bottom half below) and reads as a 50/50 horizontal
+        # split.  We push every particle back to ``ground_z`` and zero
+        # its downward velocity component to be consistent with the
+        # slip BC.
+        if (self._gravity_drop_contacted
+                and self.x_mpm is not None
+                and self.v_mpm is not None):
+            ground_z = float(getattr(self, '_gravity_drop_ground_z', 0.0))
+            if ground_z > 0.0:
+                below = self.x_mpm[:, 2] < ground_z
+                if bool(below.any()):
+                    self.x_mpm[below, 2] = ground_z
+                    # Kill any lingering downward velocity (slip).
+                    v_z = self.v_mpm[below, 2]
+                    self.v_mpm[below, 2] = torch.where(
+                        v_z < 0.0, torch.zeros_like(v_z), v_z)
+
         self._apply_soft_elastic_contact_response(dt)
         self._apply_shape_matching(dt)
         self._apply_soft_elastic_squash(dt)
+
+        # Re-apply floor clamp after shape matching: the position lerp
+        # toward (cur_COM + rest_offset) can push particles below the
+        # ground when cur_COM has descended near the floor — exactly
+        # the case for non-fragment-capable bodies (rubber, wood)
+        # whose COM sits at floor level after impact.  Without this
+        # second clamp, the body bisects visually across the floor
+        # plane (top half above, bottom half below as a mirror).
+        if (self._gravity_drop_contacted
+                and self.x_mpm is not None
+                and self.v_mpm is not None):
+            ground_z = float(getattr(self, '_gravity_drop_ground_z', 0.0))
+            if ground_z > 0.0:
+                below = self.x_mpm[:, 2] < ground_z
+                if bool(below.any()):
+                    self.x_mpm[below, 2] = ground_z
+                    v_z = self.v_mpm[below, 2]
+                    self.v_mpm[below, 2] = torch.where(
+                        v_z < 0.0, torch.zeros_like(v_z), v_z)
 
         # Post-impact kinematic lock: for the first K post-impact
         # *frames*, blend every particle's velocity toward the body
@@ -871,8 +936,20 @@ class ManifoldSimulator(
                 and frames_since_impact < K
                 and self.v_mpm is not None
                 and self.x_mpm is not None):
-            # Blend strength: 1.0 at impact, 0.0 at frame K.
-            w = 1.0 - frames_since_impact / float(K)
+            # Blend strength: hold w=1.0 for first M frames, then
+            # linearly decay to 0.0 by frame K.  The hold suppresses
+            # the impact-transient deformation band that forms in
+            # the first ~5 frames after contact when bottom particles
+            # decelerate while top particles still fall.
+            hold_frames = int(self.fracture_cfg.get(
+                'post_impact_kinematic_lock_hold_frames', 0))
+            if frames_since_impact < hold_frames:
+                w = 1.0
+            else:
+                decay_progress = (
+                    (frames_since_impact - hold_frames)
+                    / max(float(K - hold_frames), 1.0))
+                w = max(0.0, 1.0 - decay_progress)
             v_com = self._v_com if self._v_com is not None else torch.zeros(
                 3, device=self.v_mpm.device, dtype=self.v_mpm.dtype)
             omega = getattr(self, '_omega_com', None)
@@ -885,14 +962,62 @@ class ManifoldSimulator(
             else:
                 v_target = v_com.unsqueeze(0).expand_as(self.v_mpm)
             self.v_mpm[:] = (1.0 - w) * self.v_mpm + w * v_target
-            # Position blend toward (current_COM + rest_offset).
-            rest = getattr(self, '_shape_match_rest_positions', None)
-            if rest is not None and rest.shape == self.x_mpm.shape:
-                rest_com = rest.mean(dim=0)
-                rest_rel = rest - rest_com.unsqueeze(0)
-                cur_com = self.x_mpm.mean(dim=0)
-                target = cur_com.unsqueeze(0) + rest_rel
-                self.x_mpm[:] = (1.0 - w) * self.x_mpm + w * target
+            # Position blend toward (current_COM + rest_offset),
+            # gated by ``post_impact_position_lerp_strength`` so that
+            # rubber-like materials (where visible compression is the
+            # whole point) can disable the position lock entirely
+            # while still benefiting from the velocity lock that
+            # suppresses MPM grid-split.  Default 1.0 = full position
+            # lerp (rigid wood/metal); set to 0.0 in runtime for
+            # diffuse_damage so the body can squash freely.
+            pos_lerp = float(self.fracture_cfg.get(
+                'post_impact_position_lerp_strength', 1.0))
+            if pos_lerp > 0.0:
+                rest = getattr(self, '_shape_match_rest_positions', None)
+                if rest is not None and rest.shape == self.x_mpm.shape:
+                    rest_com = rest.mean(dim=0)
+                    rest_rel = rest - rest_com.unsqueeze(0)
+                    cur_com = self.x_mpm.mean(dim=0)
+                    # When affine shape match is active, the lock
+                    # target must use the SAME affine transform A as
+                    # _shape_match_component (otherwise lock pulls
+                    # toward rigid rest pose and overrides affine).
+                    affine_blend = float(getattr(
+                        self, 'shape_match_affine_blend', 0.0))
+                    if affine_blend > 0.0:
+                        cur_centered = self.x_mpm - cur_com.unsqueeze(0)
+                        try:
+                            P_mat = cur_centered.transpose(0, 1) @ rest_rel
+                            Q_mat = rest_rel.transpose(0, 1) @ rest_rel
+                            eye3 = torch.eye(
+                                3, device=Q_mat.device, dtype=Q_mat.dtype)
+                            Q_reg = Q_mat + 1e-6 * eye3 * float(
+                                Q_mat.diag().abs().max())
+                            A_col = P_mat @ torch.linalg.inv(Q_reg)
+                            u_a, s_a, vh_a = torch.linalg.svd(A_col)
+                            sv_min = float(getattr(
+                                self, 'shape_match_sv_min', 0.78))
+                            sv_max = float(getattr(
+                                self, 'shape_match_sv_max', 1.00))
+                            s_a = torch.clamp(s_a, min=sv_min, max=sv_max)
+                            A_col = u_a @ torch.diag(s_a) @ vh_a
+                            cov = rest_rel.transpose(0, 1) @ cur_centered
+                            u_r, _, vh_r = torch.linalg.svd(cov)
+                            R_rigid = u_r @ vh_r
+                            if torch.det(R_rigid) < 0.0:
+                                u_r = u_r.clone()
+                                u_r[:, -1] *= -1.0
+                                R_rigid = u_r @ vh_r
+                            A_row = A_col.transpose(0, 1)
+                            T = ((1.0 - affine_blend) * R_rigid
+                                 + affine_blend * A_row)
+                            target = rest_rel @ T + cur_com.unsqueeze(0)
+                        except RuntimeError:
+                            target = cur_com.unsqueeze(0) + rest_rel
+                    else:
+                        target = cur_com.unsqueeze(0) + rest_rel
+                    w_pos = w * pos_lerp
+                    self.x_mpm[:] = (1.0 - w_pos) * self.x_mpm + w_pos * target
 
         # Velocity & F clamping.  Standard MPM safety cap = 0.4 * dx/dt
         # (CFL-safe).  Override with `velocity_cap_scale` to relax it

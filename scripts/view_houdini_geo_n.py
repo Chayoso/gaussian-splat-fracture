@@ -224,7 +224,10 @@ def main() -> int:
     opt = vis.get_render_option()
     opt.point_size = float(args.point_size)
     opt.background_color = np.array([0.05, 0.05, 0.06])
-    opt.mesh_show_back_face = True
+    # Back-face culling on: previously the floor's bottom face was
+    # rendered too, producing a visible "mirror" of the bunny below
+    # the floor whenever the camera looked up through the slab.
+    opt.mesh_show_back_face = False
     opt.light_on = False
     try:
         opt.mesh_color_option = o3d.visualization.MeshColorOption.Color

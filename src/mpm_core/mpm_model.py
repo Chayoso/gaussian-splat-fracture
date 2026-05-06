@@ -499,19 +499,37 @@ class MPMModel:
         # particles, making chunks hover just above ground).
         # Sub-cell ground positions are handled by including the cell
         # that contains the ground (idx <= floor(ground_idx + 1)).
+        # Optional grid-level restitution for soft/elastic materials.
+        # Without this the floor BC hard-zeros v_z at cells inside the
+        # ground, which under high-velocity impact (v_impact > 50 m/s)
+        # produces a 50/50 spatial split: floor-cell particles freeze
+        # while above-floor particles still fall, opening a gap right
+        # at the floor line that shape match alone cannot close in
+        # one step.  When ``floor_restitution_grid > 0`` we instead
+        # reflect v_z with that coefficient (-e·v_z), so the floor
+        # cells uniformly bounce upward and the body compresses
+        # against itself rather than tearing along the floor.
         ground_z = float(getattr(self, "ground_z", 0.0))
+        restitution = float(getattr(self, "floor_restitution_grid", 0.0))
         if ground_z > 0.0:
             ground_idx = ground_z * (n - 1)
             floor_mask = grid_coords[:, 2] <= float(ground_idx)
             into_floor = floor_mask & (v_z < 0.0)
             if bool(into_floor.any()):
-                self.grid_mv[into_floor, 2] = 0.0
+                if restitution > 0.0:
+                    self.grid_mv[into_floor, 2] = (
+                        -float(restitution) * self.grid_mv[into_floor, 2])
+                else:
+                    self.grid_mv[into_floor, 2] = 0.0
         else:
-            # Fall back to standard wall slip on Z lo (domain bottom)
             wall_lo_z = grid_coords[:, 2] < float(slip_band)
             into_lo_z = wall_lo_z & (v_z < 0.0)
             if bool(into_lo_z.any()):
-                self.grid_mv[into_lo_z, 2] = 0.0
+                if restitution > 0.0:
+                    self.grid_mv[into_lo_z, 2] = (
+                        -float(restitution) * self.grid_mv[into_lo_z, 2])
+                else:
+                    self.grid_mv[into_lo_z, 2] = 0.0
         
     def pre_p2g_operation(self) -> None:
         pass
