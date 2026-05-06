@@ -1990,7 +1990,10 @@ class MaterialPriorAdapter:
         E_ref, Gc_ref = 70.0e9, 5.0
         brittleness = float(np.sqrt(E / Gc) / np.sqrt(E_ref / Gc_ref))
         brittleness = max(0.0, min(brittleness, 1.5))
-        # Scatter-velocity knobs: linear in brittleness.
+        # Scatter-velocity knobs: brittleness^1.5 for a more dramatic
+        # gradient.  Glass ~0.7, ceramic ~0.18, concrete ~0.06 — visible
+        # difference between explosive shatter and chunky settling.
+        scatter_factor = max(brittleness ** 1.5, 0.05)
         scatter_keys = (
             "manifold.fragment_release_v_com_gain",
             "manifold.voronoi_impact_shock_radius",
@@ -1998,16 +2001,24 @@ class MaterialPriorAdapter:
         for key in scatter_keys:
             if key in out:
                 try:
-                    out[key] = float(out[key]) * brittleness
+                    out[key] = float(out[key]) * scatter_factor
                 except (TypeError, ValueError):
                     continue
-        # Cell-count + breakage threshold scaled aggressively by
-        # brittleness so the same "completely pulverized" prompt
-        # produces visibly different fracture counts across materials.
-        # Linear ^1.0 + 2.0× bond-thr: glass 178 cells / ceramic ~89 /
-        # concrete ~45 / rubber clamp.
+        # Fragment max-speed clamp also scaled — high-brittleness glass
+        # fragments may exceed the baseline cap and need it lifted; tough
+        # concrete fragments rarely approach the baseline anyway.
+        max_speed_keys = ("manifold.fragment_physical_max_speed",)
+        max_speed_factor = max(brittleness ** 1.0, 0.30)
+        for key in max_speed_keys:
+            if key in out:
+                try:
+                    out[key] = float(out[key]) * max_speed_factor
+                except (TypeError, ValueError):
+                    continue
+        # Cell-count: brittleness^1.8 + 2.5× bond-thr for a sharper
+        # fragment-size gradient (small/many vs large/few).
         n_cells_keys = ("manifold.voronoi_n_cells",)
-        n_cells_factor = max(brittleness ** 1.0, 0.05)
+        n_cells_factor = max(brittleness ** 1.8, 0.05)
         for key in n_cells_keys:
             if key in out:
                 try:
@@ -2015,7 +2026,7 @@ class MaterialPriorAdapter:
                 except (TypeError, ValueError):
                     continue
         thr_keys = ("manifold.voronoi_bond_break_threshold",)
-        thr_factor = 1.0 + 2.0 * max(0.0, 1.0 - brittleness)
+        thr_factor = 1.0 + 2.5 * max(0.0, 1.0 - brittleness)
         for key in thr_keys:
             if key in out:
                 try:
