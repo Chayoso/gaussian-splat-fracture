@@ -64,13 +64,15 @@ class VoronoiDecomposer:
         anisotropy_axis: Optional[Tensor] = None,
         seed: int = 1234,
         force_shrink_max_frac: float = 0.0,
+        impact_bias_scale: float = 0.25,
     ):
         if not _SCIPY_OK:
             raise RuntimeError("scipy is required for VoronoiDecomposer")
-        self.n_cells = int(max(8, n_cells))
+        self.n_cells = int(max(2, n_cells))
         self.distribution = str(distribution)
         self.bond_break_threshold = float(bond_break_threshold)
         self.force_shrink_max_frac = float(force_shrink_max_frac)
+        self.impact_bias_scale = float(impact_bias_scale)
         self.impact_center = impact_center
         self.anisotropy_axis = anisotropy_axis
         self.rng = np.random.default_rng(int(seed))
@@ -115,7 +117,7 @@ class VoronoiDecomposer:
             if float(d) > accept_radius:
                 continue
             seeds.append(cand)
-        if len(seeds) < 8:
+        if len(seeds) < min(2, self.n_cells):
             raise RuntimeError(
                 f"VoronoiDecomposer: only {len(seeds)} seeds sampled "
                 f"(target {self.n_cells}); check distribution params"
@@ -134,8 +136,12 @@ class VoronoiDecomposer:
         if self.distribution == "impact_biased":
             ic = self._impact_center_np(bbox_min, bbox_max)
             # Sample radius from exponential: more density near impact.
-            # Scale: half-bbox-diagonal / 2.
-            scale = float(np.linalg.norm(bbox_size)) * 0.25
+            # ``impact_bias_scale`` (default 0.25) controls how tightly
+            # cells cluster around the impact point.  Larger values
+            # (0.5–0.7) approach a uniform spread while preserving
+            # the impact-centered density profile.
+            scale_frac = float(getattr(self, "impact_bias_scale", 0.25))
+            scale = float(np.linalg.norm(bbox_size)) * scale_frac
             r = self.rng.exponential(scale=scale)
             theta = self.rng.uniform(0.0, 2.0 * np.pi)
             phi = np.arccos(1.0 - 2.0 * self.rng.random())

@@ -106,7 +106,7 @@ class VoronoiPipelineMixin:
         # body stays mostly in the elastic regime, so very few stress
         # concentrations exceed the local fracture toughness and n
         # collapses well below the cubic bound.
-        n_cells = max(4, int(n_cells_full * (ke_factor ** 6)))
+        n_cells = max(2, int(n_cells_full * (ke_factor ** 6)))
 
         # force_shrink scales INVERSELY: hard impact → 5% base cap
         # (full pulverization), soft impact → 95% base (mostly intact).
@@ -154,6 +154,8 @@ class VoronoiPipelineMixin:
               f"force_shrink={force_shrink:.2f} (full={force_shrink_full:.2f}) "
               f"wave={self._voronoi_wave_speed_effective:.4f} "
               f"shock={self._voronoi_shock_radius_effective:.3f}")
+        impact_bias_scale = float(self.fracture_cfg.get(
+            'voronoi_impact_bias_scale', 0.25))
         self.voronoi = VoronoiDecomposer(
             n_cells=n_cells,
             distribution=distribution,
@@ -162,6 +164,7 @@ class VoronoiPipelineMixin:
             anisotropy_axis=anisotropy_axis,
             seed=seed,
             force_shrink_max_frac=force_shrink,
+            impact_bias_scale=impact_bias_scale,
         )
         self.voronoi.tessellate(self.x_mpm)
         self._voronoi_cell_graduated = [False] * self.voronoi.n_cells

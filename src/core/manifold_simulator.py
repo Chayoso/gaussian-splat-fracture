@@ -306,25 +306,12 @@ class ManifoldSimulator(
         self.shard_scale_gain = float(fp.get('shard_scale_gain', 1.0))
         self.shard_opacity_gain = float(fp.get('shard_opacity_gain', 1.0))
         self._last_render_state: Optional[Dict] = None
-        self.fragment_render_gravity = float(fp.get('fragment_render_gravity', 0.0026))
-        self.fragment_render_damping = float(fp.get('fragment_render_damping', 0.985))
-        self.fragment_render_lateral_damping = float(fp.get('fragment_render_lateral_damping', 0.992))
-        self.fragment_render_gap_scale = float(fp.get('fragment_render_gap_scale', 1.55))
-        self.fragment_render_velocity_scale = float(fp.get('fragment_render_velocity_scale', 0.22))
-        self.fragment_render_strict_motion_boost = float(
-            fp.get('fragment_render_strict_motion_boost', 1.0))
-        self.fragment_render_strict_gap_scale = float(
-            fp.get('fragment_render_strict_gap_scale', 0.68))
-        self.fragment_render_strict_velocity_scale = float(
-            fp.get('fragment_render_strict_velocity_scale', 0.12))
-        self.fragment_render_strict_max_detach = float(
-            fp.get('fragment_render_strict_max_detach', 0.085))
-        self.fragment_render_strict_gravity_scale = float(
-            fp.get('fragment_render_strict_gravity_scale', 0.0))
-        self.fragment_render_strict_damping = float(
-            fp.get('fragment_render_strict_damping', 0.90))
-        self.fragment_render_strict_lateral_damping = float(
-            fp.get('fragment_render_strict_lateral_damping', 0.90))
+        # Render-fragment label tracking only.  All offset/velocity
+        # parameters (fragment_render_gravity / damping / max_detach /
+        # gravity_scale / strict_*) were removed when the render
+        # offset path was deleted — fragments now render at raw MPM
+        # positions.  fragment_render_min_size + overlap_threshold
+        # are kept since they gate label persistence.
         self.fragment_render_min_size = max(int(fp.get('fragment_render_min_size', 6)), 1)
         self.fragment_render_overlap_threshold = float(
             fp.get('fragment_render_overlap_threshold', 0.24)
@@ -337,7 +324,6 @@ class ManifoldSimulator(
             fp.get('fragment_physical_overlap_threshold', 0.18)
         )
         self._render_fragment_labels: Optional[Tensor] = None
-        self._render_fragment_states = {}
         self._next_render_fragment_id = 1
         self._physical_fragment_labels: Optional[Tensor] = None
         self._physical_fragment_states = {}
@@ -704,7 +690,6 @@ class ManifoldSimulator(
         self._surface_normals = None  # set via set_surface_normals()
         self._last_render_state = None
         self._render_fragment_labels = None
-        self._render_fragment_states = {}
         self._next_render_fragment_id = 1
         self._physical_fragment_labels = None
         self._physical_fragment_states = {}
@@ -2200,15 +2185,8 @@ class ManifoldSimulator(
                     ]
                     detached_distance = max(distances)
                     mean_detached_distance = sum(distances) / max(len(distances), 1)
-        if self._render_fragment_states:
-            offsets = []
-            for state in self._render_fragment_states.values():
-                offset = state.get("offset")
-                if offset is not None:
-                    offsets.append(float(offset.norm().item()))
-            if offsets:
-                render_offset_distance = max(offsets)
-                render_mean_offset_distance = sum(offsets) / max(len(offsets), 1)
+        # Render offset metrics removed: render position equals MPM
+        # position so per-fragment offset distance is always 0.
         physical_n_frags = 0
         frag_ids_phys = None
         if (self._physical_fragment_labels is not None

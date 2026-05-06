@@ -813,8 +813,13 @@ SENTENCE_STYLE_RULES = (
             # pulverization) so the "thousands of fine" prompt produces
             # a visibly finer tessellation than "hundreds of tiny".
             "manifold.voronoi_enable": True,
-            "manifold.voronoi_n_cells": 400,
-            "manifold.voronoi_seed_distribution": "impact_biased",
+            # n_cells=1000 calibrated for 150K particles + grid=256:
+            # ~150 particles/cell ensures stable shape_match SVD,
+            # uniform distribution + damp=0.95 (below) gives the
+            # body-wide tessellation without grid-coupling-driven
+            # oscillation.
+            "manifold.voronoi_n_cells": 1000,
+            "manifold.voronoi_seed_distribution": "uniform",
             "manifold.voronoi_bond_break_threshold": 0.10,
             "manifold.voronoi_bond_aging_per_frame": 0.0,
             "manifold.voronoi_impact_shock_radius": 0.12,
@@ -825,7 +830,13 @@ SENTENCE_STYLE_RULES = (
             "manifold.particle_speed_cap": 80.0,
             "manifold.shape_match_static_omega": 25.0,
             "manifold.post_impact_gravity_z": -7500.0,
-            "manifold.post_impact_damping": 0.999,
+            # Damping 0.95 (vs 0.999 default) suppresses fragment-
+            # internal oscillation that surfaces with uniform seed
+            # distribution.  fragment_physics undamps fragment
+            # particles by /damping each substep, so the net per-
+            # substep decay lands at exactly 0.95 — enough to kill
+            # the spurious mid-air "elasticity" feel.
+            "manifold.post_impact_damping": 0.95,
             "manifold.curvature_weight": 0.4,
             "manifold.fragment_boundary_cut_min_ratio": 0.45,
             "manifold.shard_enable": False,
@@ -916,6 +927,11 @@ SENTENCE_STYLE_RULES = (
             "manifold.open_crack_release_max_patches": 2,
             "manifold.open_crack_release_threshold": 0.44,
             "manifold.brittle_release_intensity": 0.90,
+            # Force exactly 2 fragments via 2-cell axis-aligned Voronoi.
+            "manifold.voronoi_enable": True,
+            "manifold.voronoi_n_cells": 2,
+            "manifold.voronoi_seed_distribution": "axis_aligned",
+            "manifold.voronoi_bond_break_threshold": 0.45,
         },
     },
 )
@@ -2022,7 +2038,9 @@ class MaterialPriorAdapter:
         for key in n_cells_keys:
             if key in out:
                 try:
-                    out[key] = max(int(int(out[key]) * n_cells_factor), 4)
+                    requested = int(out[key])
+                    floor = 2 if requested <= 4 else 4
+                    out[key] = max(int(requested * n_cells_factor), floor)
                 except (TypeError, ValueError):
                     continue
         thr_keys = ("manifold.voronoi_bond_break_threshold",)
