@@ -594,9 +594,20 @@ SENTENCE_STYLE_RULES = (
             # rubber inherit reduced scatter without retuning the style.
             # Lateral scatter — radial_shatter is the pre-pulverization
             # tier so spread is significant but less than full pulverize.
-            "manifold.fragment_release_v_com_gain": 6.0,
+            "manifold.fragment_release_v_com_gain": 2.0,
+            "manifold.fragment_release_impulse_ramp_substeps": 8,
+            "manifold.rigid_handoff_birth_lateral_velocity_cap": 1.8,
+            "manifold.rigid_handoff_birth_inherited_lateral_velocity_scale": 0.30,
+            "manifold.rigid_handoff_birth_downward_velocity": 6.0,
+            "manifold.rigid_handoff_birth_angular_velocity_scale": 0.30,
+            "manifold.rigid_handoff_birth_body_angular_velocity_scale": 0.24,
+            "manifold.rigid_handoff_birth_tumble_gain": 0.0045,
+            "manifold.rigid_handoff_birth_angular_velocity_cap": 9.0,
+            "manifold.rigid_handoff_floor_contact_torque": False,
+            "manifold.rigid_handoff_floor_contact_angular_gain": 0.0,
+            "manifold.rigid_handoff_floor_angular_friction": 0.0005,
             "manifold.fragment_physical_max_speed": 50.0,
-            "manifold.fragment_release_position_offset": 0.012,
+            "manifold.fragment_release_position_offset": 0.0,
             # Voronoi pre-fracture: partial pulverization for radial_shatter.
             "manifold.voronoi_enable": True,
             "manifold.voronoi_n_cells": 80,
@@ -605,6 +616,10 @@ SENTENCE_STYLE_RULES = (
             "manifold.voronoi_bond_aging_per_frame": 0.005,
             "manifold.voronoi_impact_shock_radius": 0.12,
             "manifold.voronoi_cascade_radius": 1.0,
+            "manifold.voronoi_cascade_from_new_bonds_only": True,
+            "manifold.voronoi_impact_damage_floor": 0.10,
+            "manifold.voronoi_cascade_damage_floor": 0.12,
+            "manifold.voronoi_force_shrink_damage_floor": 0.16,
             "manifold.voronoi_force_shrink_max_frac": 0.40,
             "manifold.particle_speed_cap": 60.0,
             # Per-particle floor bounce override (recovers bounce that
@@ -731,7 +746,18 @@ SENTENCE_STYLE_RULES = (
             # world over their flight, which reads as "흩날린다" rather
             # than "주저앉는다".  upward_fraction 0.25 = brief arc lift,
             # the dominant motion is horizontal.
-            "manifold.fragment_release_v_com_gain": 6.0,
+            "manifold.fragment_release_v_com_gain": 2.5,
+            "manifold.fragment_release_impulse_ramp_substeps": 8,
+            "manifold.rigid_handoff_birth_lateral_velocity_cap": 2.4,
+            "manifold.rigid_handoff_birth_inherited_lateral_velocity_scale": 0.25,
+            "manifold.rigid_handoff_birth_downward_velocity": 8.0,
+            "manifold.rigid_handoff_birth_angular_velocity_scale": 0.22,
+            "manifold.rigid_handoff_birth_body_angular_velocity_scale": 0.14,
+            "manifold.rigid_handoff_birth_tumble_gain": 0.0034,
+            "manifold.rigid_handoff_birth_angular_velocity_cap": 8.0,
+            "manifold.rigid_handoff_floor_contact_torque": False,
+            "manifold.rigid_handoff_floor_contact_angular_gain": 0.0,
+            "manifold.rigid_handoff_floor_angular_friction": 0.0005,
             "manifold.fragment_physical_max_speed": 50.0,
             # Per-particle floor bounce override (recovers from slip BC).
             # 0.50 = moderate glass shard bounce.
@@ -761,8 +787,12 @@ SENTENCE_STYLE_RULES = (
             # impact window.
             "manifold.voronoi_wave_speed_per_frame": 0.025,
             "manifold.voronoi_cascade_radius": 1.0,
+            "manifold.voronoi_cascade_from_new_bonds_only": True,
+            "manifold.voronoi_impact_damage_floor": 0.08,
+            "manifold.voronoi_cascade_damage_floor": 0.10,
+            "manifold.voronoi_force_shrink_damage_floor": 0.12,
             "manifold.voronoi_force_shrink_max_frac": 0.05,
-            "manifold.fragment_release_position_offset": 0.012,
+            "manifold.fragment_release_position_offset": 0.0,
             "manifold.particle_speed_cap": 80.0,
             # Aggressive angular damping for residual base + fragments.
             # static_omega=25 puts kinetic damping (0.985) only above
@@ -815,6 +845,22 @@ SENTENCE_STYLE_RULES = (
             "anisotropy_strength": 0.72,
         },
         "runtime": {
+            "manifold.max_seed_points": 36,
+            "manifold.seed_quantile": 0.940,
+            "manifold.min_seed_spacing": 0.008,
+            "manifold.successor_topk": 8,
+            "manifold.max_branching_tips": 128,
+            "manifold.branch_score_ratio": 0.55,
+            "manifold.branch_drive_threshold": 0.04,
+            "manifold.branching_bias": 1.35,
+            "manifold.min_successor_score": 0.035,
+            "manifold.drive_quantile": 0.34,
+            "manifold.front_substeps": 6,
+            "manifold.impact_fracture_burst_steps": 12,
+            "manifold.impact_fracture_burst_front_substeps": 36,
+            "manifold.damage_spread": 0.22,
+            "manifold.damage_source_scale": 0.80,
+            "manifold.edge_break_rate": 1.75,
             # Inherits the calmer impact-frame defaults from v25e.
             "manifold.shape_match_strength": 0.97,
             "manifold.shape_match_fragment_strength": 0.97,
@@ -822,6 +868,17 @@ SENTENCE_STYLE_RULES = (
             "manifold.unified_impact_impulse_scale": 0.003,
             "manifold.unified_impact_tumble_scale": 0.012,
             "manifold.fragment_release_v_com_gain": 6.0,
+            "manifold.fragment_release_impulse_ramp_substeps": 1,
+            "manifold.rigid_handoff_birth_lateral_velocity_cap": 4.5,
+            "manifold.rigid_handoff_birth_inherited_lateral_velocity_scale": 0.20,
+            "manifold.rigid_handoff_birth_downward_velocity": 9.0,
+            "manifold.rigid_handoff_birth_angular_velocity_scale": 0.10,
+            "manifold.rigid_handoff_birth_body_angular_velocity_scale": 0.0,
+            "manifold.rigid_handoff_birth_tumble_gain": 0.0018,
+            "manifold.rigid_handoff_birth_angular_velocity_cap": 6.0,
+            "manifold.rigid_handoff_floor_contact_torque": False,
+            "manifold.rigid_handoff_floor_contact_angular_gain": 0.0,
+            "manifold.rigid_handoff_floor_angular_friction": 0.006,
             "manifold.fragment_physical_max_speed": 50.0,
             "manifold.fragment_release_jitter": 0.35,
             "manifold.fragment_physical_gap_scale": 0.0035,
@@ -840,12 +897,18 @@ SENTENCE_STYLE_RULES = (
             # body-wide tessellation without grid-coupling-driven
             # oscillation.
             "manifold.voronoi_n_cells": 1000,
+            "manifold.voronoi_impact_speed_ref": 42.0,
+            "manifold.voronoi_impact_cell_exponent": 1.0,
             "manifold.voronoi_seed_distribution": "uniform",
             "manifold.voronoi_bond_break_threshold": 0.10,
             "manifold.voronoi_bond_aging_per_frame": 0.0,
             "manifold.voronoi_impact_shock_radius": 0.12,
             "manifold.voronoi_wave_speed_per_frame": 0.030,
             "manifold.voronoi_cascade_radius": 1.0,
+            "manifold.voronoi_cascade_from_new_bonds_only": True,
+            "manifold.voronoi_impact_damage_floor": 0.06,
+            "manifold.voronoi_cascade_damage_floor": 0.08,
+            "manifold.voronoi_force_shrink_damage_floor": 0.10,
             "manifold.voronoi_force_shrink_max_frac": 0.02,
             "manifold.fragment_release_position_offset": 0.012,
             "manifold.fragment_physical_min_size": 6,
@@ -909,9 +972,24 @@ SENTENCE_STYLE_RULES = (
             "manifold.voronoi_bond_aging_per_frame": 0.0,
             "manifold.voronoi_impact_shock_radius": 0.06,
             "manifold.voronoi_wave_speed_per_frame": 0.020,
+            "manifold.voronoi_cascade_from_new_bonds_only": True,
+            "manifold.voronoi_impact_damage_floor": 0.14,
+            "manifold.voronoi_cascade_damage_floor": 0.18,
+            "manifold.voronoi_force_shrink_damage_floor": 0.22,
             "manifold.voronoi_force_shrink_max_frac": 0.20,
-            "manifold.fragment_release_position_offset": 0.012,
-            "manifold.fragment_release_v_com_gain": 6.0,
+            "manifold.fragment_release_position_offset": 0.0,
+            "manifold.fragment_release_v_com_gain": 2.8,
+            "manifold.fragment_release_impulse_ramp_substeps": 6,
+            "manifold.rigid_handoff_birth_lateral_velocity_cap": 2.5,
+            "manifold.rigid_handoff_birth_inherited_lateral_velocity_scale": 0.35,
+            "manifold.rigid_handoff_birth_downward_velocity": 4.0,
+            "manifold.rigid_handoff_birth_angular_velocity_scale": 0.20,
+            "manifold.rigid_handoff_birth_body_angular_velocity_scale": 0.16,
+            "manifold.rigid_handoff_birth_tumble_gain": 0.0030,
+            "manifold.rigid_handoff_birth_angular_velocity_cap": 7.0,
+            "manifold.rigid_handoff_floor_contact_torque": False,
+            "manifold.rigid_handoff_floor_contact_angular_gain": 0.0,
+            "manifold.rigid_handoff_floor_angular_friction": 0.0005,
             "manifold.fragment_physical_max_speed": 30.0,
             "manifold.fragment_release_jitter": 0.20,
             "manifold.fragment_physical_gap_scale": 0.0012,
@@ -1205,6 +1283,8 @@ FAMILY_RUNTIME_PRESETS = {
         "manifold.crack_volume_visited_floor": 0.62,
         "manifold.crack_volume_tip_floor": 0.78,
         "manifold.crack_volume_interior_scale": 0.92,
+        "manifold.voronoi_use_topology_damage": True,
+        "manifold.voronoi_topology_interior_scale": 0.92,
         "manifold.fragment_physical_gap_scale": 0.00010,
         "manifold.fragment_physical_release_velocity": 0.010,
         "manifold.fragment_physical_downward_bias": 0.22,
@@ -1841,12 +1921,14 @@ class MaterialPriorAdapter:
                 return default
 
         if family_name == "sharp_brittle":
-            out["manifold.successor_topk"] = 1
-            out["manifold.max_branching_tips"] = min(_get("manifold.max_branching_tips", 8), 8)
-            out["manifold.branch_score_ratio"] = max(
-                _get("manifold.branch_score_ratio", 0.92), 0.92)
-            out["manifold.branch_drive_threshold"] = max(
-                _get("manifold.branch_drive_threshold", 0.62), 0.62)
+            out["manifold.successor_topk"] = min(
+                max(_get("manifold.successor_topk", 1), 1), 8)
+            out["manifold.max_branching_tips"] = min(
+                max(_get("manifold.max_branching_tips", 12), 1), 128)
+            out["manifold.branch_score_ratio"] = min(
+                max(_get("manifold.branch_score_ratio", 0.82), 0.55), 0.99)
+            out["manifold.branch_drive_threshold"] = min(
+                max(_get("manifold.branch_drive_threshold", 0.24), 0.04), 0.85)
         elif family_name == "brittle_moderate":
             out["manifold.successor_topk"] = min(_get("manifold.successor_topk", 2), 2)
             out["manifold.max_branching_tips"] = min(_get("manifold.max_branching_tips", 10), 10)

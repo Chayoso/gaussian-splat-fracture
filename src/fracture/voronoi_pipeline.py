@@ -212,7 +212,10 @@ class VoronoiPipelineMixin:
         """
         if self.voronoi is None or self.x_mpm is None:
             return None
-        damage = self._get_volumetric_damage()
+        if bool(self.fracture_cfg.get('voronoi_use_topology_damage', True)):
+            damage = self._get_voronoi_topology_damage()
+        else:
+            damage = self._get_volumetric_damage()
         if damage.numel() != self.x_mpm.shape[0]:
             return None
         bond_aging = float(getattr(
@@ -233,10 +236,20 @@ class VoronoiPipelineMixin:
             impact_radius=impact_radius,
             cascade_radius=cascade_radius,
             wave_speed_per_frame=wave_speed,
+            impact_damage_floor=float(self.fracture_cfg.get(
+                'voronoi_impact_damage_floor', 0.0)),
+            cascade_damage_floor=float(self.fracture_cfg.get(
+                'voronoi_cascade_damage_floor', 0.0)),
+            cascade_from_new_bonds_only=bool(self.fracture_cfg.get(
+                'voronoi_cascade_from_new_bonds_only', True)),
+            force_shrink_damage_floor=float(self.fracture_cfg.get(
+                'voronoi_force_shrink_damage_floor', 0.0)),
         )
-        # Mode-I bond opening: Newton-3rd kicks per newly-broken bond.
-        for (a, b, stress) in newly_broken:
-            self._apply_bond_opening_kick(a, b, stress)
+        # Mode-I bond opening.  Accumulate per-cell impulses first, then
+        # write them once with a cap; otherwise one cell that loses several
+        # bonds in the same fracture tick receives the same rigid-body kick
+        # repeatedly and the result reads as an explosion rather than a crack.
+        self._apply_bond_opening_kicks(newly_broken)
         comp_per_cell = self.voronoi.connected_components()
         per_particle = self.voronoi.particle_fragment_ids()
         # Telemetry: count cells whose component flipped this frame.
@@ -487,19 +500,21 @@ class VoronoiPipelineMixin:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def _apply_bond_opening_kick(self, cell_a: int, cell_b: int, stress: float):
-        """Mode-I crack opening at one broken bond.
+    def _apply_bond_opening_kicks(self, newly_broken: list[tuple[int, int, float]]):
+        """Apply Griffith-bounded Mode-I opening for a batch of broken bonds.
 
-        Each adjacent cell receives an equal-and-opposite Newton-3rd
-        kick along the bond normal ``(b - a)``.  The opening velocity
+        Each adjacent cell accumulates equal-and-opposite Newton-3rd
+        kicks along the bond normal ``(b - a)``.  The opening velocity
         is bounded by Griffith's critical energy release rate
 
             v_open = sqrt(G_c * A_bond / m_cell)
 
-        so the released KE never exceeds physical surface energy.  This
-        replaces the legacy ``gain * sqrt(stress)`` formulation that
-        injected non-physical KE and produced an "explosion" feel.
+        and the final cell-level delta is capped once per fracture tick.
+        This prevents multi-bond graduation from injecting N copies of the
+        same rigid-body velocity into a single fragment.
         """
+        if not newly_broken:
+            return
         if self.voronoi is None or self.voronoi.cell_centers is None:
             return
         release_gain = float(getattr(self, "fragment_release_v_com_gain", 0.0))
@@ -507,71 +522,164 @@ class VoronoiPipelineMixin:
             return
         max_speed = max(float(getattr(
             self, "fragment_physical_max_speed", 30.0)), 0.05)
-
-        ca_np = self.voronoi.cell_centers[cell_a]
-        cb_np = self.voronoi.cell_centers[cell_b]
-        direction_np = cb_np - ca_np
-        n = float(np.linalg.norm(direction_np))
-        if n < 1e-6:
-            return
-        direction_np = direction_np / n
-        direction = torch.from_numpy(direction_np).to(
-            self.x_mpm.device, self.x_mpm.dtype)
+        cell_velocity: dict[int, torch.Tensor] = {}
+        cell_offset: dict[int, torch.Tensor] = {}
 
         # Griffith-bounded opening velocity.  Bond-area heuristic uses
         # cube-face of the cells' combined volume.
         Gc = float(getattr(self.elasticity, 'Gc', 9.0))
-        cell_count_a = int(np.sum(self.voronoi.cell_assignment == cell_a))
-        cell_count_b = int(np.sum(self.voronoi.cell_assignment == cell_b))
-        cell_count_min = max(1, min(cell_count_a, cell_count_b))
-        m_cell = float(self.mpm.p_mass) * cell_count_min
-        cell_vol = float(self.mpm.vol) * cell_count_min
-        bond_area = max(cell_vol ** (2.0 / 3.0), 1e-8)
-        v_open_griffith = float((Gc * bond_area / max(m_cell, 1e-8)) ** 0.5)
-        # User-tunable energy-conversion fraction, applied to the
-        # released KE (so v scales with sqrt of the fraction).
         energy_frac = float(getattr(
             self, "fragment_release_energy_fraction", 1.0))
-        v_open = v_open_griffith * (energy_frac ** 0.5)
-        # Impact-energy multiplier: soft drops further dampen the
-        # released KE since the body's KE budget is smaller.
         kick_scale = float(getattr(self, "_voronoi_kick_scale", 1.0))
-        v_open = v_open * kick_scale
-        # Floor for force-shrink/cascade-driven breaks (stress=0); cap
-        # at the configured max_speed.  ``fragment_release_v_com_gain``
-        # is the style/material calibrated Mode-I opening target.  Older
-        # code only used it as an on/off switch, which made brittle
-        # styles visually too cohesive even when the sentence profile
-        # requested high-energy shattering.
         min_open_kick = float(getattr(
             self, "fragment_release_min_open_kick", 0.1))
-        target_open_kick = max(min_open_kick, release_gain)
-        v_open = max(target_open_kick, v_open)
-        v_open = min(v_open, max_speed)
-
-        idx_a = torch.where(
-            torch.from_numpy(self.voronoi.cell_assignment == cell_a)
-            .to(self.x_mpm.device)
-        )[0]
-        idx_b = torch.where(
-            torch.from_numpy(self.voronoi.cell_assignment == cell_b)
-            .to(self.x_mpm.device)
-        )[0]
-        if idx_a.numel() == 0 or idx_b.numel() == 0:
-            return
-
-        kick_b = direction * v_open
-        kick_a = -direction * v_open
-        self.v_mpm[idx_a] = self.v_mpm[idx_a] + kick_a.unsqueeze(0)
-        self.v_mpm[idx_b] = self.v_mpm[idx_b] + kick_b.unsqueeze(0)
-
-        # Position offset along the bond direction so the cells are
-        # geometrically separated in the shared MPM grid; without it
-        # the heavy-base velocity field swallows the kicks via grid
-        # coupling within one P2G2P step.
+        cell_speed_cap = max(0.05, min(max_speed, release_gain))
         offset_scale = float(getattr(
             self, "_voronoi_position_offset_eff",
             getattr(self, "fragment_release_position_offset", 0.0)))
-        if offset_scale > 0.0:
-            self.x_mpm[idx_a] = self.x_mpm[idx_a] + (-direction * offset_scale).unsqueeze(0)
-            self.x_mpm[idx_b] = self.x_mpm[idx_b] + (direction * offset_scale).unsqueeze(0)
+        offset_cap = max(0.0, float(getattr(
+            self, "fragment_release_cell_offset_cap", offset_scale)))
+
+        for (cell_a, cell_b, _stress) in newly_broken:
+            ca_np = self.voronoi.cell_centers[cell_a]
+            cb_np = self.voronoi.cell_centers[cell_b]
+            direction_np = cb_np - ca_np
+            n = float(np.linalg.norm(direction_np))
+            if n < 1e-6:
+                continue
+            direction_np = direction_np / n
+            direction = torch.from_numpy(direction_np).to(
+                self.x_mpm.device, self.x_mpm.dtype)
+
+            cell_count_a = int(np.sum(self.voronoi.cell_assignment == cell_a))
+            cell_count_b = int(np.sum(self.voronoi.cell_assignment == cell_b))
+            cell_count_min = max(1, min(cell_count_a, cell_count_b))
+            m_cell = float(self.mpm.p_mass) * cell_count_min
+            cell_vol = float(self.mpm.vol) * cell_count_min
+            bond_area = max(cell_vol ** (2.0 / 3.0), 1e-8)
+            v_open_griffith = float((Gc * bond_area / max(m_cell, 1e-8)) ** 0.5)
+            v_open = v_open_griffith * (max(energy_frac, 0.0) ** 0.5)
+            v_open = v_open * kick_scale
+            # ``fragment_release_v_com_gain`` is a material/style cap, not a
+            # lower bound.  A high sentence-style value should allow energetic
+            # cracks when the Griffith budget supports them, not force every
+            # broken bond to inject that much velocity.
+            v_open = max(min_open_kick * kick_scale, v_open)
+            v_open = min(v_open, cell_speed_cap)
+
+            if cell_a not in cell_velocity:
+                cell_velocity[cell_a] = torch.zeros(
+                    3, device=self.x_mpm.device, dtype=self.x_mpm.dtype)
+            if cell_b not in cell_velocity:
+                cell_velocity[cell_b] = torch.zeros(
+                    3, device=self.x_mpm.device, dtype=self.x_mpm.dtype)
+            cell_velocity[cell_a] = cell_velocity[cell_a] - direction * v_open
+            cell_velocity[cell_b] = cell_velocity[cell_b] + direction * v_open
+            if offset_scale > 0.0:
+                if cell_a not in cell_offset:
+                    cell_offset[cell_a] = torch.zeros(
+                        3, device=self.x_mpm.device, dtype=self.x_mpm.dtype)
+                if cell_b not in cell_offset:
+                    cell_offset[cell_b] = torch.zeros(
+                        3, device=self.x_mpm.device, dtype=self.x_mpm.dtype)
+                cell_offset[cell_a] = cell_offset[cell_a] - direction * offset_scale
+                cell_offset[cell_b] = cell_offset[cell_b] + direction * offset_scale
+
+        if not cell_velocity and not cell_offset:
+            return
+        assignment = torch.from_numpy(self.voronoi.cell_assignment).to(
+            self.x_mpm.device)
+        for cell_id, dv in cell_velocity.items():
+            idx = torch.where(assignment == int(cell_id))[0]
+            if idx.numel() == 0:
+                continue
+            speed = float(dv.norm().item())
+            if speed > cell_speed_cap:
+                dv = dv * (cell_speed_cap / max(speed, 1e-8))
+            if offset_cap > 0.0:
+                dx = cell_offset.get(int(cell_id))
+                if dx is None:
+                    dx = torch.zeros_like(dv)
+                else:
+                    dist = float(dx.norm().item())
+                    if dist > offset_cap:
+                        dx = dx * (offset_cap / max(dist, 1e-8))
+            else:
+                dx = None
+            self._queue_voronoi_cell_release(int(cell_id), dv, dx)
+        for cell_id, dx in cell_offset.items():
+            if int(cell_id) in cell_velocity:
+                continue
+            dist = float(dx.norm().item())
+            if offset_cap > 0.0 and dist > offset_cap:
+                dx = dx * (offset_cap / max(dist, 1e-8))
+            self._queue_voronoi_cell_release(
+                int(cell_id),
+                torch.zeros(3, device=self.x_mpm.device, dtype=self.x_mpm.dtype),
+                dx,
+            )
+
+    def _queue_voronoi_cell_release(
+        self,
+        cell_id: int,
+        dv: torch.Tensor,
+        dx: torch.Tensor | None = None,
+    ) -> None:
+        ramp = max(1, int(getattr(
+            self, "fragment_release_impulse_ramp_substeps", 1)))
+        if ramp <= 1:
+            self._apply_voronoi_cell_release_now(cell_id, dv, dx)
+            return
+        pending = getattr(self, "_pending_voronoi_cell_releases", None)
+        if pending is None:
+            pending = []
+            self._pending_voronoi_cell_releases = pending
+        pending.append({
+            "cell": int(cell_id),
+            "dv": dv.detach().clone(),
+            "dx": None if dx is None else dx.detach().clone(),
+            "remaining": ramp,
+        })
+
+    @torch.no_grad()
+    def _apply_pending_voronoi_cell_releases(self) -> None:
+        pending = getattr(self, "_pending_voronoi_cell_releases", None)
+        if not pending:
+            return
+        keep = []
+        for item in pending:
+            remaining = max(int(item.get("remaining", 1)), 1)
+            dv = item["dv"].to(device=self.x_mpm.device, dtype=self.x_mpm.dtype)
+            dx_raw = item.get("dx")
+            dx = None if dx_raw is None else dx_raw.to(
+                device=self.x_mpm.device, dtype=self.x_mpm.dtype)
+            step_dv = dv / float(remaining)
+            step_dx = None if dx is None else dx / float(remaining)
+            self._apply_voronoi_cell_release_now(
+                int(item["cell"]), step_dv, step_dx)
+            remaining -= 1
+            if remaining > 0:
+                item["dv"] = (dv - step_dv).detach().clone()
+                item["dx"] = None if dx is None else (dx - step_dx).detach().clone()
+                item["remaining"] = remaining
+                keep.append(item)
+        self._pending_voronoi_cell_releases = keep
+
+    @torch.no_grad()
+    def _apply_voronoi_cell_release_now(
+        self,
+        cell_id: int,
+        dv: torch.Tensor,
+        dx: torch.Tensor | None = None,
+    ) -> None:
+        if self.voronoi is None or self.x_mpm is None or self.v_mpm is None:
+            return
+        assignment = torch.from_numpy(self.voronoi.cell_assignment).to(
+            self.x_mpm.device)
+        idx = torch.where(assignment == int(cell_id))[0]
+        if idx.numel() == 0:
+            return
+        if dv is not None and float(dv.norm().item()) > 0.0:
+            self.v_mpm[idx] = self.v_mpm[idx] + dv.unsqueeze(0)
+        if dx is not None and float(dx.norm().item()) > 0.0:
+            self.x_mpm[idx] = self.x_mpm[idx] + dx.unsqueeze(0)

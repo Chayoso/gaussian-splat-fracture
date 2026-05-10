@@ -278,6 +278,10 @@ class VoronoiDecomposer:
         impact_radius: float = 0.0,
         cascade_radius: float = 0.0,
         wave_speed_per_frame: float = 0.0,
+        impact_damage_floor: float = 0.0,
+        cascade_damage_floor: float = 0.0,
+        cascade_from_new_bonds_only: bool = True,
+        force_shrink_damage_floor: float = 0.0,
     ) -> List[Tuple[int, int, float]]:
         """Mark bonds broken when avg damage on their boundary exceeds
         the threshold.  Three break criteria, OR'd together:
@@ -303,6 +307,7 @@ class VoronoiDecomposer:
                 0.01, float(self.bond_break_threshold) - float(bond_aging))
         thr = self.bond_break_threshold
         newly_broken_bonds: List[Tuple[int, int, float]] = []
+        newly_broken_keys: set[Tuple[int, int]] = set()
 
         ic_np = None
         if impact_center is not None:
@@ -344,19 +349,23 @@ class VoronoiDecomposer:
             if bond_idx.size == 0:
                 self.bond_broken[bond_key] = True
                 newly_broken_bonds.append((bond_key[0], bond_key[1], 0.0))
+                newly_broken_keys.add(bond_key)
                 continue
             avg_dmg = float(damage_np[bond_idx].mean())
             if avg_dmg >= thr:
                 self.bond_broken[bond_key] = True
                 newly_broken_bonds.append((bond_key[0], bond_key[1], avg_dmg))
+                newly_broken_keys.add(bond_key)
                 continue
             if (ic_np is not None and impact_radius > 0.0
                     and self.cell_centers is not None):
                 a, b = bond_key
                 mid = 0.5 * (self.cell_centers[a] + self.cell_centers[b])
-                if float(np.linalg.norm(mid - ic_np)) < impact_radius:
+                if (float(np.linalg.norm(mid - ic_np)) < impact_radius
+                        and avg_dmg >= float(impact_damage_floor)):
                     self.bond_broken[bond_key] = True
                     newly_broken_bonds.append((a, b, avg_dmg))
+                    newly_broken_keys.add(bond_key)
 
         # Force-shrink the largest component: if one connected component
         # of unbroken bonds owns more than `force_shrink_max_frac` of all
@@ -436,12 +445,23 @@ class VoronoiDecomposer:
                                 break
                     if target is None:
                         break
-                    # Break all of target's incident bonds.
+                    # Break damage-supported incident bonds only.  This keeps
+                    # force-shrink from becoming an independent fragmentation
+                    # system that can split undamaged material just to satisfy
+                    # a target fragment-count/style ratio.
                     progress = False
                     for nb in self._cell_incident_bonds.get(target, []):
                         if not self.bond_broken.get(nb, False):
+                            nb_idx = self._bond_boundary_idx.get(nb)
+                            nb_dmg = (
+                                float(damage_np[nb_idx].mean())
+                                if nb_idx is not None and nb_idx.size > 0 else 0.0
+                            )
+                            if nb_dmg < float(force_shrink_damage_floor):
+                                continue
                             self.bond_broken[nb] = True
-                            newly_broken_bonds.append((nb[0], nb[1], 0.0))
+                            newly_broken_bonds.append((nb[0], nb[1], nb_dmg))
+                            newly_broken_keys.add(nb)
                             progress = True
                     if not progress:
                         break
@@ -469,16 +489,25 @@ class VoronoiDecomposer:
                     self._cell_incident_bonds[a].append((a, b))
                     self._cell_incident_bonds[b].append((a, b))
             hops = int(max(1, round(cascade_radius)))
-            frontier = {k for k, v in self.bond_broken.items() if v}
+            frontier = set(newly_broken_keys) if cascade_from_new_bonds_only else {
+                k for k, v in self.bond_broken.items() if v
+            }
             for _ in range(hops):
                 next_frontier: set = set()
                 for (a, b) in frontier:
                     for cell in (a, b):
                         for nb in self._cell_incident_bonds.get(cell, []):
                             if not self.bond_broken.get(nb, False):
+                                nb_idx = self._bond_boundary_idx.get(nb)
+                                nb_dmg = (
+                                    float(damage_np[nb_idx].mean())
+                                    if nb_idx is not None and nb_idx.size > 0 else 0.0
+                                )
+                                if nb_dmg < float(cascade_damage_floor):
+                                    continue
                                 self.bond_broken[nb] = True
                                 next_frontier.add(nb)
-                                newly_broken_bonds.append((nb[0], nb[1], 0.0))
+                                newly_broken_bonds.append((nb[0], nb[1], nb_dmg))
                 if not next_frontier:
                     break
                 frontier = next_frontier

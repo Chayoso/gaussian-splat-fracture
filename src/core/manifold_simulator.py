@@ -401,6 +401,12 @@ class ManifoldSimulator(
         # shared MPM grid so the kick survives grid gather/scatter.
         self.fragment_release_position_offset = max(0.0, float(
             fp.get('fragment_release_position_offset', 0.0)))
+        # Spread fracture release over a few physics ticks.  A crack event
+        # can break many Voronoi bonds at once; applying the whole opening
+        # velocity and geometric separation in the same tick reads as an
+        # explosion.  The default preserves legacy behavior.
+        self.fragment_release_impulse_ramp_substeps = max(
+            int(fp.get('fragment_release_impulse_ramp_substeps', 1)), 1)
         # Velocity-clamp scale: 1.0 = standard CFL-safe cap; >1.0 lets
         # fragments fall faster than the dx/dt limit (use with caution
         # under aggressive gravity, may cause numerical jitter).
@@ -520,6 +526,39 @@ class ManifoldSimulator(
         self.rigid_handoff_floor_friction = float(
             fp.get('rigid_handoff_floor_friction',
                    max(self.rigid_contact_friction, 0.45)))
+        self.rigid_handoff_floor_angular_friction = max(0.0, float(
+            fp.get('rigid_handoff_floor_angular_friction', 0.0)))
+        # Rigid handoff birth controls.  These are initial-condition
+        # corrections at the moment a Voronoi fragment becomes mechanically
+        # independent: cap lateral COM energy from accumulated crack-opening
+        # kicks, and optionally transfer some release energy into downward
+        # motion so shards fall instead of hovering near the parent body.
+        # 0.0 disables each knob.
+        self.rigid_handoff_birth_lateral_velocity_cap = max(0.0, float(
+            fp.get('rigid_handoff_birth_lateral_velocity_cap', 0.0)))
+        self.rigid_handoff_birth_inherited_lateral_velocity_scale = max(
+            0.0,
+            min(float(fp.get(
+                'rigid_handoff_birth_inherited_lateral_velocity_scale', 1.0)),
+                1.0),
+        )
+        self.rigid_handoff_birth_downward_velocity = max(0.0, float(
+            fp.get('rigid_handoff_birth_downward_velocity', 0.0)))
+        self.rigid_handoff_birth_angular_velocity_scale = max(0.0, float(
+            fp.get('rigid_handoff_birth_angular_velocity_scale', 0.0)))
+        self.rigid_handoff_birth_body_angular_velocity_scale = max(0.0, float(
+            fp.get('rigid_handoff_birth_body_angular_velocity_scale', 0.0)))
+        self.rigid_handoff_birth_tumble_gain = max(0.0, float(
+            fp.get('rigid_handoff_birth_tumble_gain', 0.0)))
+        self.rigid_handoff_birth_angular_velocity_cap = max(0.0, float(
+            fp.get('rigid_handoff_birth_angular_velocity_cap', 0.0)))
+        self.rigid_handoff_pair_contact_birth_slop = max(0.0, float(
+            fp.get('rigid_handoff_pair_contact_birth_slop', 2.0)))
+        self.rigid_handoff_floor_contact_torque = bool(
+            fp.get('rigid_handoff_floor_contact_torque', False))
+        self.rigid_handoff_floor_contact_angular_gain = max(0.0, float(
+            fp.get('rigid_handoff_floor_contact_angular_gain',
+                   self.rigid_contact_angular_gain)))
         self.soft_contact_rebound = float(
             fp.get('soft_contact_rebound', shape_defaults.get("soft_rebound", 0.0)))
         self.soft_contact_rebound_frames = max(
@@ -571,6 +610,8 @@ class ManifoldSimulator(
         self._last_stress = None
         self._last_volumetric_damage_max = 0.0
         self._last_volumetric_damage_mean = 0.0
+        self._last_topology_damage_max = 0.0
+        self._last_topology_damage_mean = 0.0
         # Pipeline rewrite Step 1a: c_mech cache scaffold.  Set per
         # fracture tick by _step_physics; reused by future steps when
         # fracture tick interval > 1 substep.
@@ -580,6 +621,7 @@ class ManifoldSimulator(
         # loop.  step_rendering consumes it at frame end via
         # _voronoi_spatial_split_and_refine() when the flag is on.
         self._last_voronoi_components_state: Optional[Dict] = None
+        self._pending_voronoi_cell_releases = []
         self._phase_tick_budget_frame: int = -1
         self._phase_tick_budget_total: int = 0
         self._phase_tick_budget_ticks: int = 1
@@ -1133,6 +1175,9 @@ class ManifoldSimulator(
         voronoi_per_tick = bool(self.fracture_cfg.get(
             'voronoi_eval_per_fracture_tick', False))
 
+        if hasattr(self, "_apply_pending_voronoi_cell_releases"):
+            self._apply_pending_voronoi_cell_releases()
+
         # Compute stress with damage degradation.
         #
         # Step 1a (pipeline rewrite, 2026-05-09): introduce c_visual / c_mech
@@ -1163,6 +1208,7 @@ class ManifoldSimulator(
             state = self._voronoi_bond_eval_commit()
             if state is not None:
                 self._last_voronoi_components_state = state
+            self._apply_pending_voronoi_cell_releases()
 
         c_mech = self._compute_c_mech(c_visual)
 
@@ -1195,6 +1241,7 @@ class ManifoldSimulator(
                 state = self._voronoi_bond_eval_commit()
                 if state is not None:
                     self._last_voronoi_components_state = state
+                self._apply_pending_voronoi_cell_releases()
 
         # Floor position clamp: the slip BC only zeros grid v_z, it
         # does not stop particles from drifting below ``ground_z``
@@ -1382,6 +1429,80 @@ class ManifoldSimulator(
                   f"|stress|={s_max:.2e} CFL~{self._last_cfl:.3f}")
 
         self._physics_step += 1
+
+    def _get_voronoi_topology_damage(self) -> Tensor:
+        """Project phase-field topology evidence to MPM particles.
+
+        This is the Voronoi breakage signal (`c_topology` in the
+        pipeline spec).  It intentionally excludes mechanical feedback
+        timing, graph-fragment structural floors, and
+        `_physical_fragment_labels` feedback.  Otherwise the topology
+        solver can use its own previous labels as new "damage" evidence
+        and create fragments before the AT2/front field has actually
+        reached that region.
+        """
+        N = self.x_mpm.shape[0]
+        c_topology = torch.zeros(N, device=self.x_mpm.device)
+        field = getattr(self, "fracture_field", None)
+        if field is None or field.c is None:
+            self._last_topology_damage_max = 0.0
+            self._last_topology_damage_mean = 0.0
+            return c_topology
+
+        if self._surface_indices is None:
+            self._surface_indices = torch.where(self.surface_mask)[0]
+        n_assign = min(int(field.c.shape[0]), int(self._surface_indices.shape[0]))
+        if n_assign <= 0:
+            self._last_topology_damage_max = 0.0
+            self._last_topology_damage_mean = 0.0
+            return c_topology
+
+        surf_topology = field.c[:n_assign].clamp(0.0, 1.0).clone()
+
+        crack_front = getattr(field, "crack_front", None)
+        if crack_front is not None:
+            visited = getattr(crack_front, "visited_mask", None)
+            tips = getattr(crack_front, "tip_mask", None)
+            if visited is not None:
+                visited = visited[:n_assign]
+                surf_topology = torch.maximum(
+                    surf_topology,
+                    visited.float() * self.crack_volume_visited_floor,
+                )
+            if tips is not None:
+                tips = tips[:n_assign]
+                surf_topology = torch.maximum(
+                    surf_topology,
+                    tips.float() * self.crack_volume_tip_floor,
+                )
+
+        if field.a is not None:
+            opening = field.a[:n_assign].clamp(min=0.0)
+            if bool(opening.max() > 0.0):
+                opening_scale = torch.quantile(
+                    opening.detach(), 0.85).clamp(min=1e-6)
+                opening_norm = (opening / opening_scale).clamp(0.0, 1.0)
+                surf_topology = torch.maximum(
+                    surf_topology,
+                    (
+                        field.c[:n_assign].clamp(0.0, 1.0)
+                        + self.crack_volume_opening_gain * opening_norm
+                    ).clamp(0.0, 1.0),
+                )
+
+        interior_scale = float(self.fracture_cfg.get(
+            "voronoi_topology_interior_scale",
+            max(float(self.crack_volume_interior_scale), 0.85),
+        ))
+        c_topology = self._project_surface_scalar_to_particles(
+            surf_topology.clamp(0.0, 1.0),
+            interior_scale=interior_scale,
+        ).clamp(0.0, 1.0)
+        self._last_topology_damage_max = (
+            float(c_topology.max().item()) if c_topology.numel() else 0.0)
+        self._last_topology_damage_mean = (
+            float(c_topology.mean().item()) if c_topology.numel() else 0.0)
+        return c_topology
 
     def _get_volumetric_damage(self) -> Tensor:
         """
@@ -2717,6 +2838,8 @@ class ManifoldSimulator(
             "phase_y_cut_threshold": float(self.phase_y_cut_threshold),
             "volumetric_damage_max": float(self._last_volumetric_damage_max),
             "volumetric_damage_mean": float(self._last_volumetric_damage_mean),
+            "topology_damage_max": float(self._last_topology_damage_max),
+            "topology_damage_mean": float(self._last_topology_damage_mean),
             "surface_volume_damage_proxy_max": float(self._last_surface_volume_damage_proxy_max),
             "surface_volume_damage_proxy_mean": float(self._last_surface_volume_damage_proxy_mean),
             "rigid_angular_speed_max": float(self._last_rigid_angular_speed_max),

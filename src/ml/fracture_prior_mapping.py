@@ -101,16 +101,20 @@ def fracture_prior_to_runtime_overrides(
     )
 
     if family == "sharp_brittle":
-        successor_topk = 1
-        max_branching_tips = min(max_branching_tips, 8)
-        branch_score_ratio = max(branch_score_ratio, 0.92)
-        branch_drive_threshold = max(branch_drive_threshold, 0.62)
-        damage_spread *= 0.65
+        # Keep glass-class cracks sharp by default, but do not collapse the
+        # sentence/style channel into a single-tip solver.  Pulverization
+        # and radial shatter styles need multiple active crack fronts; the
+        # later style runtime may raise these further.
+        successor_topk = min(max(successor_topk, 1), 3)
+        max_branching_tips = min(max_branching_tips, 24)
+        branch_score_ratio = max(branch_score_ratio, 0.72)
+        branch_drive_threshold = max(branch_drive_threshold, 0.24)
+        damage_spread *= 0.85
         damage_source_scale *= 1.12
         tip_propagation_scale *= 1.05
         opening_scale *= 1.35
         dC_max *= 0.92
-        drive_quantile = max(drive_quantile, 0.78)
+        drive_quantile = max(drive_quantile, 0.60)
         gaussian_damage_threshold = min(gaussian_damage_threshold + 0.03, 0.34)
         crack_max_opening *= 1.35
         crack_gap_fraction *= 1.16

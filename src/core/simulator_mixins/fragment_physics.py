@@ -519,6 +519,48 @@ class FragmentPhysicsMixin:
         com = x.mean(dim=0)
         local = x - com.unsqueeze(0)
         v_com = v.mean(dim=0)
+        base_v_com = None
+        base_com = None
+        labels = getattr(self, "_physical_fragment_labels", None)
+        if labels is not None and labels.shape[0] == self.v_mpm.shape[0]:
+            base_mask = labels.to(device=self.v_mpm.device) == 0
+            if bool(base_mask.any()):
+                base_com = self.x_mpm[base_mask].mean(dim=0).detach()
+                base_v_com = self.v_mpm[base_mask].mean(dim=0).detach()
+        lateral_cap = float(getattr(
+            self, "rigid_handoff_birth_lateral_velocity_cap", 0.0))
+        inherited_lateral_scale = max(0.0, min(float(getattr(
+            self,
+            "rigid_handoff_birth_inherited_lateral_velocity_scale",
+            1.0,
+        )), 1.0))
+        if base_v_com is not None and inherited_lateral_scale < 1.0:
+            rel_xy = v_com[:2] - base_v_com[:2]
+            v_com[:2] = base_v_com[:2] + inherited_lateral_scale * rel_xy
+        elif base_v_com is None and inherited_lateral_scale < 1.0:
+            v_com[:2] = inherited_lateral_scale * v_com[:2]
+        if lateral_cap > 0.0:
+            if base_v_com is None:
+                v_xy = v_com[:2]
+                v_xy_norm = float(v_xy.norm().item())
+                if v_xy_norm > lateral_cap:
+                    v_com[:2] = v_xy * (lateral_cap / max(v_xy_norm, 1e-8))
+            else:
+                rel_xy = v_com[:2] - base_v_com[:2]
+                rel_xy_norm = float(rel_xy.norm().item())
+                if rel_xy_norm > lateral_cap:
+                    v_com[:2] = base_v_com[:2] + rel_xy * (
+                        lateral_cap / max(rel_xy_norm, 1e-8))
+        birth_down = float(getattr(
+            self, "rigid_handoff_birth_downward_velocity", 0.0))
+        if birth_down > 0.0 and bool(getattr(self, "_gravity_drop_contacted", False)):
+            base_vz = (
+                base_v_com[2] if base_v_com is not None
+                else torch.zeros((), device=v_com.device, dtype=v_com.dtype)
+            )
+            target_vz = torch.tensor(
+                -birth_down, device=v_com.device, dtype=v_com.dtype) + base_vz
+            v_com[2] = torch.minimum(v_com[2], target_vz)
         if bool(getattr(self, "fracture_cfg", {}).get(
                 "rigid_handoff_inherit_particle_spin", False)):
             omega = self._component_angular_velocity(local, v - v_com.unsqueeze(0))
@@ -533,12 +575,63 @@ class FragmentPhysicsMixin:
                     dtype=self.x_mpm.dtype,
                 ).detach().clone()
         else:
-            # Detached rigid fragments do not have a resolved contact-torque
-            # model yet.  Inheriting the whole-body tumble makes every shard
-            # keep the parent bunny's angular velocity forever, which reads as
-            # artificial post-fracture spinning.  Keep spin opt-in until a real
-            # per-fragment angular impulse/contact model exists.
-            omega = torch.zeros(3, device=self.x_mpm.device, dtype=self.x_mpm.dtype)
+            # Capture only detachment-local angular momentum.  Full parent
+            # body spin is subtracted so all shards do not inherit the same
+            # perpetual tumble, but residual intra-fragment angular velocity
+            # from crack opening / MPM contact is preserved.
+            raw_omega = self._component_angular_velocity(
+                local, v - v_com.unsqueeze(0))
+            parent_omega = getattr(self, "_omega_com", None)
+            if parent_omega is None:
+                parent_omega = torch.zeros(
+                    3, device=self.x_mpm.device, dtype=self.x_mpm.dtype)
+            else:
+                parent_omega = parent_omega.to(
+                    device=self.x_mpm.device,
+                    dtype=self.x_mpm.dtype,
+                )
+            omega = (
+                raw_omega - parent_omega
+            ) * float(getattr(
+                self, "rigid_handoff_birth_angular_velocity_scale", 0.0))
+            body_spin_scale = float(getattr(
+                self, "rigid_handoff_birth_body_angular_velocity_scale", 0.0))
+            if body_spin_scale > 0.0:
+                omega = omega + parent_omega * body_spin_scale
+
+            tumble_gain = float(getattr(
+                self, "rigid_handoff_birth_tumble_gain", 0.0))
+            if tumble_gain > 0.0 and base_v_com is not None:
+                rel_v = v_com - base_v_com
+                speed = float(rel_v.norm().item())
+                if speed > 1e-6 and float(local.norm().item()) > 1e-8:
+                    try:
+                        _, _, vh = torch.linalg.svd(local, full_matrices=False)
+                        major_axis = vh[0]
+                    except RuntimeError:
+                        major_axis = None
+                    if major_axis is not None:
+                        motion_dir = rel_v / rel_v.norm().clamp(min=1e-8)
+                        axis = torch.cross(major_axis, motion_dir, dim=0)
+                        if float(axis.norm().item()) < 1e-8 and base_com is not None:
+                            radial = com - base_com
+                            if float(radial.norm().item()) > 1e-8:
+                                axis = torch.cross(
+                                    radial / radial.norm().clamp(min=1e-8),
+                                    motion_dir,
+                                    dim=0,
+                                )
+                        if float(axis.norm().item()) > 1e-8:
+                            axis = axis / axis.norm().clamp(min=1e-8)
+                            radius = local.norm(dim=1).quantile(0.75).clamp(
+                                min=float(self.mpm.dx))
+                            omega = omega + axis * (
+                                tumble_gain * speed / radius)
+            omega_cap = float(getattr(
+                self, "rigid_handoff_birth_angular_velocity_cap", 0.0))
+            omega_norm = float(omega.norm().item())
+            if omega_cap > 0.0 and omega_norm > omega_cap:
+                omega = omega * (omega_cap / max(omega_norm, 1e-8))
         dtype = self.x_mpm.dtype
         device = self.x_mpm.device
         eye = torch.eye(3, device=device, dtype=dtype)
@@ -557,6 +650,7 @@ class FragmentPhysicsMixin:
             "local": local.detach().clone(),
             "R": eye.detach().clone(),
             "com": com.detach().clone(),
+            "birth_com": com.detach().clone(),
             "v_com": v_com.detach().clone(),
             "omega": omega.detach().clone(),
             "mass": mass,
@@ -624,24 +718,58 @@ class FragmentPhysicsMixin:
             return
 
         n = torch.tensor([0.0, 0.0, 1.0], device=rel.device, dtype=rel.dtype)
-        # The rigid handoff path does not have a resolved mesh contact
-        # point.  A single averaged particle contact point creates an
-        # arbitrary lever arm and turns floor impulses into synthetic
-        # spin.  Resolve the plane normal impulse at the COM; future
-        # angular motion should come from an explicit torque/contact
-        # model, not from MPM particle scatter.
-        vn = torch.dot(state["v_com"], n)
+        contact_pos = pos[contact_mask]
+        depth = (ground_z + band - contact_pos[:, 2]).clamp(min=0.0)
+        if float(depth.sum().item()) > 1e-8:
+            weights = depth / depth.sum().clamp(min=1e-8)
+            contact_point = (contact_pos * weights.unsqueeze(1)).sum(dim=0)
+        else:
+            contact_point = contact_pos.mean(dim=0)
+        r = contact_point - state["com"]
 
         inv_m = 1.0 / max(float(state["mass"]), 1e-12)
         e = max(0.0, min(float(getattr(
             self, "rigid_handoff_restitution",
             getattr(self, "rigid_contact_restitution", 0.0),
         )), 0.95))
+        torque_enabled = bool(getattr(
+            self, "rigid_handoff_floor_contact_torque", True))
+        angular_gain = max(0.0, float(getattr(
+            self,
+            "rigid_handoff_floor_contact_angular_gain",
+            getattr(self, "rigid_contact_angular_gain", 0.0),
+        )))
+        inertia_inv = None
+        omega = state.get("omega")
+        if torque_enabled and omega is not None and float(r.norm().item()) > 1e-8:
+            try:
+                inertia_inv = self._rigid_world_inertia_inv(state)
+            except RuntimeError:
+                inertia_inv = None
+
+        if inertia_inv is not None:
+            v_contact = state["v_com"] + torch.cross(omega, r, dim=0)
+            vn = torch.minimum(v_contact.dot(n), state["v_com"].dot(n))
+        else:
+            v_contact = state["v_com"]
+            vn = torch.dot(state["v_com"], n)
+
         normal_impulse_mag = 0.0
         if float(vn.item()) < 0.0:
-            normal_impulse_mag = -(1.0 + e) * float(vn.item()) / inv_m
+            denom = inv_m
+            if inertia_inv is not None:
+                rn = torch.cross(r, n, dim=0)
+                angular_term = n.dot(torch.cross(inertia_inv @ rn, r, dim=0))
+                denom = denom + max(float(angular_term.item()), 0.0)
+            denom = max(float(denom), 1e-8)
+            normal_impulse_mag = -(1.0 + e) * float(vn.item()) / denom
             impulse = normal_impulse_mag * n
             state["v_com"] = state["v_com"] + impulse * inv_m
+            # Keep the normal support impulse torque-free.  With only a
+            # particle-cloud contact patch, the normal lever arm is too noisy
+            # for small shards and creates hundreds of rad/s of fake spin.
+            # Tangential friction below is the resolved source of contact
+            # angular momentum.
 
         # Coulomb floor friction for rigid handoff fragments.  This is a
         # contact impulse, not free-space fragment damping: it only acts
@@ -649,31 +777,54 @@ class FragmentPhysicsMixin:
         # normal load includes the collision impulse plus the per-step
         # support impulse from gravity, so resting fragments can settle
         # instead of sliding forever on a frictionless plane.
+        gravity = self.mpm.gravity.to(device=rel.device, dtype=rel.dtype)
+        mass = max(float(state["mass"]), 1e-12)
+        support_impulse_mag = (
+            max(0.0, -float(torch.dot(gravity, n).item()))
+            * mass
+            * max(float(dt), 0.0)
+        )
         mu = max(0.0, float(getattr(
             self, "rigid_handoff_floor_friction",
             getattr(self, "rigid_contact_friction", 0.0),
         )))
-        if mu <= 0.0:
-            return
-        gravity = self.mpm.gravity.to(device=rel.device, dtype=rel.dtype)
-        support_impulse_mag = (
-            max(0.0, -float(torch.dot(gravity, n).item()))
-            * max(float(state["mass"]), 1e-12)
-            * max(float(dt), 0.0)
-        )
-        friction_cap = mu * (normal_impulse_mag + support_impulse_mag)
-        if friction_cap <= 0.0:
-            return
-        v_n = torch.dot(state["v_com"], n) * n
-        v_t = state["v_com"] - v_n
-        v_t_norm = float(v_t.norm().item())
-        if v_t_norm <= 1e-8:
-            return
-        stop_impulse_mag = max(float(state["mass"]), 1e-12) * v_t_norm
-        applied = min(stop_impulse_mag, friction_cap)
-        state["v_com"] = state["v_com"] - (applied / max(float(state["mass"]), 1e-12)) * (
-            v_t / v_t.norm().clamp(min=1e-8)
-        )
+        if mu > 0.0:
+            friction_cap = mu * (normal_impulse_mag + support_impulse_mag)
+            if friction_cap > 0.0:
+                omega = state.get("omega")
+                if inertia_inv is not None and omega is not None:
+                    v_contact = state["v_com"] + torch.cross(omega, r, dim=0)
+                else:
+                    v_contact = state["v_com"]
+                v_n = torch.dot(v_contact, n) * n
+                v_t = v_contact - v_n
+                v_t_norm = float(v_t.norm().item())
+                if v_t_norm > 1e-8:
+                    stop_impulse_mag = mass * v_t_norm
+                    applied = min(stop_impulse_mag, friction_cap)
+                    friction_impulse = -applied * (
+                        v_t / v_t.norm().clamp(min=1e-8))
+                    state["v_com"] = state["v_com"] + friction_impulse * inv_m
+                    if inertia_inv is not None and angular_gain > 0.0:
+                        state["omega"] = state["omega"] + angular_gain * (
+                            inertia_inv @ torch.cross(r, friction_impulse, dim=0))
+
+        # Rolling/contact angular friction.  This is contact-only: airborne
+        # shards keep their birth angular momentum, but pieces resting on the
+        # floor lose spin through the support impulse instead of spinning
+        # forever.
+        mu_roll = max(0.0, float(getattr(
+            self, "rigid_handoff_floor_angular_friction", 0.0)))
+        omega = state.get("omega")
+        if mu_roll > 0.0 and omega is not None:
+            omega_norm = float(omega.norm().item())
+            if omega_norm > 1e-8:
+                support_accel = max(0.0, -float(torch.dot(gravity, n).item()))
+                radius = max(float(state.get("radius", float(self.mpm.dx))),
+                             float(self.mpm.dx))
+                domega = mu_roll * support_accel * max(float(dt), 0.0) / radius
+                if domega > 0.0:
+                    state["omega"] = omega * max(0.0, 1.0 - domega / omega_norm)
 
     def _solve_rigid_fragment_pair_contacts(self) -> None:
         states = getattr(self, "_rigid_fragment_states", {})
@@ -693,6 +844,39 @@ class FragmentPhysicsMixin:
                 ra = float(a["radius"])
                 rb = float(b["radius"])
                 target = ra + rb
+                # Bounding spheres are a broad phase, not the shard mesh.
+                # Immediately after fracture, adjacent shards can have very
+                # overlapping spheres even though their surfaces are only
+                # touching along the crack.  Resolving that overlap to
+                # ``ra + rb`` creates the visual "explosion".  Treat the
+                # birth COM distance as the non-penetrating rest separation
+                # for sibling fragments; contact only corrects motion that
+                # compresses them beyond that rest distance plus a small slop.
+                birth_a = a.get("birth_com")
+                birth_b = b.get("birth_com")
+                if birth_a is not None and birth_b is not None:
+                    birth_delta = (
+                        birth_b.to(device=delta.device, dtype=delta.dtype)
+                        - birth_a.to(device=delta.device, dtype=delta.dtype)
+                    )
+                    slop = max(
+                        float(getattr(
+                            self,
+                            "rigid_handoff_pair_contact_birth_slop",
+                            2.0,
+                        )) * float(self.mpm.dx),
+                        1e-6,
+                    )
+                    # Treat the birth separation as the rest distance and
+                    # allow a small tolerance before applying broad-phase
+                    # sphere correction.  Using birth_distance + slop pushes
+                    # every sibling pair apart immediately after fracture,
+                    # which makes fully-pulverized objects expand even when
+                    # explicit release velocity is disabled.
+                    target = min(
+                        target,
+                        max(float(birth_delta.norm().item()) - slop, 0.0),
+                    )
                 if float(dist.item()) >= target:
                     continue
                 if float(dist.item()) < 1e-8:
