@@ -612,9 +612,22 @@ class FragmentPhysicsMixin:
         # Step 4a: skip position pull on detached fragments when the
         # corresponding flag is disabled.  Velocity injection still
         # runs below so cohesion is preserved through v.
+        #
+        # Guard: Step 4a is only meaningful when fragment identity is
+        # owned by the voronoi authority (Step 2).  Without that, the
+        # incoming label may be a graph-fragment id whose physical
+        # separation is not yet established, and skipping the pull
+        # would bleed cohesion from still-connected pieces.  We
+        # therefore require ``use_physical_fragment_authority`` to be
+        # True before honouring the skip.
         position_pull_enabled = bool(self.fracture_cfg.get(
             'shape_match_fragment_position_pull', True))
-        if is_fragment and not position_pull_enabled:
+        physical_authority = bool(self.fracture_cfg.get(
+            'use_physical_fragment_authority', False))
+        skip_pull = (is_fragment
+                     and not position_pull_enabled
+                     and physical_authority)
+        if skip_pull:
             new = old
         else:
             self.x_mpm[idx] = new
