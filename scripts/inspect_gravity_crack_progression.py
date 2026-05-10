@@ -219,6 +219,19 @@ def _surface_state(
 
 
 def _fragment_ids(simulator, n: int) -> torch.Tensor | None:
+    use_physical = bool(getattr(simulator, "fracture_cfg", {}).get(
+        "use_physical_fragment_authority", False))
+    if use_physical:
+        physical_labels = getattr(simulator, "_physical_fragment_labels", None)
+        surface_indices = getattr(simulator, "_surface_indices", None)
+        if physical_labels is None:
+            return None
+        try:
+            if surface_indices is not None:
+                return physical_labels[surface_indices][:n].detach()
+            return physical_labels[:n].detach()
+        except Exception:
+            return None
     manager = getattr(simulator, "fragment_manager", None)
     if manager is None or getattr(manager, "fragment_ids", None) is None:
         return None

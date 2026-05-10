@@ -154,6 +154,133 @@ class MPMModel:
         return x, v, C, F
 
     @torch.no_grad()
+    def p2g2p_masked(
+        self,
+        x: Tensor,
+        v: Tensor,
+        C: Tensor,
+        F: Tensor,
+        stress: Tensor,
+        active_mask: Tensor,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Run one MPM step for active particles and leave inactive ones untouched.
+
+        Detached rigid fragments use this path to leave the shared MPM grid
+        completely instead of being re-coupled through P2G/G2P after their
+        fragment birth.  The method advances ``self.time`` exactly once,
+        matching ``p2g2p``.
+        """
+        if active_mask is None:
+            return self.p2g2p(x, v, C, F, stress)
+        active_mask = active_mask.to(device=x.device, dtype=torch.bool)
+        if active_mask.shape[0] != x.shape[0] or bool(active_mask.all()):
+            return self.p2g2p(x, v, C, F, stress)
+
+        indices = torch.where(active_mask)[0]
+        if indices.numel() == 0:
+            self.time += self.dt
+            return x, v, C, F
+
+        dt = self.dt
+        vol = self.vol
+        p_mass = self.p_mass
+        dx = self.dx
+        inv_dx = self.inv_dx
+        n_grids = self.num_grids
+        clip_bound = self.clip_bound
+
+        if self.pre_particle_process:
+            x_pre = x.clone()
+            v_pre = v.clone()
+            for operation in self.pre_particle_process:
+                operation(self, x_pre, v_pre)
+            x = x_pre
+            v = v_pre
+
+        x_s = x[indices]
+        v_s = v[indices]
+        C_s = C[indices]
+        F_s = F[indices]
+        stress_s = stress[indices]
+
+        px = x_s * inv_dx
+        base = (px - 0.5).long()
+        fx = px - base.float()
+
+        w = [
+            0.5 * (1.5 - fx) ** 2,
+            0.75 - (fx - 1) ** 2,
+            0.5 * (fx - 0.5) ** 2,
+        ]
+        w = torch.stack(w, dim=-1)
+        w_e = torch.einsum('bi,bj,bk->bijk', w[:, 0], w[:, 1], w[:, 2])
+        weight = w_e.reshape(-1, 27)
+
+        dw = [fx - 1.5, -2.0 * (fx - 1.0), fx - 0.5]
+        dw = torch.stack(dw, dim=-1)
+        dweight = [
+            torch.einsum('pi,pj,pk->pijk', dw[:, 0], w[:, 1], w[:, 2]),
+            torch.einsum('pi,pj,pk->pijk', w[:, 0], dw[:, 1], w[:, 2]),
+            torch.einsum('pi,pj,pk->pijk', w[:, 0], w[:, 1], dw[:, 2]),
+        ]
+        dweight = inv_dx * torch.stack(dweight, dim=-1).reshape(-1, 27, 3)
+
+        dpos = (self.offset - fx.unsqueeze(1)) * dx
+        index = base.unsqueeze(1) + self.offset.unsqueeze(0).long()
+        index = (
+            index[:, :, 0] * n_grids * n_grids
+            + index[:, :, 1] * n_grids
+            + index[:, :, 2]
+        ).reshape(-1)
+        index = index.clamp(0, n_grids ** 3 - 1)
+
+        self.grid_mv = torch.zeros_like(self.grid_mv)
+        self.grid_m = torch.zeros_like(self.grid_m)
+
+        mv = (
+            -dt * vol * torch.einsum('bij,bkj->bki', stress_s, dweight)
+            + p_mass * weight.unsqueeze(2)
+            * (v_s.unsqueeze(1) + torch.einsum('bij,bkj->bki', C_s, dpos))
+        )
+        mv = mv.reshape(-1, 3)
+        m = (weight * p_mass).reshape(-1)
+
+        self.grid_mv = self.grid_mv.index_add(dim=0, index=index, source=mv)
+        self.grid_m = self.grid_m.index_add(dim=0, index=index, source=m)
+
+        self.grid_update()
+
+        for operation in self.post_grid_process:
+            operation(self)
+
+        v_g = self.grid_mv.index_select(dim=0, index=index).reshape(-1, 27, 3)
+        C_new = torch.einsum('bij,bik->bijk', v_g, dpos)
+        new_F = torch.einsum('bij,bik->bijk', v_g, dweight)
+
+        v_new = (weight.unsqueeze(2) * v_g).sum(dim=1)
+        C_new = (
+            4.0 * inv_dx * inv_dx
+            * weight.unsqueeze(2).unsqueeze(3) * C_new
+        ).sum(dim=1)
+        new_F = dt * new_F.sum(dim=1)
+
+        x_new = x_s + v_new * dt
+        x_new = x_new.clamp(clip_bound, 1.0 - clip_bound)
+        F_new = F_s + torch.bmm(new_F, F_s)
+        F_new = F_new.clamp(-2.0, 2.0)
+
+        x = x.clone()
+        v = v.clone()
+        C = C.clone()
+        F = F.clone()
+        x[indices] = x_new
+        v[indices] = v_new
+        C[indices] = C_new
+        F[indices] = F_new
+        self.time += dt
+        return x, v, C, F
+
+    @torch.no_grad()
     def p2g2p_subset(
         self,
         x: Tensor,

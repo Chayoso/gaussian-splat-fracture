@@ -1587,8 +1587,10 @@ def main():
 
     t0 = time.time()
     first_split_frame = None
-    last_n_frags = 1
-    max_n_frags = 1
+    use_physical_authority_for_stats = bool(simulator.fracture_cfg.get(
+        'use_physical_fragment_authority', False))
+    last_n_frags = 0 if use_physical_authority_for_stats else 1
+    max_n_frags = 0 if use_physical_authority_for_stats else 1
     split_frame_count = 0
     current_split_run = 0
     longest_split_run = 0
@@ -1727,19 +1729,22 @@ def main():
         ff = simulator.fracture_field
         if frame % 5 == 0 or frame == total_frames - 1:
             damage = ff.c if ff.c is not None else torch.zeros(N_surf, device=device)
+            use_physical_authority = bool(getattr(simulator, "fracture_cfg", {}).get(
+                "use_physical_fragment_authority", False))
             frag_ids = None
             if (simulator.fragment_manager is not None
                     and simulator.fragment_manager.fragment_ids is not None):
                 frag_ids = simulator.fragment_manager.fragment_ids
-            physical_frag_ids = frag_ids
+            physical_frag_ids = None
             if (getattr(simulator, "_physical_fragment_labels", None) is not None
                     and getattr(simulator, "_surface_indices", None) is not None
                     and bool((simulator._physical_fragment_labels > 0).any())):
                 physical_frag_ids = simulator._physical_fragment_labels[simulator._surface_indices]
+            fallback_frag_ids = physical_frag_ids if use_physical_authority else frag_ids
             render_state = simulator._last_render_state or {}
             render_positions = render_state.get("positions", gaussians._xyz.data.detach())
             render_damage = render_state.get("damage", damage)
-            render_frag = render_state.get("fragment_ids", frag_ids)
+            render_frag = render_state.get("fragment_ids", fallback_frag_ids)
             render_visited = render_state.get(
                 "crack_visited",
                 ff.crack_front.visited_mask if hasattr(ff, 'crack_front') else None,
@@ -1777,7 +1782,12 @@ def main():
                     ),
                     file_prefix="fragment",
                 )
-            if physical_frag_ids is not None and n_frags > 1 and (frame % 10 == 0 or frame == total_frames - 1):
+            n_physical_frags = (
+                int(physical_frag_ids.max().item()) + 1
+                if physical_frag_ids is not None and bool((physical_frag_ids > 0).any())
+                else 0
+            )
+            if physical_frag_ids is not None and n_physical_frags > 1 and (frame % 10 == 0 or frame == total_frames - 1):
                 physical_positions = simulator.mapper.mpm_to_world(
                     simulator.x_mpm[simulator.surface_mask]
                 )
@@ -1793,7 +1803,7 @@ def main():
                     out_dir,
                     file_prefix="physical_crack",
                     title_extra=(
-                        f"  |  n_frags={n_frags}  cut_edges={cut_edges}"
+                        f"  |  n_frags={n_physical_frags}  cut_edges={cut_edges}"
                         f"  phys_detach={physical_detached_distance:.4f}"
                         f"  drop={physical_fragment_drop:.4f}"
                     ),
@@ -1808,7 +1818,7 @@ def main():
                         else None
                     ),
                     fragment_ids=physical_frag_ids[:n_phys],
-                    n_fragments=n_frags,
+                    n_fragments=n_physical_frags,
                     shard_mask=None,
                 )
                 plot_fragment_frame(
@@ -1917,10 +1927,25 @@ def main():
                 "broken_edges": gm.last_broken_edges,
                 "total_edges": gm.last_total_edges,
             }
-        print(f"  final_n_frags = {simulator.fragment_manager.n_fragments}")
+        use_physical_authority = bool(
+            simulator.fracture_cfg.get('use_physical_fragment_authority', False)
+        )
+        final_graph_n_frags = int(simulator.fragment_manager.n_fragments)
+        final_physical_n_frags = None
         if (getattr(simulator, "_physical_fragment_labels", None) is not None
                 and bool((simulator._physical_fragment_labels > 0).any())):
-            print(f"  final_physical_n_frags = {int(simulator._physical_fragment_labels.max().item()) + 1}")
+            final_physical_n_frags = int(
+                simulator._physical_fragment_labels.max().item()) + 1
+        if use_physical_authority:
+            if final_physical_n_frags is None:
+                final_physical_n_frags = 0
+            print(f"  final_n_frags = {final_physical_n_frags}")
+            print(f"  final_graph_n_frags = {final_graph_n_frags}")
+            print(f"  final_physical_n_frags = {final_physical_n_frags}")
+        else:
+            print(f"  final_n_frags = {final_graph_n_frags}")
+            if final_physical_n_frags is not None:
+                print(f"  final_physical_n_frags = {final_physical_n_frags}")
         print(f"  broken_edges = {simulator.fragment_manager.last_broken_edges}")
         print(f"  raw_components = {simulator.fragment_manager.last_raw_components}")
         print(f"  promoted_components = {simulator.fragment_manager.last_promoted_components}")

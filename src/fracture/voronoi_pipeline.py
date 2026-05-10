@@ -98,20 +98,23 @@ class VoronoiPipelineMixin:
             'voronoi_impact_min_factor', 0.01))
         impact_speed = float(getattr(self, '_soft_impact_speed', ref_speed))
         ke_factor = max(min_factor, min(1.0, impact_speed / max(ref_speed, 1e-3)))
-        # Quintic scaling on n_cells.  Base derivation is cubic from
-        # KE-to-fracture-area (A ∝ KE ∝ v^2 and A ∝ n^(2/3) → n ∝ v^3);
-        # additional factors of k_e capture (a) a speed-dependent
-        # dissipation efficiency ε(v_*) ∝ v_*, and (b) a stress-
-        # concentration term g(v_*) ∝ v_* — at low impact speeds the
-        # body stays mostly in the elastic regime, so very few stress
-        # concentrations exceed the local fracture toughness and n
-        # collapses well below the cubic bound.
-        n_cells = max(2, int(n_cells_full * (ke_factor ** 6)))
+        # Cell-count scaling.  The physical fracture-area argument gives a
+        # cubic relation (A ∝ KE ∝ v^2 and A ∝ n^(2/3) -> n ∝ v^3).  The
+        # previous v^6 falloff collapsed glass-tier 15K impacts
+        # (v≈42, ref=70) to two cells, so sentence styles could not express
+        # radial/chunky/pulverized topology.  Keep the cubic default and
+        # expose the exponent for future sweeps.
+        cell_exp = float(self.fracture_cfg.get(
+            'voronoi_impact_cell_exponent', 3.0))
+        cell_exp = max(1.0, min(cell_exp, 6.0))
+        n_cells = max(2, int(n_cells_full * (ke_factor ** cell_exp)))
 
-        # force_shrink scales INVERSELY: hard impact → 5% base cap
-        # (full pulverization), soft impact → 95% base (mostly intact).
+        # force_shrink scales inversely with impact energy, but gently.
+        # The old +2*ke_inv term saturated to 0.95 for ordinary glass drops,
+        # leaving a single giant base component even when many bonds broke.
         ke_inv = max(0.0, 1.0 - ke_factor)
-        force_shrink = force_shrink_full + ke_inv * 2.0
+        force_shrink = force_shrink_full + ke_inv * 0.40 * max(
+            1.0 - force_shrink_full, 0.0)
         force_shrink = min(0.95, max(0.0, force_shrink))
 
         # ke^2 family: kick magnitude, wave speed, shock radius, bond
@@ -169,6 +172,8 @@ class VoronoiPipelineMixin:
         self.voronoi.tessellate(self.x_mpm)
         self._voronoi_cell_graduated = [False] * self.voronoi.n_cells
         self._voronoi_prev_components = None
+        self._spatial_split_prev_labels = None
+        self._spatial_split_next_id = 1
         print(f"  [Voronoi] Tessellated into {self.voronoi.n_cells} cells "
               f"(distribution={distribution}, n_bonds={len(self.voronoi.cell_adjacency)})")
 
@@ -269,12 +274,42 @@ class VoronoiPipelineMixin:
         if labels.shape[0] == self.x_mpm.shape[0]:
             self._physical_fragment_labels = labels
             self._next_physical_fragment_id = int(labels.max().item()) + 1
-            # Pipeline rewrite Step 2: update the per-fragment birth
-            # registry whenever the voronoi label set changes.  Cheap
-            # (insert-only on new labels) and benign even when the
-            # authority flag is off — downstream consumers only read
-            # the registry under the flag.
-            self._update_physical_fragment_birth_registry()
+            if bool(getattr(self, "fracture_cfg", {}).get(
+                    "use_physical_fragment_authority", False)):
+                has_physical_fragment = bool((labels > 0).any())
+                if (has_physical_fragment
+                        and not bool(getattr(self, "fragmentation_active", False))):
+                    self.fragmentation_active = True
+                    self._fragment_activation_frame = self.frame_count
+                # The birth registry also synchronizes rigid handoff state
+                # and may rewrite tiny/no-base residue labels in place.
+                # Surface/render labels must be written after that sync.
+                self._update_physical_fragment_birth_registry()
+                labels = self._physical_fragment_labels
+                if (getattr(self, "_surface_indices", None) is not None
+                        and getattr(self, "fracture_field", None) is not None
+                        and self.fracture_field.c is not None
+                        and labels is not None):
+                    surf_labels = labels[self._surface_indices]
+                    n_field = int(self.fracture_field.c.shape[0])
+                    if surf_labels.shape[0] != n_field:
+                        f_phys = torch.zeros(
+                            n_field,
+                            dtype=torch.long,
+                            device=self.fracture_field.c.device,
+                        )
+                        n_assign = min(n_field, int(surf_labels.shape[0]))
+                        if n_assign > 0:
+                            f_phys[:n_assign] = surf_labels[:n_assign]
+                        surf_labels = f_phys
+                    self.fracture_field.f = surf_labels.to(
+                        device=self.fracture_field.c.device,
+                        dtype=torch.long,
+                    ).clone()
+            else:
+                # Pipeline rewrite Step 2: keep the registry warm for
+                # diagnostics even when physical authority is disabled.
+                self._update_physical_fragment_birth_registry()
 
         n_grad = int(components_state.get("n_graduated", 0))
         if n_grad > 0:
@@ -317,14 +352,25 @@ class VoronoiPipelineMixin:
 
         # Pass 1: spatial-CC produces a *temporary* sub-id per
         # particle, unique within this frame but not yet stabilised.
+        #
+        # Label convention is part of the mechanics contract:
+        # 0 = still-cohesive base body, >0 = detached fragment.  The
+        # incoming Voronoi labels already follow that convention when a
+        # dominant base exists.  Preserve the largest spatial component
+        # of label 0 as 0; any smaller pieces that split away from the
+        # base graduate to positive fragment ids.
+        has_cohesive_base = bool(np.any(per_particle == 0))
         temp = np.zeros_like(per_particle)
         next_temp = 1
         for old_fid in np.unique(per_particle):
             mask = per_particle == old_fid
             idxs = np.where(mask)[0]
             if idxs.size <= 1:
-                temp[idxs] = next_temp
-                next_temp += 1
+                if int(old_fid) == 0:
+                    temp[idxs] = 0
+                else:
+                    temp[idxs] = next_temp
+                    next_temp += 1
                 continue
             pts = positions[idxs]
             kdt = cKDTree(pts)
@@ -342,11 +388,47 @@ class VoronoiPipelineMixin:
                     parent[ra] = rb
             roots = np.array([find(i) for i in range(idxs.size)],
                              dtype=np.int64)
+            unique_roots, root_counts = np.unique(roots, return_counts=True)
+            base_root = None
+            if int(old_fid) == 0 and unique_roots.size > 0:
+                base_root = int(unique_roots[int(np.argmax(root_counts))])
             for r in np.unique(roots):
                 rmask = roots == r
                 if rmask.sum() <= 0:
                     continue
-                temp[idxs[rmask]] = next_temp
+                if base_root is not None and int(r) == base_root:
+                    temp[idxs[rmask]] = 0
+                else:
+                    temp[idxs[rmask]] = next_temp
+                    next_temp += 1
+
+        min_physical_size = max(
+            1,
+            int(getattr(self, "fragment_physical_min_size", 1)),
+        )
+        if min_physical_size > 1:
+            cluster_ids, cluster_sizes = np.unique(temp, return_counts=True)
+            for cid, size in zip(cluster_ids, cluster_sizes):
+                cid_int = int(cid)
+                if cid_int <= 0:
+                    continue
+                if int(size) < min_physical_size and has_cohesive_base:
+                    temp[temp == cid_int] = 0
+
+        # A tiny label-0 residue is not a coherent base body.  If it is
+        # left as label 0, base shape matching treats disconnected crumbs
+        # as one rigid component and injects artificial angular velocity.
+        # Promote it to a normal fragment so the rigid handoff path can
+        # absorb it into a real nearby shard.
+        base_count = int(np.count_nonzero(temp == 0))
+        if base_count > 0:
+            base_min_particles = max(
+                int(getattr(self, "shape_match_min_particles", 12)) * 2,
+                int(getattr(self, "fragment_render_min_size", 6)) * 4,
+                int(getattr(self, "rigid_handoff_min_particles", 1)),
+            )
+            if base_count < base_min_particles:
+                temp[temp == 0] = next_temp
                 next_temp += 1
 
         # Pass 2: stabilise.  Inherit each new cluster's id from its
@@ -369,6 +451,10 @@ class VoronoiPipelineMixin:
         order = np.argsort(-cluster_sizes)
         for ci in order:
             cid = int(cluster_ids[ci])
+            if cid == 0:
+                cluster_to_final[cid] = 0
+                used_ids.add(0)
+                continue
             mask = temp == cid
             n_in = int(mask.sum())
             if n_in == 0:
@@ -416,8 +502,8 @@ class VoronoiPipelineMixin:
         """
         if self.voronoi is None or self.voronoi.cell_centers is None:
             return
-        gain = float(getattr(self, "fragment_release_v_com_gain", 0.0))
-        if gain <= 0.0:
+        release_gain = float(getattr(self, "fragment_release_v_com_gain", 0.0))
+        if release_gain <= 0.0:
             return
         max_speed = max(float(getattr(
             self, "fragment_physical_max_speed", 30.0)), 0.05)
@@ -452,10 +538,15 @@ class VoronoiPipelineMixin:
         kick_scale = float(getattr(self, "_voronoi_kick_scale", 1.0))
         v_open = v_open * kick_scale
         # Floor for force-shrink/cascade-driven breaks (stress=0); cap
-        # at the configured max_speed.
+        # at the configured max_speed.  ``fragment_release_v_com_gain``
+        # is the style/material calibrated Mode-I opening target.  Older
+        # code only used it as an on/off switch, which made brittle
+        # styles visually too cohesive even when the sentence profile
+        # requested high-energy shattering.
         min_open_kick = float(getattr(
             self, "fragment_release_min_open_kick", 0.1))
-        v_open = max(min_open_kick, v_open)
+        target_open_kick = max(min_open_kick, release_gain)
+        v_open = max(target_open_kick, v_open)
         v_open = min(v_open, max_speed)
 
         idx_a = torch.where(

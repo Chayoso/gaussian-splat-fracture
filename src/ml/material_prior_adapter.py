@@ -9,6 +9,7 @@ This layer translates semantic CLIP retrieval results into:
 
 from __future__ import annotations
 
+import re
 from typing import Dict, Optional, Sequence
 
 import numpy as np
@@ -538,11 +539,18 @@ SENTENCE_STYLE_RULES = (
             # physics.  shape_match_velocity_blend = 0 disables the
             # correction-velocity injection that previously bypassed
             # mpm.damping and produced visible base-body oscillation.
-            "manifold.fragment_release_jitter": 0.0,
+            "manifold.fragment_release_jitter": 0.30,
             "manifold.fragment_offset_gain": 0.0,
             "manifold.fragment_visual_offset_scale": 0.0,
-            "manifold.fragment_physical_release_velocity": 0.0,
-            "manifold.fragment_physical_downward_bias": 0.0,
+            # Physical-authority dynamics: topology is decided by Voronoi,
+            # but newly born physical labels need a short COM separation
+            # window to overcome shared-grid coupling.  Keep this below
+            # pulverize/ultra so radial shards separate without exploding.
+            "manifold.fragment_physical_gap_scale": 0.0020,
+            "manifold.fragment_physical_release_velocity": 0.18,
+            "manifold.fragment_physical_release_frames": 6,
+            "manifold.fragment_physical_lateral_bias": 0.72,
+            "manifold.fragment_physical_downward_bias": 0.10,
             "manifold.shape_match_strength": 0.97,
             "manifold.shape_match_fragment_strength": 0.97,
             "manifold.shape_match_velocity_blend": 0.0,
@@ -683,11 +691,14 @@ SENTENCE_STYLE_RULES = (
             # Inherit v30 motion profile (no visual hacks, Griffith
             # release on, AT2 halt on, etc.) -- but with stronger
             # Griffith gain so the explosive feel matches the prompt.
-            "manifold.fragment_release_jitter": 0.0,
+            "manifold.fragment_release_jitter": 0.30,
             "manifold.fragment_offset_gain": 0.0,
             "manifold.fragment_visual_offset_scale": 0.0,
-            "manifold.fragment_physical_release_velocity": 0.0,
-            "manifold.fragment_physical_downward_bias": 0.0,
+            "manifold.fragment_physical_gap_scale": 0.0030,
+            "manifold.fragment_physical_release_velocity": 0.25,
+            "manifold.fragment_physical_release_frames": 6,
+            "manifold.fragment_physical_lateral_bias": 0.75,
+            "manifold.fragment_physical_downward_bias": 0.10,
             "manifold.shape_match_strength": 0.97,
             "manifold.shape_match_fragment_strength": 0.97,
             "manifold.shape_match_velocity_blend": 0.0,
@@ -780,13 +791,17 @@ SENTENCE_STYLE_RULES = (
             # shards") which previously degenerated to identical output.
             "thousands of fine", "thousands of tiny", "thousands of shards",
             "countless tiny", "countless fine", "countless glittering",
-            "fine glittering", "fine glittering shards", "ultra-fine",
-            "annihilated", "atomized", "disintegrated to dust",
+            "fine glittering", "fine glittering shards", "fine shards",
+            "ultra-fine",
+            "ultra brittle", "ultra-brittle", "annihilated", "atomized",
+            "disintegrated to dust",
             "complete dust", "fine dust cloud",
         ),
         "priority_tokens": (
             "thousands of fine", "thousands of tiny", "countless tiny",
-            "fine glittering", "ultra-fine", "annihilated", "atomized",
+            "fine glittering", "ultra-fine", "ultra brittle",
+            "ultra-brittle", "annihilated", "atomized",
+            "disintegrated to dust", "fine shards",
         ),
         "fracture_mult": {
             "tau_init": 0.65,
@@ -808,6 +823,12 @@ SENTENCE_STYLE_RULES = (
             "manifold.unified_impact_tumble_scale": 0.012,
             "manifold.fragment_release_v_com_gain": 6.0,
             "manifold.fragment_physical_max_speed": 50.0,
+            "manifold.fragment_release_jitter": 0.35,
+            "manifold.fragment_physical_gap_scale": 0.0035,
+            "manifold.fragment_physical_release_velocity": 0.30,
+            "manifold.fragment_physical_release_frames": 6,
+            "manifold.fragment_physical_lateral_bias": 0.78,
+            "manifold.fragment_physical_downward_bias": 0.08,
             "manifold.fragment_floor_restitution": 0.0,
             # Voronoi cell budget pushed to 400 (vs 250 in complete_
             # pulverization) so the "thousands of fine" prompt produces
@@ -827,6 +848,8 @@ SENTENCE_STYLE_RULES = (
             "manifold.voronoi_cascade_radius": 1.0,
             "manifold.voronoi_force_shrink_max_frac": 0.02,
             "manifold.fragment_release_position_offset": 0.012,
+            "manifold.fragment_physical_min_size": 6,
+            "manifold.fragment_render_min_size": 3,
             "manifold.particle_speed_cap": 80.0,
             "manifold.shape_match_static_omega": 25.0,
             "manifold.post_impact_gravity_z": -7500.0,
@@ -846,8 +869,11 @@ SENTENCE_STYLE_RULES = (
     {
         "name": "chunky_crumble",
         "tokens": (
-            "crumbling", "crumble", "chunks", "chunk", "granular",
-            "gritty", "rough pieces", "irregular chunks",
+            "crumbling", "crumble", "chunky", "chunks", "chunk", "granular",
+            "gritty", "rough pieces", "irregular pieces", "irregular chunks",
+        ),
+        "priority_tokens": (
+            "chunky", "chunks", "chunk", "irregular pieces", "irregular chunks",
         ),
         "fracture_mult": {
             "tau_init": 0.94,
@@ -887,6 +913,12 @@ SENTENCE_STYLE_RULES = (
             "manifold.fragment_release_position_offset": 0.012,
             "manifold.fragment_release_v_com_gain": 6.0,
             "manifold.fragment_physical_max_speed": 30.0,
+            "manifold.fragment_release_jitter": 0.20,
+            "manifold.fragment_physical_gap_scale": 0.0012,
+            "manifold.fragment_physical_release_velocity": 0.12,
+            "manifold.fragment_physical_release_frames": 6,
+            "manifold.fragment_physical_lateral_bias": 0.55,
+            "manifold.fragment_physical_downward_bias": 0.16,
             "manifold.unified_impact_impulse_scale": 0.003,
             "manifold.unified_impact_tumble_scale": 0.012,
         },
@@ -1565,12 +1597,24 @@ class MaterialPriorAdapter:
     @staticmethod
     def sentence_style_for_text(text: str) -> Dict[str, object]:
         q = str(text or "").lower()
+
+        def has_token(token: str) -> bool:
+            token = str(token or "").lower().strip()
+            if not token:
+                return False
+            if any(ch.isspace() for ch in token) or "-" in token:
+                return token in q
+            return re.search(
+                rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])",
+                q,
+            ) is not None
+
         matches = []
         for rule in SENTENCE_STYLE_RULES:
             tokens = tuple(rule.get("tokens", ()))
             priority_tokens = tuple(rule.get("priority_tokens", ()))
-            hits = sum(1 for token in tokens if token in q)
-            priority_hits = sum(1 for token in priority_tokens if token in q)
+            hits = sum(1 for token in tokens if has_token(token))
+            priority_hits = sum(1 for token in priority_tokens if has_token(token))
             if hits > 0 or priority_hits > 0:
                 matches.append((100 * priority_hits + hits, rule))
         if matches:

@@ -525,6 +525,8 @@ class GaussianCrackVisualizer:
         fragment_ids: Tensor = None,
         shard_mask: Tensor = None,
         graph_knn_idx: Tensor = None,
+        append_interior_faces: bool = True,
+        apply_crack_opening_offsets: bool = True,
     ):
         """Update Gaussian properties each frame.
 
@@ -571,7 +573,8 @@ class GaussianCrackVisualizer:
                 self._apply_manifold_crack_visualization(
                     gaussians, c_surface, crack_normals, crack_opening,
                     crack_tips=crack_tips, crack_visited=crack_visited,
-                    fragment_ids=fragment_ids)
+                    fragment_ids=fragment_ids,
+                    apply_opening_offsets=apply_crack_opening_offsets)
         else:
             # Legacy: scalar damage visualization
             has_damage = (c_surface is not None
@@ -592,15 +595,17 @@ class GaussianCrackVisualizer:
             self._apply_fragment_boundary_taper(
                 gaussians, fragment_ids, graph_knn_idx)
 
-        self._append_interior_crack_faces(
-            gaussians,
-            c_surface,
-            crack_normals=crack_normals,
-            crack_opening=crack_opening,
-            crack_tips=crack_tips,
-            crack_visited=crack_visited,
-            camera_pos=camera_pos,
-        )
+        if append_interior_faces:
+            self._append_interior_crack_faces(
+                gaussians,
+                c_surface,
+                crack_normals=crack_normals,
+                crack_opening=crack_opening,
+                crack_tips=crack_tips,
+                crack_visited=crack_visited,
+                fragment_ids=fragment_ids,
+                camera_pos=camera_pos,
+            )
 
     @torch.no_grad()
     def _apply_manifold_crack_visualization(
@@ -612,6 +617,7 @@ class GaussianCrackVisualizer:
         crack_tips: Tensor = None,
         crack_visited: Tensor = None,
         fragment_ids: Tensor = None,
+        apply_opening_offsets: bool = True,
     ):
         """Visualize cracks using manifold fracture state.
 
@@ -671,6 +677,8 @@ class GaussianCrackVisualizer:
 
         # --- 2. Position offset along crack normal (opening) ---
         open_mask = ((c_surface > 0.35) | crack_tips) & (crack_opening > 1e-4)
+        if not apply_opening_offsets:
+            open_mask = torch.zeros_like(open_mask, dtype=torch.bool)
         # Already-fragmented Gaussians (fragment_id > 0) are detached and
         # follow MPM rigid-body motion; the per-particle crack-gap offset
         # would only inject visible per-frame jitter on top of that, so
@@ -683,11 +691,18 @@ class GaussianCrackVisualizer:
             opening_mag = crack_opening[open_mask].clamp(min=0.0, max=self.crack_max_opening)
             tip_boost = 1.0 + crack_tips[open_mask].float() * (0.30 + self.crack_tip_scale_boost)
             offset = crack_normals[open_mask] * opening_mag.unsqueeze(1) * tip_boost.unsqueeze(1)
-            # Alternate sign based on position hash for two-sided opening
-            pos_hash = gaussians._xyz.data[open_mask].sum(dim=1)
-            sign = torch.where(pos_hash.frac() > 0.5,
-                               torch.ones_like(pos_hash),
-                               -torch.ones_like(pos_hash))
+            # Stable two-sided opening.  A position-hash sign can flip as
+            # the surface moves, making crack-adjacent splats flutter.
+            open_idx = torch.where(open_mask)[0].to(
+                device=gaussians._xyz.device,
+                dtype=gaussians._xyz.dtype,
+            )
+            sign_hash = torch.sin(open_idx * 12.9898 + 78.233)
+            sign = torch.where(
+                sign_hash >= 0.0,
+                torch.ones_like(sign_hash),
+                -torch.ones_like(sign_hash),
+            )
             gaussians._xyz.data[open_mask] += (
                 offset
                 * sign.unsqueeze(1)
@@ -733,6 +748,7 @@ class GaussianCrackVisualizer:
         crack_opening: Tensor = None,
         crack_tips: Tensor = None,
         crack_visited: Tensor = None,
+        fragment_ids: Tensor = None,
         camera_pos: Tensor = None,
     ) -> None:
         """Append render-only Gaussians for newly exposed crack interiors.
@@ -777,6 +793,8 @@ class GaussianCrackVisualizer:
             & (opening > 1e-5)
             & (crack_visited | crack_tips | (c > max(0.55, threshold)))
         )
+        if fragment_ids is not None and fragment_ids.shape[0] >= n_base:
+            face_mask = face_mask & (fragment_ids[:n_base] == 0)
         if not bool(face_mask.any()):
             return
 

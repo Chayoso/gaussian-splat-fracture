@@ -3,6 +3,7 @@
 This module is behavior-preserving extraction from manifold_simulator.py.
 """
 
+import math
 from typing import Optional
 
 import torch
@@ -10,6 +11,13 @@ from torch import Tensor
 
 
 class FragmentPhysicsMixin:
+    def _rigid_handoff_enabled(self) -> bool:
+        if not bool(getattr(self, "fracture_cfg", {}).get(
+                "use_physical_fragment_authority", False)):
+            return False
+        mode = str(getattr(self, "detached_fragment_dynamics", "mpm_shape_match"))
+        return mode in {"rigid_handoff", "rigid", "detached_rigid"}
+
     def _ensure_physical_fragment_registry(self, count: int, device) -> None:
         if (self._physical_fragment_labels is not None
                 and self._physical_fragment_labels.shape[0] == count
@@ -19,6 +27,7 @@ class FragmentPhysicsMixin:
             count, dtype=torch.long, device=device
         )
         self._physical_fragment_states = {}
+        self._rigid_fragment_states = {}
         self._next_physical_fragment_id = 1
 
     def _update_physical_fragment_registry(self, raw_particle_labels: Tensor) -> Tensor:
@@ -37,6 +46,36 @@ class FragmentPhysicsMixin:
         )
         return self._physical_fragment_labels.clone()
 
+    def _fragmented_physics_labels(self) -> Tensor:
+        """Return label overlay for fragment-aware post-P2G2P hooks."""
+        use_physical = bool(self.fracture_cfg.get(
+            'use_physical_fragment_authority', False))
+        if use_physical:
+            labels = self._physical_fragment_labels
+            if (
+                labels is not None
+                and labels.shape[0] == self.x_mpm.shape[0]
+                and labels.device == self.x_mpm.device
+            ):
+                return labels
+            return torch.zeros(
+                self.x_mpm.shape[0],
+                dtype=torch.long,
+                device=self.x_mpm.device,
+            )
+
+        if (
+            self.fragment_manager is not None
+            and getattr(self.fragment_manager, "fragment_ids", None) is not None
+        ):
+            return self._map_surface_labels_to_particles(
+                self.fragment_manager.fragment_ids)
+        return torch.zeros(
+            self.x_mpm.shape[0],
+            dtype=torch.long,
+            device=self.x_mpm.device,
+        )
+
     def _step_fragmented_physics(self, stress: Tensor, dt: float):
         """Single global MPM step with per-fragment label tracking.
 
@@ -48,9 +87,12 @@ class FragmentPhysicsMixin:
         p2g2p over all particles, with the per-fragment registry update
         + per-fragment shape matching applied as a label-only overlay.
         """
-        surf_frag_ids = self.fragment_manager.fragment_ids
-        raw_mpm_frag_ids = self._map_surface_labels_to_particles(surf_frag_ids)
-        mpm_frag_ids = self._update_physical_fragment_registry(raw_mpm_frag_ids)
+        mpm_frag_ids = self._fragmented_physics_labels()
+        rigid_enabled = self._rigid_handoff_enabled()
+        rigid_mask = None
+        if rigid_enabled:
+            self._sync_rigid_fragment_states(mpm_frag_ids)
+            rigid_mask = self._rigid_fragment_particle_mask(mpm_frag_ids)
 
         # Global P2G2P over all particles (base body + fragments share
         # the same grid).  Inter-fragment forces propagate naturally
@@ -71,8 +113,13 @@ class FragmentPhysicsMixin:
         if floor_restitution > 0.0 and getattr(self, "_gravity_drop_contacted", False):
             v_z_pre_for_bounce = self.v_mpm[:, 2].clone()
 
-        self.x_mpm, self.v_mpm, self.C, self.F = self.mpm.p2g2p(
-            self.x_mpm, self.v_mpm, self.C, self.F, stress)
+        if rigid_enabled and rigid_mask is not None and bool(rigid_mask.any()):
+            active_mask = ~rigid_mask
+            self.x_mpm, self.v_mpm, self.C, self.F = self.mpm.p2g2p_masked(
+                self.x_mpm, self.v_mpm, self.C, self.F, stress, active_mask)
+        else:
+            self.x_mpm, self.v_mpm, self.C, self.F = self.mpm.p2g2p(
+                self.x_mpm, self.v_mpm, self.C, self.F, stress)
 
         if v_z_pre_for_bounce is not None:
             ground_z = float(getattr(self, "_gravity_drop_ground_z", 0.05))
@@ -98,14 +145,22 @@ class FragmentPhysicsMixin:
         # particles only -- their effective per-substep damping is
         # 1.0, the base body keeps its 0.95.
         damping = float(self.mpm.damping)
-        if 0.0 < damping < 1.0:
+        if (not rigid_enabled) and 0.0 < damping < 1.0:
             mask = mpm_frag_ids > 0
             if bool(mask.any()):
                 self.v_mpm[mask] = self.v_mpm[mask] / damping
 
-        self._apply_fragment_extra_gravity(mpm_frag_ids, dt)
-        self._apply_physical_fragment_release_drift(mpm_frag_ids, dt)
-        self.mpm.time += dt
+        if rigid_enabled and rigid_mask is not None and bool(rigid_mask.any()):
+            nonrigid_frag_ids = torch.where(
+                rigid_mask,
+                torch.zeros_like(mpm_frag_ids),
+                mpm_frag_ids,
+            )
+            self._apply_fragment_extra_gravity(nonrigid_frag_ids, dt)
+            self._integrate_rigid_fragments(dt)
+        else:
+            self._apply_fragment_extra_gravity(mpm_frag_ids, dt)
+            self._apply_physical_fragment_release_drift(mpm_frag_ids, dt)
 
     @torch.no_grad()
     def _apply_fragment_extra_gravity(self, mpm_frag_ids: Tensor, dt: float) -> None:
@@ -137,7 +192,12 @@ class FragmentPhysicsMixin:
 
     def _apply_physical_fragment_release_drift(self, mpm_frag_ids: Tensor, dt: float) -> None:
         """Apply a small physical gap / release drift to support-lost fragments."""
-        if self.fragment_manager is None or self.fragment_manager.n_fragments <= 1:
+        use_physical_authority = bool(getattr(self, "fracture_cfg", {}).get(
+            "use_physical_fragment_authority", False))
+        if use_physical_authority:
+            if mpm_frag_ids is None or not bool((mpm_frag_ids > 0).any()):
+                return
+        elif self.fragment_manager is None or self.fragment_manager.n_fragments <= 1:
             return
         if self.fragment_physical_release_frames <= 0:
             return
@@ -207,11 +267,28 @@ class FragmentPhysicsMixin:
                     direction = self._safe_vector_normalize(
                         ((1.0 - jitter_mag) * direction + jitter_mag * rand3).unsqueeze(0)
                     ).squeeze(0)
+                # The release impulse is a post-impact separation aid,
+                # not an upward launch.  Jitter is 3D, so it can undo the
+                # downward bias unless we re-project it after blending.
+                if self.fragment_physical_downward_bias > 0.0:
+                    max_up = -0.015 * min(float(self.fragment_physical_downward_bias), 1.0)
+                    direction[2] = torch.minimum(
+                        direction[2],
+                        torch.tensor(max_up, device=direction.device, dtype=direction.dtype),
+                    )
+                    direction = self._safe_vector_normalize(direction.unsqueeze(0)).squeeze(0)
                 state["release_dir"] = direction.detach().clone()
             else:
                 direction = self._safe_vector_normalize(
                     (0.86 * stored_dir.to(direction.device) + 0.14 * direction).unsqueeze(0)
                 ).squeeze(0)
+                if self.fragment_physical_downward_bias > 0.0:
+                    max_up = -0.015 * min(float(self.fragment_physical_downward_bias), 1.0)
+                    direction[2] = torch.minimum(
+                        direction[2],
+                        torch.tensor(max_up, device=direction.device, dtype=direction.dtype),
+                    )
+                    direction = self._safe_vector_normalize(direction.unsqueeze(0)).squeeze(0)
                 state["release_dir"] = direction.detach().clone()
 
             up = torch.tensor([0.0, 0.0, 1.0], device=self.x_mpm.device, dtype=self.x_mpm.dtype)
@@ -288,12 +365,18 @@ class FragmentPhysicsMixin:
         self.x_mpm = self.x_mpm.clamp(self.mpm.clip_bound, 1.0 - self.mpm.clip_bound)
 
     def _current_mpm_fragment_labels(self) -> Optional[Tensor]:
+        use_physical = bool(self.fracture_cfg.get(
+            'use_physical_fragment_authority', False))
         if (
+            use_physical
+            and
             self._physical_fragment_labels is not None
             and self._physical_fragment_labels.shape[0] == self.x_mpm.shape[0]
             and bool((self._physical_fragment_labels > 0).any())
         ):
             return self._physical_fragment_labels
+        if use_physical:
+            return None
         if (
             self.fragment_manager is not None
             and getattr(self.fragment_manager, "fragment_ids", None) is not None
@@ -301,6 +384,396 @@ class FragmentPhysicsMixin:
         ):
             return self._map_surface_labels_to_particles(self.fragment_manager.fragment_ids)
         return None
+
+    def _rigid_fragment_particle_mask(self, labels: Optional[Tensor] = None) -> Tensor:
+        mask = torch.zeros(
+            self.x_mpm.shape[0],
+            dtype=torch.bool,
+            device=self.x_mpm.device,
+        )
+        states = getattr(self, "_rigid_fragment_states", {})
+        if not states:
+            return mask
+        for state in states.values():
+            idx = state.get("indices")
+            if idx is None:
+                continue
+            idx = idx.to(device=self.x_mpm.device, dtype=torch.long)
+            idx = idx[(idx >= 0) & (idx < self.x_mpm.shape[0])]
+            if idx.numel() > 0:
+                mask[idx] = True
+        return mask
+
+    def _sync_rigid_fragment_states(self, labels: Optional[Tensor] = None) -> None:
+        if not self._rigid_handoff_enabled():
+            return
+        if self.x_mpm is None or self.v_mpm is None:
+            return
+        if labels is None:
+            labels = self._physical_fragment_labels
+        if labels is None or labels.shape[0] != self.x_mpm.shape[0]:
+            return
+        if not hasattr(self, "_rigid_fragment_states"):
+            self._rigid_fragment_states = {}
+
+        min_particles = max(1, int(getattr(
+            self, "rigid_handoff_min_particles",
+            getattr(self, "fragment_physical_min_size", 1),
+        )))
+        attach_tiny = bool(getattr(
+            self, "rigid_handoff_attach_tiny_to_nearest_fragment", True))
+        tiny_to_base = bool(getattr(
+            self, "rigid_handoff_merge_tiny_fragments", False))
+
+        states = self._rigid_fragment_states
+        counts = {
+            int(lab): int((labels == int(lab)).sum().item())
+            for lab in labels.unique(sorted=True).tolist()
+            if int(lab) > 0
+        }
+        large_labels = [
+            lab for lab, count in counts.items()
+            if count >= min_particles
+        ]
+        if attach_tiny and large_labels:
+            large_com = {}
+            for lab in large_labels:
+                lab_mask = labels == lab
+                if bool(lab_mask.any()):
+                    large_com[lab] = self.x_mpm[lab_mask].mean(dim=0)
+            for lab, count in list(counts.items()):
+                if count >= min_particles:
+                    continue
+                idx = torch.where(labels == lab)[0]
+                if idx.numel() == 0 or not large_com:
+                    continue
+                tiny_com = self.x_mpm[idx].mean(dim=0)
+                target = min(
+                    large_com,
+                    key=lambda cand: float((large_com[cand] - tiny_com).norm().item()),
+                )
+                old_state = states.pop(int(lab), None)
+                if old_state is not None:
+                    old_idx = old_state.get("indices")
+                    if old_idx is not None:
+                        old_idx = old_idx.to(device=self.x_mpm.device, dtype=torch.long)
+                        old_idx = old_idx[
+                            (old_idx >= 0) & (old_idx < self.x_mpm.shape[0])
+                        ]
+                        if old_idx.numel() > 0:
+                            idx = torch.unique(torch.cat([idx, old_idx]))
+                labels[idx] = int(target)
+                if int(target) in states:
+                    self._absorb_rigid_fragment_indices(int(target), idx)
+
+        for lab in labels.unique(sorted=True).tolist():
+            lab_int = int(lab)
+            if lab_int <= 0 or lab_int in self._rigid_fragment_states:
+                continue
+            idx = torch.where(labels == lab_int)[0]
+            if idx.numel() < min_particles:
+                if tiny_to_base:
+                    states.pop(lab_int, None)
+                    labels[idx] = 0
+                continue
+            self._capture_rigid_fragment_state(lab_int, idx)
+
+        present_labels = {
+            int(lab) for lab in labels.unique(sorted=True).tolist()
+            if int(lab) > 0
+        }
+        for lab in list(states.keys()):
+            if int(lab) not in present_labels:
+                states.pop(int(lab), None)
+
+    def _absorb_rigid_fragment_indices(self, label: int, idx: Tensor) -> None:
+        state = getattr(self, "_rigid_fragment_states", {}).get(int(label))
+        if state is None or idx.numel() == 0:
+            return
+        idx = idx.to(device=self.x_mpm.device, dtype=torch.long)
+        idx = idx[(idx >= 0) & (idx < self.x_mpm.shape[0])]
+        if idx.numel() == 0:
+            return
+        existing = state["indices"].to(device=self.x_mpm.device, dtype=torch.long)
+        keep = ~torch.isin(idx, existing)
+        idx = idx[keep]
+        if idx.numel() == 0:
+            return
+        R = state["R"].to(device=self.x_mpm.device, dtype=self.x_mpm.dtype)
+        com = state["com"].to(device=self.x_mpm.device, dtype=self.x_mpm.dtype)
+        local_new = (self.x_mpm[idx].detach() - com.unsqueeze(0)) @ R
+        state["indices"] = torch.cat([existing, idx.detach().clone()])
+        state["local"] = torch.cat([
+            state["local"].to(device=self.x_mpm.device, dtype=self.x_mpm.dtype),
+            local_new.detach().clone(),
+        ], dim=0)
+        self._refresh_rigid_fragment_mass_properties(state)
+
+    def _capture_rigid_fragment_state(self, label: int, idx: Tensor) -> None:
+        idx = idx.to(device=self.x_mpm.device, dtype=torch.long)
+        idx = idx[(idx >= 0) & (idx < self.x_mpm.shape[0])]
+        if idx.numel() == 0:
+            return
+        x = self.x_mpm[idx].detach()
+        v = self.v_mpm[idx].detach()
+        com = x.mean(dim=0)
+        local = x - com.unsqueeze(0)
+        v_com = v.mean(dim=0)
+        if bool(getattr(self, "fracture_cfg", {}).get(
+                "rigid_handoff_inherit_particle_spin", False)):
+            omega = self._component_angular_velocity(local, v - v_com.unsqueeze(0))
+        elif bool(getattr(self, "fracture_cfg", {}).get(
+                "rigid_handoff_inherit_body_spin", False)):
+            omega_src = getattr(self, "_omega_com", None)
+            if omega_src is None:
+                omega = torch.zeros(3, device=self.x_mpm.device, dtype=self.x_mpm.dtype)
+            else:
+                omega = omega_src.to(
+                    device=self.x_mpm.device,
+                    dtype=self.x_mpm.dtype,
+                ).detach().clone()
+        else:
+            # Detached rigid fragments do not have a resolved contact-torque
+            # model yet.  Inheriting the whole-body tumble makes every shard
+            # keep the parent bunny's angular velocity forever, which reads as
+            # artificial post-fracture spinning.  Keep spin opt-in until a real
+            # per-fragment angular impulse/contact model exists.
+            omega = torch.zeros(3, device=self.x_mpm.device, dtype=self.x_mpm.dtype)
+        dtype = self.x_mpm.dtype
+        device = self.x_mpm.device
+        eye = torch.eye(3, device=device, dtype=dtype)
+        mass_per_particle = float(getattr(self.mpm, "p_mass", 1.0))
+        mass = max(mass_per_particle * float(idx.numel()), 1e-12)
+        rr = (local * local).sum(dim=1)
+        inertia = mass_per_particle * ((rr.sum() * eye) - local.transpose(0, 1) @ local)
+        inertia = inertia + 1e-8 * max(float(idx.numel()), 1.0) * eye
+        try:
+            inertia_inv = torch.linalg.inv(inertia)
+        except RuntimeError:
+            inertia_inv = torch.linalg.pinv(inertia)
+        radius = local.norm(dim=1).max().clamp(min=float(self.mpm.dx))
+        self._rigid_fragment_states[int(label)] = {
+            "indices": idx.detach().clone(),
+            "local": local.detach().clone(),
+            "R": eye.detach().clone(),
+            "com": com.detach().clone(),
+            "v_com": v_com.detach().clone(),
+            "omega": omega.detach().clone(),
+            "mass": mass,
+            "inertia_body_inv": inertia_inv.detach().clone(),
+            "radius": float(radius.item()),
+            "birth_time": float(getattr(self.mpm, "time", 0.0)),
+            "birth_physics_step": int(getattr(self, "_physics_step", 0)),
+        }
+
+    def _refresh_rigid_fragment_mass_properties(self, state: dict) -> None:
+        local = state["local"].to(device=self.x_mpm.device, dtype=self.x_mpm.dtype)
+        dtype = self.x_mpm.dtype
+        device = self.x_mpm.device
+        eye = torch.eye(3, device=device, dtype=dtype)
+        mass_per_particle = float(getattr(self.mpm, "p_mass", 1.0))
+        mass = max(mass_per_particle * float(local.shape[0]), 1e-12)
+        rr = (local * local).sum(dim=1)
+        inertia = mass_per_particle * ((rr.sum() * eye) - local.transpose(0, 1) @ local)
+        inertia = inertia + 1e-8 * max(float(local.shape[0]), 1.0) * eye
+        try:
+            inertia_inv = torch.linalg.inv(inertia)
+        except RuntimeError:
+            inertia_inv = torch.linalg.pinv(inertia)
+        state["mass"] = mass
+        state["inertia_body_inv"] = inertia_inv.detach().clone()
+        state["radius"] = float(local.norm(dim=1).max().clamp(min=float(self.mpm.dx)).item())
+
+    @staticmethod
+    def _rodrigues(axis_angle: Tensor) -> Tensor:
+        device = axis_angle.device
+        dtype = axis_angle.dtype
+        eye = torch.eye(3, device=device, dtype=dtype)
+        theta = axis_angle.norm()
+        if float(theta.item()) < 1e-9:
+            return eye
+        axis = axis_angle / theta.clamp(min=1e-12)
+        x, y, z = axis[0], axis[1], axis[2]
+        K = torch.stack([
+            torch.stack([torch.zeros((), device=device, dtype=dtype), -z, y]),
+            torch.stack([z, torch.zeros((), device=device, dtype=dtype), -x]),
+            torch.stack([-y, x, torch.zeros((), device=device, dtype=dtype)]),
+        ])
+        return eye + torch.sin(theta) * K + (1.0 - torch.cos(theta)) * (K @ K)
+
+    def _rigid_world_inertia_inv(self, state: dict) -> Tensor:
+        R = state["R"]
+        return R @ state["inertia_body_inv"] @ R.transpose(0, 1)
+
+    def _apply_floor_contact_to_rigid_state(self, state: dict, dt: float) -> None:
+        ground_z = float(getattr(self, "_gravity_drop_ground_z", 0.0))
+        if ground_z <= 0.0:
+            return
+        local = state["local"]
+        R = state["R"]
+        rel = local @ R.transpose(0, 1)
+        pos = state["com"].unsqueeze(0) + rel
+        min_z = float(pos[:, 2].min().item())
+        if min_z < ground_z:
+            state["com"][2] = state["com"][2] + (ground_z - min_z)
+            pos[:, 2] = pos[:, 2] + (ground_z - min_z)
+
+        band = max(float(getattr(self, "rigid_contact_band", 1.5)) * float(self.mpm.dx), 1e-6)
+        contact_mask = pos[:, 2] <= ground_z + band
+        if not bool(contact_mask.any()):
+            return
+
+        n = torch.tensor([0.0, 0.0, 1.0], device=rel.device, dtype=rel.dtype)
+        # The rigid handoff path does not have a resolved mesh contact
+        # point.  A single averaged particle contact point creates an
+        # arbitrary lever arm and turns floor impulses into synthetic
+        # spin.  Resolve the plane normal impulse at the COM; future
+        # angular motion should come from an explicit torque/contact
+        # model, not from MPM particle scatter.
+        vn = torch.dot(state["v_com"], n)
+
+        inv_m = 1.0 / max(float(state["mass"]), 1e-12)
+        e = max(0.0, min(float(getattr(
+            self, "rigid_handoff_restitution",
+            getattr(self, "rigid_contact_restitution", 0.0),
+        )), 0.95))
+        normal_impulse_mag = 0.0
+        if float(vn.item()) < 0.0:
+            normal_impulse_mag = -(1.0 + e) * float(vn.item()) / inv_m
+            impulse = normal_impulse_mag * n
+            state["v_com"] = state["v_com"] + impulse * inv_m
+
+        # Coulomb floor friction for rigid handoff fragments.  This is a
+        # contact impulse, not free-space fragment damping: it only acts
+        # while a fragment has particles in the floor contact band.  The
+        # normal load includes the collision impulse plus the per-step
+        # support impulse from gravity, so resting fragments can settle
+        # instead of sliding forever on a frictionless plane.
+        mu = max(0.0, float(getattr(
+            self, "rigid_handoff_floor_friction",
+            getattr(self, "rigid_contact_friction", 0.0),
+        )))
+        if mu <= 0.0:
+            return
+        gravity = self.mpm.gravity.to(device=rel.device, dtype=rel.dtype)
+        support_impulse_mag = (
+            max(0.0, -float(torch.dot(gravity, n).item()))
+            * max(float(state["mass"]), 1e-12)
+            * max(float(dt), 0.0)
+        )
+        friction_cap = mu * (normal_impulse_mag + support_impulse_mag)
+        if friction_cap <= 0.0:
+            return
+        v_n = torch.dot(state["v_com"], n) * n
+        v_t = state["v_com"] - v_n
+        v_t_norm = float(v_t.norm().item())
+        if v_t_norm <= 1e-8:
+            return
+        stop_impulse_mag = max(float(state["mass"]), 1e-12) * v_t_norm
+        applied = min(stop_impulse_mag, friction_cap)
+        state["v_com"] = state["v_com"] - (applied / max(float(state["mass"]), 1e-12)) * (
+            v_t / v_t.norm().clamp(min=1e-8)
+        )
+
+    def _solve_rigid_fragment_pair_contacts(self) -> None:
+        states = getattr(self, "_rigid_fragment_states", {})
+        if len(states) < 2:
+            return
+        labels = list(states.keys())
+        e = max(0.0, min(float(getattr(
+            self, "rigid_handoff_restitution",
+            getattr(self, "rigid_contact_restitution", 0.0),
+        )), 0.95))
+        for i, lab_a in enumerate(labels):
+            a = states[lab_a]
+            for lab_b in labels[i + 1:]:
+                b = states[lab_b]
+                delta = b["com"] - a["com"]
+                dist = delta.norm()
+                ra = float(a["radius"])
+                rb = float(b["radius"])
+                target = ra + rb
+                if float(dist.item()) >= target:
+                    continue
+                if float(dist.item()) < 1e-8:
+                    n = torch.tensor([1.0, 0.0, 0.0], device=delta.device, dtype=delta.dtype)
+                    dist_val = 1e-8
+                else:
+                    n = delta / dist.clamp(min=1e-8)
+                    dist_val = float(dist.item())
+                penetration = target - dist_val
+                inv_ma = 1.0 / max(float(a["mass"]), 1e-12)
+                inv_mb = 1.0 / max(float(b["mass"]), 1e-12)
+                inv_sum = inv_ma + inv_mb
+                if inv_sum <= 1e-12:
+                    continue
+                a["com"] = a["com"] - n * (penetration * inv_ma / inv_sum)
+                b["com"] = b["com"] + n * (penetration * inv_mb / inv_sum)
+
+                # This is a bounding-sphere contact, not a resolved mesh
+                # contact point.  Using r = n * radius as a lever arm
+                # creates synthetic torque and can spin fragments forever
+                # when many shards overlap.  Resolve pair contact at the
+                # centers of mass and leave angular velocity unchanged.
+                rel_v = b["v_com"] - a["v_com"]
+                vn = torch.dot(rel_v, n)
+                if float(vn.item()) >= 0.0:
+                    continue
+                j = -(1.0 + e) * float(vn.item()) / inv_sum
+                impulse = j * n
+                a["v_com"] = a["v_com"] - impulse * inv_ma
+                b["v_com"] = b["v_com"] + impulse * inv_mb
+
+    def _integrate_rigid_fragments(self, dt: float) -> None:
+        states = getattr(self, "_rigid_fragment_states", {})
+        if not states:
+            return
+        dt = float(dt)
+        gravity = self.mpm.gravity.to(device=self.x_mpm.device, dtype=self.x_mpm.dtype)
+        for state in states.values():
+            state["v_com"] = state["v_com"] + gravity * dt
+            dR = self._rodrigues(state["omega"] * dt)
+            state["R"] = dR @ state["R"]
+            try:
+                u, _, vh = torch.linalg.svd(state["R"])
+                state["R"] = u @ vh
+            except RuntimeError:
+                pass
+            state["com"] = state["com"] + state["v_com"] * dt
+            self._apply_floor_contact_to_rigid_state(state, dt)
+        self._solve_rigid_fragment_pair_contacts()
+        self._write_rigid_fragment_particles_from_state()
+
+    def _write_rigid_fragment_particles_from_state(self) -> None:
+        states = getattr(self, "_rigid_fragment_states", {})
+        if not states or self.x_mpm is None or self.v_mpm is None:
+            return
+        eye = torch.eye(3, device=self.x_mpm.device, dtype=self.x_mpm.dtype)
+        for lab, state in states.items():
+            idx = state["indices"].to(device=self.x_mpm.device, dtype=torch.long)
+            idx = idx[(idx >= 0) & (idx < self.x_mpm.shape[0])]
+            if idx.numel() == 0:
+                continue
+            local = state["local"].to(device=self.x_mpm.device, dtype=self.x_mpm.dtype)
+            R = state["R"].to(device=self.x_mpm.device, dtype=self.x_mpm.dtype)
+            rel = local @ R.transpose(0, 1)
+            pos = state["com"].to(device=self.x_mpm.device, dtype=self.x_mpm.dtype).unsqueeze(0) + rel
+            omega = state["omega"].to(device=self.x_mpm.device, dtype=self.x_mpm.dtype)
+            v_com = state["v_com"].to(device=self.x_mpm.device, dtype=self.x_mpm.dtype)
+            vel = v_com.unsqueeze(0) + torch.cross(
+                omega.unsqueeze(0).expand_as(rel),
+                rel,
+                dim=1,
+            )
+            self.x_mpm[idx] = pos.clamp(self.mpm.clip_bound, 1.0 - self.mpm.clip_bound)
+            self.v_mpm[idx] = vel
+            if self.C is not None and self.C.shape[0] == self.x_mpm.shape[0]:
+                self.C[idx] = torch.zeros_like(self.C[idx])
+            if self.F is not None and self.F.shape[0] == self.x_mpm.shape[0]:
+                self.F[idx] = eye.unsqueeze(0).expand(idx.numel(), 3, 3)
+            if (self._physical_fragment_labels is not None
+                    and self._physical_fragment_labels.shape[0] == self.x_mpm.shape[0]):
+                self._physical_fragment_labels[idx] = int(lab)
 
     @staticmethod
     def _component_angular_velocity(rel: Tensor, vel_rel: Tensor) -> Tensor:
@@ -340,6 +813,39 @@ class FragmentPhysicsMixin:
         n = torch.tensor([0.0, 0.0, 1.0], device=current.device, dtype=current.dtype)
         contact_point = current[contact].mean(dim=0)
         r = contact_point - com
+        physical_authority = bool(getattr(self, "fracture_cfg", {}).get(
+            "use_physical_fragment_authority", False))
+        contact_torque_enabled = bool(getattr(self, "fracture_cfg", {}).get(
+            "shape_match_contact_torque_enabled",
+            not physical_authority,
+        ))
+        if not contact_torque_enabled:
+            vn_com = v_com.dot(n)
+            mass = max(float(current.shape[0]), 1.0)
+            restitution = max(0.0, min(float(self.rigid_contact_restitution), 0.85))
+            normal_impulse_mag = 0.0
+            if float(vn_com.item()) < -1e-5:
+                normal_impulse_mag = float((-(1.0 + restitution) * vn_com * mass).item())
+                v_com = v_com + (normal_impulse_mag / mass) * n
+
+            friction = max(0.0, float(self.rigid_contact_friction))
+            if friction > 0.0:
+                gravity = self.mpm.gravity.to(device=current.device, dtype=current.dtype)
+                support_impulse_mag = (
+                    max(0.0, -float(torch.dot(gravity, n).item()))
+                    * mass
+                    * max(float(self.mpm.dt), 0.0)
+                )
+                friction_cap = friction * (normal_impulse_mag + support_impulse_mag)
+                v_t = v_com - v_com.dot(n) * n
+                v_t_norm = float(v_t.norm().item())
+                if friction_cap > 0.0 and v_t_norm > 1e-8:
+                    applied = min(mass * v_t_norm, friction_cap)
+                    v_com = v_com - (applied / mass) * (
+                        v_t / v_t.norm().clamp(min=1e-8)
+                    )
+            return v_com, omega
+
         v_contact = v_com + torch.cross(omega, r, dim=0)
         vn = torch.minimum(v_contact.dot(n), v_com.dot(n))
         if float(vn.item()) >= -1e-5:
@@ -481,7 +987,8 @@ class FragmentPhysicsMixin:
         self.v_mpm = self.v_mpm + 0.18 * (self.x_mpm - old) / max(float(dt), 1e-8)
 
     def _shape_match_component(self, idx: Tensor, strength: float, dt: float,
-                               is_fragment: bool = False) -> float:
+                               is_fragment: bool = False,
+                               label: int = 0) -> float:
         """Shape-match a connected component back toward its rest pose.
 
         Step 4a (pipeline rewrite, 2026-05-09): when ``is_fragment`` is
@@ -640,11 +1147,38 @@ class FragmentPhysicsMixin:
             )
             correction_v = (new - old) / max(float(self.mpm.dt), 1e-8)
             blend = max(0.0, min(self.shape_match_velocity_blend + 0.45 * strength, 1.0))
-            self.v_mpm[idx] = (
-                (1.0 - blend) * self.v_mpm[idx]
-                + blend * rigid_v
-                + 0.15 * self.shape_match_velocity_blend * correction_v
-            )
+            apply_handoff = is_fragment and physical_authority
+            if apply_handoff:
+                smoothing_steps = max(0, int(self.fracture_cfg.get(
+                    'fragment_handoff_smoothing_substeps', 0)))
+                birth_steps = getattr(
+                    self, '_physical_fragment_birth_physics_step', {})
+                birth_step = birth_steps.get(int(label), None)
+                age_steps = (
+                    int(getattr(self, '_physics_step', 0)) - int(birth_step)
+                    if birth_step is not None else smoothing_steps
+                )
+                if smoothing_steps > 0 and age_steps < smoothing_steps:
+                    w = 1.0 - max(float(age_steps), 0.0) / float(smoothing_steps)
+                    v_target = v_com.unsqueeze(0).expand_as(self.v_mpm[idx])
+                    self.v_mpm[idx] = (
+                        (1.0 - w) * self.v_mpm[idx] + w * v_target
+                    )
+                else:
+                    s = float(self.fracture_cfg.get(
+                        'shape_match_fragment_velocity_blend_scale', 1.0))
+                    s = max(0.0, min(s, 1.0))
+                    self.v_mpm[idx] = (
+                        (1.0 - s * blend) * self.v_mpm[idx]
+                        + s * blend * rigid_v
+                        + 0.15 * s * self.shape_match_velocity_blend * correction_v
+                    )
+            else:
+                self.v_mpm[idx] = (
+                    (1.0 - blend) * self.v_mpm[idx]
+                    + blend * rigid_v
+                    + 0.15 * self.shape_match_velocity_blend * correction_v
+                )
         return float(omega.norm().item())
 
     def _apply_shape_matching(self, dt: float) -> None:
@@ -669,20 +1203,27 @@ class FragmentPhysicsMixin:
             return
 
         labels = labels.to(device=self.x_mpm.device, dtype=torch.long)
-        angular_speeds = []
+        rigid_states = getattr(self, "_rigid_fragment_states", {})
+        angular_speeds = [
+            float(state.get("omega", torch.zeros(3, device=self.x_mpm.device)).norm().item())
+            for state in rigid_states.values()
+            if state.get("omega") is not None
+        ]
         for label in labels.unique(sorted=True).tolist():
             mask = labels == int(label)
             idx = torch.where(mask)[0]
             if idx.numel() < self.shape_match_min_particles:
                 continue
             is_fragment = int(label) > 0
+            if is_fragment and int(label) in rigid_states:
+                continue
             strength = (
                 self.shape_match_fragment_strength
                 if is_fragment
                 else self._body_shape_match_strength()
             )
             angular_speeds.append(self._shape_match_component(
-                idx, strength, dt, is_fragment=is_fragment))
+                idx, strength, dt, is_fragment=is_fragment, label=int(label)))
         if angular_speeds:
             self._last_rigid_angular_speed_max = max(angular_speeds)
             self._last_rigid_angular_speed_mean = sum(angular_speeds) / max(len(angular_speeds), 1)
