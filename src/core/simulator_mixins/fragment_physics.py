@@ -480,7 +480,17 @@ class FragmentPhysicsMixin:
             self.x_mpm[below, 2] = floor
         self.v_mpm = self.v_mpm + 0.18 * (self.x_mpm - old) / max(float(dt), 1e-8)
 
-    def _shape_match_component(self, idx: Tensor, strength: float, dt: float) -> float:
+    def _shape_match_component(self, idx: Tensor, strength: float, dt: float,
+                               is_fragment: bool = False) -> float:
+        """Shape-match a connected component back toward its rest pose.
+
+        Step 4a (pipeline rewrite, 2026-05-09): when ``is_fragment`` is
+        True and ``manifold.shape_match_fragment_position_pull`` is
+        disabled, the position pull (``x.lerp(target, strength)``) is
+        skipped for this component.  The velocity-injection block still
+        runs so cohesion is maintained through ``v``.  Step 4b will
+        further attenuate the velocity injection on fragments.
+        """
         if idx.numel() < self.shape_match_min_particles:
             return 0.0
         rest_all = self._shape_match_rest_positions
@@ -599,7 +609,15 @@ class FragmentPhysicsMixin:
 
         old = self.x_mpm[idx]
         new = old.lerp(target, strength)
-        self.x_mpm[idx] = new
+        # Step 4a: skip position pull on detached fragments when the
+        # corresponding flag is disabled.  Velocity injection still
+        # runs below so cohesion is preserved through v.
+        position_pull_enabled = bool(self.fracture_cfg.get(
+            'shape_match_fragment_position_pull', True))
+        if is_fragment and not position_pull_enabled:
+            new = old
+        else:
+            self.x_mpm[idx] = new
         if self.v_mpm is not None and self.mpm.dt > 0.0:
             rel_new = new - new.mean(dim=0, keepdim=True)
             rigid_v = v_com.unsqueeze(0) + torch.cross(
@@ -644,12 +662,14 @@ class FragmentPhysicsMixin:
             idx = torch.where(mask)[0]
             if idx.numel() < self.shape_match_min_particles:
                 continue
+            is_fragment = int(label) > 0
             strength = (
                 self.shape_match_fragment_strength
-                if int(label) > 0
+                if is_fragment
                 else self._body_shape_match_strength()
             )
-            angular_speeds.append(self._shape_match_component(idx, strength, dt))
+            angular_speeds.append(self._shape_match_component(
+                idx, strength, dt, is_fragment=is_fragment))
         if angular_speeds:
             self._last_rigid_angular_speed_max = max(angular_speeds)
             self._last_rigid_angular_speed_mean = sum(angular_speeds) / max(len(angular_speeds), 1)
