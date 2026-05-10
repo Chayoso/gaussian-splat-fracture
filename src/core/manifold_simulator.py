@@ -736,6 +736,23 @@ class ManifoldSimulator(
         labels = self._physical_fragment_labels
         return labels is not None and bool((labels > 0).any())
 
+    def _fragmented_physics_gate(self) -> bool:
+        """Decide whether to take the fragmented MPM path.
+
+        When ``manifold.use_physical_fragment_authority`` is enabled,
+        defer to ``_has_physical_fragments()`` (voronoi-driven).
+        Otherwise fall back to the legacy graph-fragment counter on
+        ``fragment_manager``.  Both paths still require
+        ``self.fragmentation_active`` to be True so the upstream
+        impact-detection gating is respected.
+        """
+        if not self.fragmentation_active:
+            return False
+        if bool(self.fracture_cfg.get('use_physical_fragment_authority', False)):
+            return self._has_physical_fragments()
+        return (self.fragment_manager is not None
+                and self.fragment_manager.n_fragments > 1)
+
     def _update_physical_fragment_birth_registry(self) -> None:
         """Record (mpm.time, _physics_step) for any new physical fragment label.
 
@@ -927,10 +944,12 @@ class ManifoldSimulator(
         stress = stress.clamp(-5.0 * E, 5.0 * E)
         self._last_stress = stress.detach()
 
-        # MPM P2G2P
-        if (self.fragmentation_active
-                and self.fragment_manager is not None
-                and self.fragment_manager.n_fragments > 1):
+        # MPM P2G2P.  Gate selects between the global p2g2p and the
+        # fragmented variant.  Pipeline rewrite Step 2: when
+        # manifold.use_physical_fragment_authority is enabled, the
+        # source of truth is _physical_fragment_labels (voronoi-driven).
+        # Otherwise the legacy graph-fragment counter is consulted.
+        if self._fragmented_physics_gate():
             self._step_fragmented_physics(stress, dt)
         else:
             self.x_mpm, self.v_mpm, self.C, self.F = self.mpm.p2g2p(

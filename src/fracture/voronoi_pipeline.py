@@ -269,6 +269,12 @@ class VoronoiPipelineMixin:
         if labels.shape[0] == self.x_mpm.shape[0]:
             self._physical_fragment_labels = labels
             self._next_physical_fragment_id = int(labels.max().item()) + 1
+            # Pipeline rewrite Step 2: update the per-fragment birth
+            # registry whenever the voronoi label set changes.  Cheap
+            # (insert-only on new labels) and benign even when the
+            # authority flag is off — downstream consumers only read
+            # the registry under the flag.
+            self._update_physical_fragment_birth_registry()
 
         n_grad = int(components_state.get("n_graduated", 0))
         if n_grad > 0:
