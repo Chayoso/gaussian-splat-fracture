@@ -252,8 +252,19 @@ class VoronoiPipelineMixin:
                 'voronoi_cascade_damage_floor', 0.0)),
             cascade_from_new_bonds_only=bool(self.fracture_cfg.get(
                 'voronoi_cascade_from_new_bonds_only', True)),
+            # Default damage floor for force-shrink: 0.30 (was 0.0).
+            # Matches the AT2 damage_threshold the splat renderer uses
+            # to draw "visible damage" (gaussian_updater._apply_damage_
+            # visualization).  Without this gate force_shrink iteratively
+            # breaks bonds in the largest CC down to
+            # `voronoi_force_shrink_max_frac` * n_cells regardless of
+            # phase-field damage, which fragments still-undamaged
+            # regions and visually contradicts the c_visual map (the
+            # renderer paints them as undamaged but the labels say
+            # detached fragment).  Threshold 0.30 keeps physical and
+            # visual narratives aligned.
             force_shrink_damage_floor=float(self.fracture_cfg.get(
-                'voronoi_force_shrink_damage_floor', 0.0)),
+                'voronoi_force_shrink_damage_floor', 0.30)),
         )
         # Mode-I bond opening.  Accumulate per-cell impulses first, then
         # write them once with a cap; otherwise one cell that loses several
