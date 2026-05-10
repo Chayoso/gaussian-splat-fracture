@@ -13,7 +13,7 @@ from torch import Tensor
 class FragmentPhysicsMixin:
     def _rigid_handoff_enabled(self) -> bool:
         if not bool(getattr(self, "fracture_cfg", {}).get(
-                "use_physical_fragment_authority", False)):
+                "use_physical_fragment_authority", True)):
             return False
         mode = str(getattr(self, "detached_fragment_dynamics", "mpm_shape_match"))
         return mode in {"rigid_handoff", "rigid", "detached_rigid"}
@@ -49,7 +49,7 @@ class FragmentPhysicsMixin:
     def _fragmented_physics_labels(self) -> Tensor:
         """Return label overlay for fragment-aware post-P2G2P hooks."""
         use_physical = bool(self.fracture_cfg.get(
-            'use_physical_fragment_authority', False))
+            'use_physical_fragment_authority', True))
         if use_physical:
             labels = self._physical_fragment_labels
             if (
@@ -193,7 +193,7 @@ class FragmentPhysicsMixin:
     def _apply_physical_fragment_release_drift(self, mpm_frag_ids: Tensor, dt: float) -> None:
         """Apply a small physical gap / release drift to support-lost fragments."""
         use_physical_authority = bool(getattr(self, "fracture_cfg", {}).get(
-            "use_physical_fragment_authority", False))
+            "use_physical_fragment_authority", True))
         if use_physical_authority:
             if mpm_frag_ids is None or not bool((mpm_frag_ids > 0).any()):
                 return
@@ -366,7 +366,7 @@ class FragmentPhysicsMixin:
 
     def _current_mpm_fragment_labels(self) -> Optional[Tensor]:
         use_physical = bool(self.fracture_cfg.get(
-            'use_physical_fragment_authority', False))
+            'use_physical_fragment_authority', True))
         if (
             use_physical
             and
@@ -998,7 +998,7 @@ class FragmentPhysicsMixin:
         contact_point = current[contact].mean(dim=0)
         r = contact_point - com
         physical_authority = bool(getattr(self, "fracture_cfg", {}).get(
-            "use_physical_fragment_authority", False))
+            "use_physical_fragment_authority", True))
         contact_torque_enabled = bool(getattr(self, "fracture_cfg", {}).get(
             "shape_match_contact_torque_enabled",
             not physical_authority,
@@ -1314,7 +1314,7 @@ class FragmentPhysicsMixin:
         position_pull_enabled = bool(self.fracture_cfg.get(
             'shape_match_fragment_position_pull', True))
         physical_authority = bool(self.fracture_cfg.get(
-            'use_physical_fragment_authority', False))
+            'use_physical_fragment_authority', True))
         skip_pull = (is_fragment
                      and not position_pull_enabled
                      and physical_authority)

@@ -288,7 +288,7 @@ class VoronoiPipelineMixin:
             self._physical_fragment_labels = labels
             self._next_physical_fragment_id = int(labels.max().item()) + 1
             if bool(getattr(self, "fracture_cfg", {}).get(
-                    "use_physical_fragment_authority", False)):
+                    "use_physical_fragment_authority", True)):
                 has_physical_fragment = bool((labels > 0).any())
                 if (has_physical_fragment
                         and not bool(getattr(self, "fragmentation_active", False))):
@@ -512,6 +512,17 @@ class VoronoiPipelineMixin:
         and the final cell-level delta is capped once per fracture tick.
         This prevents multi-bond graduation from injecting N copies of the
         same rigid-body velocity into a single fragment.
+
+        Pipeline rewrite Option A (2026-05-10): when
+        ``manifold.voronoi_kick_scope`` is ``'bond_boundary'`` the kick
+        applies only to particles on the bond's boundary band (the
+        actual interface region between the two cells), not to every
+        particle assigned to either cell.  This eliminates the
+        legacy artifact where breaking a bond at the impact zone
+        ejected every particle of an adjacent un-damaged cell (e.g.
+        the bunny's legs) as floating dust.  Default scope remains
+        ``'cell'`` so existing pipelines are unchanged unless the
+        flag is enabled.
         """
         if not newly_broken:
             return
@@ -519,6 +530,10 @@ class VoronoiPipelineMixin:
             return
         release_gain = float(getattr(self, "fragment_release_v_com_gain", 0.0))
         if release_gain <= 0.0:
+            return
+        scope = str(self.fracture_cfg.get('voronoi_kick_scope', 'cell'))
+        if scope == 'bond_boundary':
+            self._apply_bond_opening_kicks_bond_scope(newly_broken)
             return
         max_speed = max(float(getattr(
             self, "fragment_physical_max_speed", 30.0)), 0.05)
@@ -683,3 +698,101 @@ class VoronoiPipelineMixin:
             self.v_mpm[idx] = self.v_mpm[idx] + dv.unsqueeze(0)
         if dx is not None and float(dx.norm().item()) > 0.0:
             self.x_mpm[idx] = self.x_mpm[idx] + dx.unsqueeze(0)
+
+    @torch.no_grad()
+    def _apply_bond_opening_kicks_bond_scope(
+        self,
+        newly_broken: list[tuple[int, int, float]],
+    ) -> None:
+        """Bond-boundary scoped Mode-I kicks (Pipeline rewrite Option A).
+
+        Apply Newton-3rd kicks only to particles inside the bond's
+        boundary band (``voronoi._bond_boundary_idx[(a, b)]``), split
+        by which cell they belong to.  This localises the impulse to
+        the actual interface region instead of every particle
+        assigned to either cell, eliminating the artifact where
+        breaking a bond at the impact zone ejected entire un-damaged
+        adjacent cells (e.g. the bunny's legs) as floating dust.
+
+        v_open / offset are computed per bond identically to the
+        cell-scope path, then applied once to the boundary particles.
+        Multiple bonds breaking on the same cell pair contribute
+        independently (each bond touches a small particle subset).
+        """
+        if not newly_broken:
+            return
+        if self.voronoi is None or self.voronoi.cell_centers is None:
+            return
+        if self.x_mpm is None or self.v_mpm is None:
+            return
+        max_speed = max(float(getattr(
+            self, "fragment_physical_max_speed", 30.0)), 0.05)
+        Gc = float(getattr(self.elasticity, 'Gc', 9.0))
+        energy_frac = float(getattr(
+            self, "fragment_release_energy_fraction", 1.0))
+        kick_scale = float(getattr(self, "_voronoi_kick_scale", 1.0))
+        min_open_kick = float(getattr(
+            self, "fragment_release_min_open_kick", 0.1))
+        release_gain = float(getattr(self, "fragment_release_v_com_gain", 0.0))
+        cell_speed_cap = max(0.05, min(max_speed, release_gain))
+        offset_scale = float(getattr(
+            self, "_voronoi_position_offset_eff",
+            getattr(self, "fragment_release_position_offset", 0.0)))
+
+        assignment_np = self.voronoi.cell_assignment
+        device = self.x_mpm.device
+
+        for (cell_a, cell_b, _stress) in newly_broken:
+            ca_np = self.voronoi.cell_centers[int(cell_a)]
+            cb_np = self.voronoi.cell_centers[int(cell_b)]
+            direction_np = cb_np - ca_np
+            n = float(np.linalg.norm(direction_np))
+            if n < 1e-6:
+                continue
+            direction_np = direction_np / n
+            direction = torch.from_numpy(direction_np).to(
+                device, self.x_mpm.dtype)
+
+            cell_count_a = int(np.sum(assignment_np == int(cell_a)))
+            cell_count_b = int(np.sum(assignment_np == int(cell_b)))
+            cell_count_min = max(1, min(cell_count_a, cell_count_b))
+            m_cell = float(self.mpm.p_mass) * cell_count_min
+            cell_vol = float(self.mpm.vol) * cell_count_min
+            bond_area = max(cell_vol ** (2.0 / 3.0), 1e-8)
+            v_open = float((Gc * bond_area / max(m_cell, 1e-8)) ** 0.5)
+            v_open = v_open * (max(energy_frac, 0.0) ** 0.5)
+            v_open = v_open * kick_scale
+            v_open = max(min_open_kick * kick_scale, v_open)
+            v_open = min(v_open, cell_speed_cap)
+
+            boundary = self.voronoi._bond_boundary_idx.get(
+                (int(cell_a), int(cell_b)))
+            if boundary is None or boundary.size == 0:
+                continue
+
+            sides = assignment_np[boundary]
+            a_side = boundary[sides == int(cell_a)]
+            b_side = boundary[sides == int(cell_b)]
+
+            if a_side.size > 0:
+                a_idx = torch.from_numpy(a_side).to(device).long()
+                self.v_mpm[a_idx] = (
+                    self.v_mpm[a_idx]
+                    - direction.unsqueeze(0) * v_open
+                )
+                if offset_scale > 0.0:
+                    self.x_mpm[a_idx] = (
+                        self.x_mpm[a_idx]
+                        - direction.unsqueeze(0) * offset_scale
+                    )
+            if b_side.size > 0:
+                b_idx = torch.from_numpy(b_side).to(device).long()
+                self.v_mpm[b_idx] = (
+                    self.v_mpm[b_idx]
+                    + direction.unsqueeze(0) * v_open
+                )
+                if offset_scale > 0.0:
+                    self.x_mpm[b_idx] = (
+                        self.x_mpm[b_idx]
+                        + direction.unsqueeze(0) * offset_scale
+                    )

@@ -830,7 +830,7 @@ class ManifoldSimulator(
             c_mech = c_visual.clone() if isinstance(c_visual, torch.Tensor) else c_visual
 
         # Step 1b — fragment-internal damage anneal.
-        if (bool(self.fracture_cfg.get('use_physical_fragment_authority', False))
+        if (bool(self.fracture_cfg.get('use_physical_fragment_authority', True))
                 and bool(self.fracture_cfg.get('c_mech_anneal_after_break', False))
                 and self._physical_fragment_labels is not None
                 and isinstance(c_mech, torch.Tensor)
@@ -883,7 +883,7 @@ class ManifoldSimulator(
         """
         if not self.fragmentation_active:
             return False
-        if bool(self.fracture_cfg.get('use_physical_fragment_authority', False)):
+        if bool(self.fracture_cfg.get('use_physical_fragment_authority', True)):
             return self._has_physical_fragments()
         return (self.fragment_manager is not None
                 and self.fragment_manager.n_fragments > 1)
@@ -1030,7 +1030,7 @@ class ManifoldSimulator(
         phase_per_tick = bool(self.fracture_cfg.get(
             'phase_field_evolve_per_fracture_tick', False))
         use_physical_authority = bool(self.fracture_cfg.get(
-            'use_physical_fragment_authority', False))
+            'use_physical_fragment_authority', True))
         if bool(self.fracture_cfg.get('voronoi_eval_per_fracture_tick', False)):
             self._last_voronoi_components_state = None
         if phase_per_tick:
@@ -1615,7 +1615,7 @@ class ManifoldSimulator(
             structural_floor = torch.zeros_like(c_surf[:n_assign])
             structural_mask = torch.zeros_like(c_surf[:n_assign], dtype=torch.bool)
             use_physical_authority = bool(self.fracture_cfg.get(
-                'use_physical_fragment_authority', False))
+                'use_physical_fragment_authority', True))
 
             if not use_physical_authority:
                 auth_mask = getattr(self.fragment_manager, "last_authoritative_cut_mask", None)
@@ -1879,7 +1879,7 @@ class ManifoldSimulator(
         # spreads thinner), so 0.999 would be too strict; 0.40 covers
         # the plateau range observed across 2K-150K runs.
         c_max_threshold = 0.40
-        if (bool(self.fracture_cfg.get('use_physical_fragment_authority', False))
+        if (bool(self.fracture_cfg.get('use_physical_fragment_authority', True))
                 and self.fracture_field.c is not None
                 and c_max_now >= c_max_threshold
                 and self._physical_fragment_labels is not None
@@ -1944,7 +1944,7 @@ class ManifoldSimulator(
         if self.fracture_field.c is None:
             return
         use_physical_authority = bool(self.fracture_cfg.get(
-            'use_physical_fragment_authority', False))
+            'use_physical_fragment_authority', True))
         if getattr(self.fragment_manager, 'material_family', '') == 'diffuse_damage':
             N = self.fracture_field.c.shape[0]
             self.fragment_manager.n_fragments = 1
@@ -2178,7 +2178,7 @@ class ManifoldSimulator(
         if self.fragmentation_active and self.fragment_manager is not None:
             frag_ids = None
             use_physical = bool(self.fracture_cfg.get(
-                'use_physical_fragment_authority', False))
+                'use_physical_fragment_authority', True))
             if (use_physical
                     and self._physical_fragment_labels is not None
                     and self._surface_indices is not None
@@ -2236,7 +2236,7 @@ class ManifoldSimulator(
         )
 
         use_physical_render = bool(self.fracture_cfg.get(
-            'use_physical_fragment_authority', False))
+            'use_physical_fragment_authority', True))
         append_interior_faces = not (
             use_physical_render
             and surf_frag is not None
@@ -2737,7 +2737,7 @@ class ManifoldSimulator(
         physical_n_frags = 0
         frag_ids_phys = None
         use_physical = bool(self.fracture_cfg.get(
-            'use_physical_fragment_authority', False))
+            'use_physical_fragment_authority', True))
         if (use_physical
                 and self._physical_fragment_labels is not None
                 and self._surface_indices is not None
