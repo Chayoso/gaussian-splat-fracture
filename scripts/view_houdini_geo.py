@@ -283,11 +283,14 @@ def build_splat_disk_mesh(rec: Dict[str, np.ndarray],
     fid_all = rec.get("fragment_id",
                       np.zeros(P_all.shape[0], dtype=np.int32)).reshape(-1).astype(np.int64)
     cd_all = rec.get("Cd")
+    alpha_all = rec.get("Alpha")
 
     if include_base:
         keep = np.ones(P_all.shape[0], dtype=bool)
     else:
         keep = fid_all > 0
+    if alpha_all is not None:
+        keep = keep & (alpha_all.reshape(-1).astype(np.float32) > 1e-4)
     if min_fragment_size > 1:
         keep = keep & _fragment_size_filter(fid_all, min_fragment_size)
     if not keep.any():

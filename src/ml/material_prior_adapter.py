@@ -445,6 +445,8 @@ SENTENCE_STYLE_RULES = (
             # ~30-60ms of real playback -- close to how brittle glass
             # actually fractures.
             "manifold.front_substeps": 4,
+            "manifold.impact_fracture_burst_steps": 16,
+            "manifold.impact_fracture_burst_front_substeps": 48,
             "manifold.at2_drive_gain": 1.0,
             "manifold.damage_spread": 0.12,
             "manifold.damage_source_scale": 0.50,
@@ -554,6 +556,11 @@ SENTENCE_STYLE_RULES = (
             "manifold.shape_match_strength": 0.97,
             "manifold.shape_match_fragment_strength": 0.97,
             "manifold.shape_match_velocity_blend": 0.0,
+            # Keep fragment pose cohesion, but do not fully re-inject the
+            # shape-match angular velocity into particle velocities.  The
+            # old strength-derived velocity blend made released shards spin
+            # from the rigid projection itself instead of from fracture KE.
+            "manifold.shape_match_fragment_velocity_scale": 0.25,
             # Unified impact impulse (rigid-body form): horizontal v_com
             # slide along body-COM-to-impact-center offset + tumble omega
             # around the perpendicular horizontal axis.  Per-particle
@@ -611,21 +618,23 @@ SENTENCE_STYLE_RULES = (
             # Voronoi pre-fracture: partial pulverization for radial_shatter.
             "manifold.voronoi_enable": True,
             "manifold.voronoi_n_cells": 80,
+            "manifold.voronoi_cell_energy_exponent": 1.0,
             "manifold.voronoi_seed_distribution": "impact_biased",
             "manifold.voronoi_bond_break_threshold": 0.20,
+            "manifold.voronoi_bond_threshold_energy_blend": 0.25,
+            # Discard thin surface dust labels: after the 1-frame AT2 burst,
+            # Voronoi can create tiny floor/shell slivers that read as
+            # floating Gaussians rather than intentional shards.
+            "manifold.voronoi_spatial_split_min_fraction": 0.010,
             "manifold.voronoi_bond_aging_per_frame": 0.005,
-            "manifold.voronoi_impact_shock_radius": 0.12,
-            "manifold.voronoi_cascade_radius": 1.0,
-            "manifold.voronoi_cascade_from_new_bonds_only": True,
-            "manifold.voronoi_impact_damage_floor": 0.10,
-            "manifold.voronoi_cascade_damage_floor": 0.12,
-            "manifold.voronoi_force_shrink_damage_floor": 0.16,
+            "manifold.voronoi_impact_shock_radius": 0.0,
+            "manifold.voronoi_cascade_radius": 0.0,
             "manifold.voronoi_force_shrink_max_frac": 0.40,
             "manifold.particle_speed_cap": 60.0,
             # Per-particle floor bounce override (recovers bounce that
             # the MPM "slip" BC would otherwise eat).  0.45 gives a
             # crisp half-velocity rebound for glass-tier shards.
-            "manifold.fragment_floor_restitution": 0.45,
+            "manifold.fragment_floor_restitution": 0.15,
             # Post-impact gravity matches the free-fall magnitude so
             # acceleration is uniform across impact (no visible
             # "hovering" after contact).  Stronger damping (0.95) plus
@@ -687,6 +696,8 @@ SENTENCE_STYLE_RULES = (
             "manifold.min_successor_score": 0.060,
             "manifold.drive_quantile": 0.40,
             "manifold.front_substeps": 4,
+            "manifold.impact_fracture_burst_steps": 20,
+            "manifold.impact_fracture_burst_front_substeps": 56,
             "manifold.damage_spread": 0.16,
             "manifold.damage_source_scale": 0.70,
             "manifold.edge_break_rate": 1.40,
@@ -717,19 +728,9 @@ SENTENCE_STYLE_RULES = (
             "manifold.shape_match_strength": 0.97,
             "manifold.shape_match_fragment_strength": 0.97,
             "manifold.shape_match_velocity_blend": 0.0,
-            # Calmer impact-frame defaults (calmer-x3 iteration):
-            # halving the rigid impulse + tumble alone (0.05→0.025→
-            # 0.0125, 0.20→0.10→0.05) had no visible effect because
-            # the dominant frame-1 KE source is the *per-bond Mode-I
-            # kick* (`fragment_release_v_com_gain` below) summed
-            # across 1000+ bonds breaking in a 4-6 frame window.
-            # We further drop the unified rigid impulse + tumble to
-            # 0.005 / 0.02 (1/2.5×) and crash the per-bond kick gain
-            # from 35.0 to 10.0, plus the per-bond position offset
-            # from 0.05 to 0.02.  ``voronoi_wave_speed_per_frame``
-            # stays at 0.025 so crack propagation timing is unchanged.
-            "manifold.unified_impact_impulse_scale": 0.003,
-            "manifold.unified_impact_tumble_scale": 0.012,
+            "manifold.shape_match_fragment_velocity_scale": 0.25,
+            "manifold.unified_impact_impulse_scale": 0.05,
+            "manifold.unified_impact_tumble_scale": 0.20,
             # Stronger NET COM release than radial_shatter -- complete
             # pulverization is the explosive end of the brittle spectrum,
             # so each shard carries away more of the released elastic
@@ -770,8 +771,11 @@ SENTENCE_STYLE_RULES = (
             # Voronoi pre-fracture: full pulverization, no base remnant.
             "manifold.voronoi_enable": True,
             "manifold.voronoi_n_cells": 250,
+            "manifold.voronoi_cell_energy_exponent": 0.75,
             "manifold.voronoi_seed_distribution": "impact_biased",
             "manifold.voronoi_bond_break_threshold": 0.15,
+            "manifold.voronoi_bond_threshold_energy_blend": 0.15,
+            "manifold.voronoi_spatial_split_min_fraction": 0.004,
             # Time-driven bond aging disabled in favor of stress-wave
             # propagation: bonds outside the wave can't break by aging,
             # they wait for the wave-front to reach them.  This produces
@@ -779,20 +783,16 @@ SENTENCE_STYLE_RULES = (
             # uniform simultaneous breakage everywhere (which reads as
             # "explosion" not "shatter").
             "manifold.voronoi_bond_aging_per_frame": 0.0,
-            "manifold.voronoi_impact_shock_radius": 0.10,
+            "manifold.voronoi_impact_shock_radius": 0.0,
             # Wave propagation speed: bonds within `_wave_radius` of
             # impact_center can break each frame; radius grows by this
             # much per call.  0.025 = wave reaches body extent (~0.4)
             # in ~16 frames, matching the typical 30-60 frame post-
             # impact window.
             "manifold.voronoi_wave_speed_per_frame": 0.025,
-            "manifold.voronoi_cascade_radius": 1.0,
-            "manifold.voronoi_cascade_from_new_bonds_only": True,
-            "manifold.voronoi_impact_damage_floor": 0.08,
-            "manifold.voronoi_cascade_damage_floor": 0.10,
-            "manifold.voronoi_force_shrink_damage_floor": 0.12,
+            "manifold.voronoi_cascade_radius": 0.0,
             "manifold.voronoi_force_shrink_max_frac": 0.05,
-            "manifold.fragment_release_position_offset": 0.0,
+            "manifold.fragment_release_position_offset": 0.05,
             "manifold.particle_speed_cap": 80.0,
             # Aggressive angular damping for residual base + fragments.
             # static_omega=25 puts kinetic damping (0.985) only above
@@ -1894,6 +1894,16 @@ class MaterialPriorAdapter:
         out["manifold.shape_match_fragment_strength"] = 0.97
         out["manifold.shape_match_velocity_blend"] = 0.80
         out["manifold.post_impact_kinematic_lock_frames"] = 25
+        out["manifold.fragmentation_enabled"] = False
+        out["manifold.voronoi_impact_shock_radius"] = 0.0
+        out["manifold.voronoi_cascade_radius"] = 0.0
+        out["manifold.voronoi_force_shrink_max_frac"] = 0.0
+        out["manifold.voronoi_bond_aging_per_frame"] = 0.0
+        out["manifold.fragment_release_v_com_gain"] = 0.0
+        out["manifold.fragment_release_position_offset"] = 0.0
+        out["manifold.fragment_physical_gap_scale"] = 0.0
+        out["manifold.fragment_physical_release_velocity"] = 0.0
+        out["manifold.fragment_physical_release_frames"] = 0
         return out
 
     @staticmethod

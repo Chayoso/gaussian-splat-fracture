@@ -294,34 +294,15 @@ def export_simulator_state(
         except Exception as exc:
             print(f"[houdini_export] fragment_id alignment skipped: {exc}")
 
-    # Densified Gaussians (slots past surface count) inherit their parent
-    # particle's fragment_id so they aren't visually orphaned.  Parent
-    # indices come from either splitter._last_append_parent_idx (crack
-    # debris) or gaussians._interior_parent_idx (interior fill).
+    # Densified Gaussians (slots past surface count) do not have a stable
+    # physical fragment identity.  Leaving them visible in fragment-colored
+    # .geo previews makes low-opacity crack/interior splats read as floating
+    # shard dust, even though they are not physical fragments.
     n_surface = (int(surface_indices.shape[0])
                  if surface_indices is not None else 0)
     if n_surface > 0 and n > n_surface:
-        candidates = []
-        splitter = getattr(simulator, "splitter", None)
-        if splitter is not None:
-            sp_idx = getattr(splitter, "_last_append_parent_idx", None)
-            if sp_idx is not None and sp_idx.numel() > 0:
-                candidates.append(sp_idx)
-        int_idx = getattr(gaussians, "_interior_parent_idx", None)
-        if int_idx is not None and int_idx.numel() > 0:
-            candidates.append(int_idx)
-        if candidates:
-            try:
-                merged = torch.cat([c.flatten() for c in candidates], dim=0)
-                pidx = merged.cpu().numpy().astype(np.int64)
-                tail = max(0, n - n_surface)
-                k = min(tail, pidx.shape[0])
-                if k > 0:
-                    pidx_clipped = np.clip(pidx[-k:], 0, n_surface - 1)
-                    parent_fid = fid_np[:n_surface][pidx_clipped]
-                    fid_np[n - k:] = parent_fid
-            except Exception as exc:
-                print(f"[houdini_export] phantom inherit skipped: {exc}")
+        fid_np[n_surface:] = -1
+        alpha_np[n_surface:] = 0.0
 
     fracture_field = getattr(simulator, "fracture_field", None)
     damage_np = np.zeros(n, dtype=np.float32)
