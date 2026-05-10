@@ -552,6 +552,11 @@ class ManifoldSimulator(
         # fracture tick by _step_physics; reused by future steps when
         # fracture tick interval > 1 substep.
         self._last_c_mech: Optional[Tensor] = None
+        # Pipeline rewrite Step 3a: cached voronoi components-state
+        # produced by _voronoi_bond_eval_commit() inside the substep
+        # loop.  step_rendering consumes it at frame end via
+        # _voronoi_spatial_split_and_refine() when the flag is on.
+        self._last_voronoi_components_state: Optional[Dict] = None
         # Pipeline rewrite Step 2 prep: per-fragment birth-time registries.
         # Populated when manifold.use_physical_fragment_authority is True
         # (also requires _physical_fragment_labels to be the active
@@ -836,9 +841,22 @@ class ManifoldSimulator(
             self._fracture_burst_active = False
 
         # --- Voronoi pre-fracture update (if enabled) ---
+        # Pipeline rewrite Step 3a: when
+        # ``manifold.voronoi_eval_per_fracture_tick`` is True the
+        # cheap half (bond eval / commit / Mode-I kicks) runs inside
+        # the substep loop (see ``_step_physics``); only the
+        # expensive spatial-split / label-refinement half runs at
+        # frame end.  Otherwise we fall back to the legacy single-
+        # call wrapper which executes both halves serially here.
         if (getattr(self, 'voronoi', None) is not None
                 and self._gravity_drop_contacted):
-            self._step_voronoi_fracture()
+            if bool(self.fracture_cfg.get(
+                    'voronoi_eval_per_fracture_tick', False)):
+                state = getattr(self, '_last_voronoi_components_state', None)
+                if state is not None:
+                    self._voronoi_spatial_split_and_refine(state)
+            else:
+                self._step_voronoi_fracture()
         # --- Fragment detection ---
         if (not fragment_detected_in_burst
                 and self.fragment_manager is not None
@@ -925,6 +943,22 @@ class ManifoldSimulator(
         c_visual = self._get_volumetric_damage()
         self._last_volumetric_damage_max = float(c_visual.max().item()) if c_visual.numel() else 0.0
         self._last_volumetric_damage_mean = float(c_visual.mean().item()) if c_visual.numel() else 0.0
+
+        # Pipeline rewrite Step 3a: per-fracture-tick voronoi bond
+        # eval / commit + Mode-I kicks.  Runs every
+        # ``fracture_tick_interval_substeps`` physics substeps when
+        # the flag is enabled.  The expensive spatial-split + label
+        # refinement still happens at frame end (see step_rendering).
+        if (getattr(self, 'voronoi', None) is not None
+                and self._gravity_drop_contacted
+                and bool(self.fracture_cfg.get(
+                    'voronoi_eval_per_fracture_tick', False))):
+            interval = max(1, int(self.fracture_cfg.get(
+                'fracture_tick_interval_substeps', 1)))
+            if (int(self._physics_step) % interval) == 0:
+                state = self._voronoi_bond_eval_commit()
+                if state is not None:
+                    self._last_voronoi_components_state = state
 
         g_min = float(self.fracture_cfg.get('mechanical_stiffness_floor', 0.0))
         if g_min > 0.0:
