@@ -178,22 +178,38 @@ class VoronoiPipelineMixin:
 
     @torch.no_grad()
     def _step_voronoi_fracture(self):
-        """Per-frame Voronoi update: damage → bond breakage → components.
+        """Wrapper that runs both halves of the voronoi update in order.
 
-        Flow:
-            1. Get per-MPM-particle damage via ``_get_volumetric_damage``.
-            2. Update bond breakage (stress wave + cascade gates).
-            3. For each newly-broken bond, apply a Newton-3rd Mode-I
-               opening kick.
-            4. Compute connected components and write per-particle
-               fragment ids back to the persistent registry so the
-               renderer / fragment-manager use them downstream.
+        Pipeline rewrite (2026-05-09): the body has been factored into
+        :meth:`_voronoi_bond_eval_commit` (cheap; bond-breakage + Mode-I
+        kicks + cell-level connected components) and
+        :meth:`_voronoi_spatial_split_and_refine` (expensive;
+        particle-level spatial split + label write-back).  Step 3a
+        moves the cheap half into the per-substep fracture tick while
+        keeping the expensive half at frame end.  Until that flag is
+        enabled, this wrapper preserves the legacy single-call
+        behavior.
         """
         if self.voronoi is None or self.x_mpm is None:
             return
+        components_state = self._voronoi_bond_eval_commit()
+        if components_state is None:
+            return
+        self._voronoi_spatial_split_and_refine(components_state)
+
+    @torch.no_grad()
+    def _voronoi_bond_eval_commit(self):
+        """Cheap half: bond-breakage check, Mode-I kicks, cell-level CC.
+
+        Returns the cell-level connected component state needed by
+        :meth:`_voronoi_spatial_split_and_refine`, or ``None`` if the
+        precondition is not met (no voronoi, no particle field).
+        """
+        if self.voronoi is None or self.x_mpm is None:
+            return None
         damage = self._get_volumetric_damage()
         if damage.numel() != self.x_mpm.shape[0]:
-            return
+            return None
         bond_aging = float(getattr(
             self, '_voronoi_bond_aging_effective',
             self.fracture_cfg.get('voronoi_bond_aging_per_frame', 0.0)))
@@ -229,15 +245,23 @@ class VoronoiPipelineMixin:
                 self._voronoi_cell_graduated[cell_id] = True
                 n_grad += 1
         self._voronoi_prev_components = comp_per_cell.tolist()
+        return {"per_particle": per_particle, "n_graduated": n_grad}
 
-        # Spatial-connectivity refinement: a cell-based fragment id
-        # binds particles that may have flown apart since impact.  For
-        # each cell-component, run a particle-level connected-component
-        # pass in *current* world space so a chunk that drifts away
-        # from the main mass gets its own fragment id (and hence its
-        # own colour in the renderer).  IDs are stabilised across
-        # frames via majority-overlap inheritance with the previous
-        # frame's labels.
+    @torch.no_grad()
+    def _voronoi_spatial_split_and_refine(self, components_state: dict) -> None:
+        """Expensive half: particle-level spatial split + label write-back.
+
+        Refines cell-based fragment ids with a particle-level
+        connected-component pass in *current* world space so chunks
+        that drift apart (after the cell partition was fixed) get
+        their own fragment id, then writes the result back to
+        ``_physical_fragment_labels`` and updates the persistent
+        ``_next_physical_fragment_id`` counter.
+
+        Stays at frame end (Step 3a) because the cKDTree spatial split
+        is the dominant cost in this pipeline.
+        """
+        per_particle = components_state["per_particle"]
         per_particle = self._spatial_split_fragments(per_particle)
 
         labels = torch.from_numpy(per_particle).to(
@@ -246,6 +270,7 @@ class VoronoiPipelineMixin:
             self._physical_fragment_labels = labels
             self._next_physical_fragment_id = int(labels.max().item()) + 1
 
+        n_grad = int(components_state.get("n_graduated", 0))
         if n_grad > 0:
             n_components = int(per_particle.max() + 1) if per_particle.size else 1
             print(f"  [Voronoi] {n_grad} cells graduated this frame "

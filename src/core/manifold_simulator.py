@@ -548,6 +548,18 @@ class ManifoldSimulator(
         self._last_stress = None
         self._last_volumetric_damage_max = 0.0
         self._last_volumetric_damage_mean = 0.0
+        # Pipeline rewrite Step 1a: c_mech cache scaffold.  Set per
+        # fracture tick by _step_physics; reused by future steps when
+        # fracture tick interval > 1 substep.
+        self._last_c_mech: Optional[Tensor] = None
+        # Pipeline rewrite Step 2 prep: per-fragment birth-time registries.
+        # Populated when manifold.use_physical_fragment_authority is True
+        # (also requires _physical_fragment_labels to be the active
+        # source of truth).  Step 4b consumes birth_physics_step for
+        # substep-counted handoff smoothing; Step 1b consumes birth_time
+        # for time-based c_mech anneal.
+        self._physical_fragment_birth_time: Dict[int, float] = {}
+        self._physical_fragment_birth_physics_step: Dict[int, int] = {}
         self._last_surface_volume_damage_proxy_max = 0.0
         self._last_surface_volume_damage_proxy_mean = 0.0
         self._surface_indices: Optional[Tensor] = None
@@ -694,6 +706,9 @@ class ManifoldSimulator(
         self._physical_fragment_labels = None
         self._physical_fragment_states = {}
         self._next_physical_fragment_id = 1
+        # Reset birth registry (Step 2 prep).
+        self._physical_fragment_birth_time = {}
+        self._physical_fragment_birth_physics_step = {}
         self._reset_frame_fragment_event_stats()
         self._last_rigid_angular_speed_max = 0.0
         self._last_rigid_angular_speed_mean = 0.0
@@ -704,6 +719,43 @@ class ManifoldSimulator(
         self._interior_indices = torch.where(~self.surface_mask)[0]
         self._build_rest_surface_binding()
         print(f"[ManifoldSim] Initialized: {N} particles, {N_surf} surface")
+
+    # ----------------------------------------------------------------
+    # Physical fragment authority helpers (Pipeline rewrite Step 2)
+    # ----------------------------------------------------------------
+
+    def _has_physical_fragments(self) -> bool:
+        """Return True iff the voronoi-driven label tensor has any fragment.
+
+        Source of truth for fragment existence once
+        ``manifold.use_physical_fragment_authority`` is enabled.  Until
+        then this is a passive helper that may be called for
+        diagnostics; the legacy gate ``fragment_manager.n_fragments > 1``
+        is still authoritative.
+        """
+        labels = self._physical_fragment_labels
+        return labels is not None and bool((labels > 0).any())
+
+    def _update_physical_fragment_birth_registry(self) -> None:
+        """Record (mpm.time, _physics_step) for any new physical fragment label.
+
+        Called from a fracture-tick path once
+        ``manifold.use_physical_fragment_authority`` is enabled.  Labels
+        are insert-only here; eviction (if any) happens elsewhere when a
+        fragment is fully merged or removed.
+        """
+        labels = self._physical_fragment_labels
+        if labels is None:
+            return
+        cur_t = float(getattr(self.mpm, "time", 0.0))
+        cur_s = int(getattr(self, "_physics_step", 0))
+        unique = torch.unique(labels)
+        for lab in unique.tolist():
+            if lab <= 0:
+                continue
+            if lab not in self._physical_fragment_birth_physics_step:
+                self._physical_fragment_birth_time[lab] = cur_t
+                self._physical_fragment_birth_physics_step[lab] = cur_s
 
     def set_surface_normals(self, all_normals: Tensor):
         """Store surface normals and pass to the graph builder.
@@ -839,11 +891,37 @@ class ManifoldSimulator(
 
         self._apply_seismic_loading(dt)
 
-        # Compute stress with damage degradation
-        c_vol = self._get_volumetric_damage()
-        self._last_volumetric_damage_max = float(c_vol.max().item()) if c_vol.numel() else 0.0
-        self._last_volumetric_damage_mean = float(c_vol.mean().item()) if c_vol.numel() else 0.0
-        stress = self.elasticity(self.F, c=c_vol)
+        # Compute stress with damage degradation.
+        #
+        # Step 1a (pipeline rewrite, 2026-05-09): introduce c_visual / c_mech
+        # split.  c_visual is the raw phase-field damage (used for crack
+        # rendering and as Voronoi bond evidence; range [0, 1] preserved).
+        # c_mech is the damage value actually fed into the constitutive
+        # model.  When manifold.mechanical_stiffness_floor > 0, we cap
+        # c_mech so the residual stiffness never collapses to the
+        # constitutive k_residual floor at fully-damaged points (which
+        # produces a discontinuous stress field at damage boundaries).
+        # The cap value c_cap = 1 - sqrt(g_min) so the post-cap stiffness
+        # g(c_cap) = (1 - c_cap)^2 + k_residual ~= g_min.
+        # Default g_min = 0 -> c_mech == c_visual -> identical to legacy
+        # behavior.
+        c_visual = self._get_volumetric_damage()
+        self._last_volumetric_damage_max = float(c_visual.max().item()) if c_visual.numel() else 0.0
+        self._last_volumetric_damage_mean = float(c_visual.mean().item()) if c_visual.numel() else 0.0
+
+        g_min = float(self.fracture_cfg.get('mechanical_stiffness_floor', 0.0))
+        if g_min > 0.0:
+            c_cap = 1.0 - math.sqrt(max(g_min, 1e-12))
+            c_mech = c_visual.clamp(max=c_cap)
+        else:
+            c_mech = c_visual
+
+        # Cache c_mech for future fracture-tick consumers (Step 3a/3b/1b).
+        # In Step 1a this is recomputed every substep; later steps will
+        # use the cache when fracture tick interval > 1 substep.
+        self._last_c_mech = c_mech
+
+        stress = self.elasticity(self.F, c=c_mech)
         E = (torch.exp(self.elasticity.log_E).item()
              if hasattr(self.elasticity, 'log_E') else 1e6)
         stress = stress.clamp(-5.0 * E, 5.0 * E)
