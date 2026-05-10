@@ -78,6 +78,16 @@ class VoronoiPipelineMixin:
         """
         from src.fracture.voronoi_decomposer import VoronoiDecomposer
         n_cells_full = int(self.fracture_cfg.get('voronoi_n_cells', 200))
+        # n_cells < 5 means a "single-body" style (diffuse_microcrack
+        # uses n_cells=2 to express "no fragmentation, just surface
+        # microcracks").  Qhull Delaunay needs >=5 input points; below
+        # that we skip the voronoi pipeline entirely and let the
+        # particle stay on the base body label (renderer shows no
+        # detached fragments — exactly what the style wants).
+        if n_cells_full < 5:
+            print(f"  [Voronoi] n_cells={n_cells_full} < 5 — single-body mode, skipping tessellation.")
+            self.voronoi = None
+            return
         distribution = str(self.fracture_cfg.get(
             'voronoi_seed_distribution', 'impact_biased'))
         bond_thr = float(self.fracture_cfg.get(

@@ -543,38 +543,34 @@ class VoronoiDecomposer:
     def particle_fragment_ids(self) -> np.ndarray:
         """Map each particle to its current connected-component id.
 
-        Component 0 is reserved as "still-cohesive base body" (the
-        largest component); all others are individual fragments
-        (component id >= 1 after re-labeling).
+        Component 0 is reserved as "still-cohesive base body" — defined
+        as the connected component containing the most particles.  All
+        others get sequential ids >= 1.  This labelling holds even when
+        the body has heavily fragmented: the largest remaining chunk is
+        the visual "base" for rendering, and fragment metrics that need
+        a more nuanced base_frac can derive it from the size histogram
+        separately.
+
+        Earlier this routine refused to assign label 0 unless the
+        largest component owned > 30% of particles, which produced a
+        visual artifact under heavy pulverization: every voronoi cell
+        in the still-undamaged region got a non-zero fragment id and
+        the renderer painted them as detached fragments.  The 30%
+        gate is removed; the largest CC is always the base.
         """
         comp_per_cell = self.connected_components()
         if self.cell_assignment is None:
             return np.zeros(0, dtype=np.int64)
         per_particle = comp_per_cell[self.cell_assignment]
-        # Identify largest component (= base) and remap to label 0;
-        # everything else gets sequential labels 1..K.
         if per_particle.size > 0:
             counts = np.bincount(per_particle)
             largest = int(np.argmax(counts))
-            # Only relabel the largest component as "base" (id 0) if it
-            # genuinely owns a majority of particles; otherwise the body
-            # has already pulverized into many small chunks and "base"
-            # is a misleading concept (we'd be calling whichever chunk
-            # happens to have the most particles "base", artificially
-            # inflating base_frac).  Threshold: 0.30 of total particles.
-            n_total = int(per_particle.size)
-            if int(counts[largest]) > int(0.30 * n_total):
-                mask_base = per_particle == largest
-                unique_non_base = sorted(
-                    set(per_particle[~mask_base].tolist()))
-                remap = {largest: 0}
-                for new_id, old_id in enumerate(unique_non_base, start=1):
-                    remap[old_id] = new_id
-            else:
-                # No dominant base; sequential labels 1..K, no zero.
-                unique_all = sorted(set(per_particle.tolist()))
-                remap = {old_id: new_id
-                         for new_id, old_id in enumerate(unique_all, start=1)}
+            mask_base = per_particle == largest
+            unique_non_base = sorted(
+                set(per_particle[~mask_base].tolist()))
+            remap = {largest: 0}
+            for new_id, old_id in enumerate(unique_non_base, start=1):
+                remap[old_id] = new_id
             per_particle = np.array(
                 [remap[c] for c in per_particle.tolist()],
                 dtype=np.int64,
