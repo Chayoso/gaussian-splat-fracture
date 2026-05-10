@@ -291,14 +291,13 @@ def _fragment_boundary_support_metrics(simulator, fragment_ids: torch.Tensor | N
             "final_detached_boundary_edges": 0,
         }
     graph = getattr(simulator, "graph", None)
-    manager = getattr(simulator, "fragment_manager", None)
     knn_idx = getattr(graph, "knn_idx", None) if graph is not None else None
     if knn_idx is None:
         return {
             "final_fragment_boundary_edges": 0,
             "final_causal_supported_fragment_boundary_edges": 0,
             "final_fragment_boundary_support_ratio": 0.0,
-            "final_detached_boundary_edges": int(getattr(manager, "last_detached_boundary_edges", 0)) if manager is not None else 0,
+            "final_detached_boundary_edges": 0,
         }
 
     n = min(int(n), int(fragment_ids.shape[0]), int(knn_idx.shape[0]))
@@ -310,20 +309,17 @@ def _fragment_boundary_support_metrics(simulator, fragment_ids: torch.Tensor | N
     frag_j[valid] = frag[knn[valid]]
     boundary = valid & (frag_i != frag_j) & ((frag_i > 0) | (frag_j > 0))
 
-    causal = torch.zeros_like(boundary)
-    if manager is not None:
-        for attr in ("last_cut_edge_mask", "last_closure_boundary_mask", "detached_boundary_mask"):
-            edge_mask = getattr(manager, attr, None)
-            if edge_mask is not None and edge_mask.shape == knn_idx.shape:
-                causal |= edge_mask.detach().bool()[:n] & valid
-    supported = boundary & causal
+    # Graph-derived cut/closure mask augmentation removed with
+    # GraphFragmentManager; causal support now reduces to fragment-
+    # boundary edges only.
+    supported = boundary
     boundary_edges = int(boundary.sum().item())
     supported_edges = int(supported.sum().item())
     return {
         "final_fragment_boundary_edges": boundary_edges,
         "final_causal_supported_fragment_boundary_edges": supported_edges,
         "final_fragment_boundary_support_ratio": supported_edges / max(boundary_edges, 1),
-        "final_detached_boundary_edges": int(getattr(manager, "last_detached_boundary_edges", 0)) if manager is not None else 0,
+        "final_detached_boundary_edges": 0,
     }
 
 
@@ -435,15 +431,14 @@ def _final_simulator_crack_metrics(
     metrics.update(_angular_metrics(positions, cracked, center, "final_cracked"))
     metrics.update(_angular_metrics(positions, visited, center, "final_visited"))
 
-    manager = getattr(simulator, "fragment_manager", None)
+    # Source of truth: physical voronoi fragment labels.
     fragment_ids = None
-    if manager is not None and getattr(manager, "fragment_ids", None) is not None:
-        fragment_ids = manager.fragment_ids.detach()
     physical_labels = getattr(simulator, "_physical_fragment_labels", None)
     surface_indices = getattr(simulator, "_surface_indices", None)
     if physical_labels is not None and surface_indices is not None:
         surf_phys = physical_labels[surface_indices][:n].detach()
         if bool((surf_phys > 0).any()):
+            fragment_ids = surf_phys
             metrics.update({
                 f"physical_{key}": value
                 for key, value in _fragment_label_metrics(surf_phys, int(surf_phys.shape[0])).items()
@@ -593,16 +588,8 @@ def run_gravity_sweep(
         row.update(_runtime_release_row(result["params"]))
         row.update(_summarize_history(history))
         simulator = getattr(pipeline.engine, "last_simulator", None)
-        manager = getattr(simulator, "fragment_manager", None) if simulator is not None else None
-        if manager is not None:
-            row.update({
-                "runtime_crack_connected_release_only": bool(getattr(manager, "crack_connected_release_only", False)),
-                "runtime_open_crack_release_enable": bool(getattr(manager, "open_crack_release_enable", True)),
-                "runtime_catastrophic_release_enable": bool(getattr(manager, "catastrophic_release_enable", False)),
-                "runtime_catastrophic_release_patches_per_step": int(getattr(manager, "catastrophic_release_patches_per_step", 0)),
-                "runtime_secondary_shatter_enable": bool(getattr(manager, "secondary_shatter_enable", False)),
-                "runtime_secondary_shatter_max_patches": int(getattr(manager, "secondary_shatter_max_patches", 0)),
-            })
+        if simulator is not None:
+            row["runtime_crack_connected_release_only"] = bool(getattr(simulator, "crack_connected_release_only", False))
         plot_path = None
         if bool(getattr(args, "plot_final", True)):
             plot_path = out_dir / "final_plots" / "gravity_material_validation" / f"{idx:02d}_{_slug(prompt)}.png"

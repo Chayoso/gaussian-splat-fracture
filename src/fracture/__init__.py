@@ -9,7 +9,6 @@ from .graph_builder import GaussianGraph
 from .physics_projector import PhysicsProjector
 from .tip_based_fracture_field import GaussianFractureField
 from .gaussian_splitter import GaussianSplitter
-from .graph_fragment_manager import GraphFragmentManager
 from .crack_front import CrackFront
 
 __all__ = [
@@ -17,6 +16,5 @@ __all__ = [
     "PhysicsProjector",
     "GaussianFractureField",
     "GaussianSplitter",
-    "GraphFragmentManager",
     "CrackFront",
 ]

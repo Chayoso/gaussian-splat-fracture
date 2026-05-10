@@ -12,9 +12,6 @@ from torch import Tensor
 
 class FragmentPhysicsMixin:
     def _rigid_handoff_enabled(self) -> bool:
-        if not bool(getattr(self, "fracture_cfg", {}).get(
-                "use_physical_fragment_authority", True)):
-            return False
         mode = str(getattr(self, "detached_fragment_dynamics", "mpm_shape_match"))
         return mode in {"rigid_handoff", "rigid", "detached_rigid"}
 
@@ -48,28 +45,13 @@ class FragmentPhysicsMixin:
 
     def _fragmented_physics_labels(self) -> Tensor:
         """Return label overlay for fragment-aware post-P2G2P hooks."""
-        use_physical = bool(self.fracture_cfg.get(
-            'use_physical_fragment_authority', True))
-        if use_physical:
-            labels = self._physical_fragment_labels
-            if (
-                labels is not None
-                and labels.shape[0] == self.x_mpm.shape[0]
-                and labels.device == self.x_mpm.device
-            ):
-                return labels
-            return torch.zeros(
-                self.x_mpm.shape[0],
-                dtype=torch.long,
-                device=self.x_mpm.device,
-            )
-
+        labels = self._physical_fragment_labels
         if (
-            self.fragment_manager is not None
-            and getattr(self.fragment_manager, "fragment_ids", None) is not None
+            labels is not None
+            and labels.shape[0] == self.x_mpm.shape[0]
+            and labels.device == self.x_mpm.device
         ):
-            return self._map_surface_labels_to_particles(
-                self.fragment_manager.fragment_ids)
+            return labels
         return torch.zeros(
             self.x_mpm.shape[0],
             dtype=torch.long,
@@ -192,12 +174,7 @@ class FragmentPhysicsMixin:
 
     def _apply_physical_fragment_release_drift(self, mpm_frag_ids: Tensor, dt: float) -> None:
         """Apply a small physical gap / release drift to support-lost fragments."""
-        use_physical_authority = bool(getattr(self, "fracture_cfg", {}).get(
-            "use_physical_fragment_authority", True))
-        if use_physical_authority:
-            if mpm_frag_ids is None or not bool((mpm_frag_ids > 0).any()):
-                return
-        elif self.fragment_manager is None or self.fragment_manager.n_fragments <= 1:
+        if mpm_frag_ids is None or not bool((mpm_frag_ids > 0).any()):
             return
         if self.fragment_physical_release_frames <= 0:
             return
@@ -365,24 +342,12 @@ class FragmentPhysicsMixin:
         self.x_mpm = self.x_mpm.clamp(self.mpm.clip_bound, 1.0 - self.mpm.clip_bound)
 
     def _current_mpm_fragment_labels(self) -> Optional[Tensor]:
-        use_physical = bool(self.fracture_cfg.get(
-            'use_physical_fragment_authority', True))
         if (
-            use_physical
-            and
             self._physical_fragment_labels is not None
             and self._physical_fragment_labels.shape[0] == self.x_mpm.shape[0]
             and bool((self._physical_fragment_labels > 0).any())
         ):
             return self._physical_fragment_labels
-        if use_physical:
-            return None
-        if (
-            self.fragment_manager is not None
-            and getattr(self.fragment_manager, "fragment_ids", None) is not None
-            and bool((self.fragment_manager.fragment_ids > 0).any())
-        ):
-            return self._map_surface_labels_to_particles(self.fragment_manager.fragment_ids)
         return None
 
     def _rigid_fragment_particle_mask(self, labels: Optional[Tensor] = None) -> Tensor:
@@ -997,11 +962,12 @@ class FragmentPhysicsMixin:
         n = torch.tensor([0.0, 0.0, 1.0], device=current.device, dtype=current.dtype)
         contact_point = current[contact].mean(dim=0)
         r = contact_point - com
-        physical_authority = bool(getattr(self, "fracture_cfg", {}).get(
-            "use_physical_fragment_authority", True))
+        # Physical-fragment authority is the only mode; default off
+        # for shape-match contact torque (was previously gated by the
+        # now-removed authority flag).
         contact_torque_enabled = bool(getattr(self, "fracture_cfg", {}).get(
             "shape_match_contact_torque_enabled",
-            not physical_authority,
+            False,
         ))
         if not contact_torque_enabled:
             vn_com = v_com.dot(n)
@@ -1302,22 +1268,12 @@ class FragmentPhysicsMixin:
         new = old.lerp(target, strength)
         # Step 4a: skip position pull on detached fragments when the
         # corresponding flag is disabled.  Velocity injection still
-        # runs below so cohesion is preserved through v.
-        #
-        # Guard: Step 4a is only meaningful when fragment identity is
-        # owned by the voronoi authority (Step 2).  Without that, the
-        # incoming label may be a graph-fragment id whose physical
-        # separation is not yet established, and skipping the pull
-        # would bleed cohesion from still-connected pieces.  We
-        # therefore require ``use_physical_fragment_authority`` to be
-        # True before honouring the skip.
+        # runs below so cohesion is preserved through v.  Physical-
+        # fragment authority is the only mode; fragment identity is
+        # always owned by the voronoi pipeline so the skip is safe.
         position_pull_enabled = bool(self.fracture_cfg.get(
             'shape_match_fragment_position_pull', True))
-        physical_authority = bool(self.fracture_cfg.get(
-            'use_physical_fragment_authority', True))
-        skip_pull = (is_fragment
-                     and not position_pull_enabled
-                     and physical_authority)
+        skip_pull = is_fragment and not position_pull_enabled
         if skip_pull:
             new = old
         else:
@@ -1331,7 +1287,7 @@ class FragmentPhysicsMixin:
             )
             correction_v = (new - old) / max(float(self.mpm.dt), 1e-8)
             blend = max(0.0, min(self.shape_match_velocity_blend + 0.45 * strength, 1.0))
-            apply_handoff = is_fragment and physical_authority
+            apply_handoff = is_fragment
             if apply_handoff:
                 smoothing_steps = max(0, int(self.fracture_cfg.get(
                     'fragment_handoff_smoothing_substeps', 0)))

@@ -287,13 +287,11 @@ class VoronoiPipelineMixin:
         if labels.shape[0] == self.x_mpm.shape[0]:
             self._physical_fragment_labels = labels
             self._next_physical_fragment_id = int(labels.max().item()) + 1
-            if bool(getattr(self, "fracture_cfg", {}).get(
-                    "use_physical_fragment_authority", True)):
-                has_physical_fragment = bool((labels > 0).any())
-                if (has_physical_fragment
-                        and not bool(getattr(self, "fragmentation_active", False))):
-                    self.fragmentation_active = True
-                    self._fragment_activation_frame = self.frame_count
+            has_physical_fragment = bool((labels > 0).any())
+            if (has_physical_fragment
+                    and not bool(getattr(self, "fragmentation_active", False))):
+                self.fragmentation_active = True
+                self._fragment_activation_frame = self.frame_count
                 # The birth registry also synchronizes rigid handoff state
                 # and may rewrite tiny/no-base residue labels in place.
                 # Surface/render labels must be written after that sync.

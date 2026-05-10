@@ -6,13 +6,16 @@ Gaussian-manifold fracture pipeline replacing HybridCrackSimulator.
 Architecture:
     MPM physics → PhysicsProjector → GaussianFractureField → GaussianUpdater
                                     → GaussianSplitter
-                                    → GraphFragmentManager
+                                    → VoronoiPipeline (physical fragments)
 
-Key difference from HybridCrackSimulator:
+Key design points:
     - Fracture state lives ON Gaussians, not on a volumetric grid
     - No damage_mapper (volume→surface projection) needed
     - Graph-based Laplacian instead of grid Laplacian
     - Crack normals and opening are first-class state
+    - Fragment identity owned by the voronoi cell bond network
+      (``_physical_fragment_labels``); GraphFragmentManager was
+      removed in the 2026-05-10 refactor.
 """
 
 import numpy as np
@@ -29,11 +32,9 @@ from src.fracture.physics_projector import PhysicsProjector
 from src.fracture.crack_front import CrackFront
 from src.fracture.tip_based_fracture_field import GaussianFractureField
 from src.fracture.gaussian_splitter import GaussianSplitter
-from src.fracture.graph_fragment_manager import GraphFragmentManager
 from src.fracture.voronoi_pipeline import VoronoiPipelineMixin
 from src.core.simulator_mixins import (
     SurfaceBindingMixin,
-    FragmentEventStatsMixin,
     FragmentPhysicsMixin,
     RuntimeProfilesMixin,
     FractureDriveMixin,
@@ -43,7 +44,6 @@ from src.core.simulator_mixins import (
 
 class ManifoldSimulator(
     SurfaceBindingMixin,
-    FragmentEventStatsMixin,
     FragmentPhysicsMixin,
     RuntimeProfilesMixin,
     FractureDriveMixin,
@@ -58,7 +58,7 @@ class ManifoldSimulator(
         2. PhysicsProjector: ψ⁺, n₁, F → Gaussians
         3. GaussianFractureField: damage evolution on graph
         4. GaussianSplitter: crack opening + split
-        5. GraphFragmentManager: fragment detection
+        5. VoronoiPipeline: physical-fragment (cell bond) authority
         6. GaussianUpdater: positions, lighting, deformation
     """
 
@@ -200,77 +200,11 @@ class ManifoldSimulator(
         self.impact_fracture_burst_front_substeps = max(
             int(fp.get('impact_fracture_burst_front_substeps', burst_defaults["front_substeps"])), 1)
         self._fracture_burst_active = False
-        frag_enabled = fp.get('fragmentation_enabled', False)
-        self.fragment_manager = GraphFragmentManager(
-            damage_threshold=fp.get('fragment_damage_threshold', 0.5),
-            min_fragment_size=fp.get('min_fragment_particles', 20),
-            edge_break_rate=fp.get('edge_break_rate', 1.0),
-            opening_weight=fp.get('fragment_opening_weight', 0.35),
-            active_tip_weight=fp.get('fragment_active_tip_weight', 0.18),
-            recent_front_weight=fp.get('fragment_recent_front_weight', 0.12),
-            pair_break_weight=fp.get('fragment_pair_break_weight', 0.10),
-            edge_memory_decay=fp.get('fragment_edge_memory_decay', 0.97),
-            edge_memory_weight=fp.get('fragment_edge_memory_weight', 0.72),
-            cut_diffusion_alpha=fp.get('fragment_cut_diffusion_alpha', 0.0),
-            cut_diffusion_iters=fp.get('fragment_cut_diffusion_iters', 0),
-            cut_cos_gate_tangent=fp.get('fragment_cut_cos_gate_tangent', 0.5),
-            cut_cos_gate_normal=fp.get('fragment_cut_cos_gate_normal', 0.4),
-            primary_cut_ratio=fp.get('fragment_primary_cut_ratio', 0.75),
-            fallback_cut_ratio=fp.get('fragment_fallback_cut_ratio', 0.55),
-            min_boundary_edges=fp.get('fragment_min_boundary_edges', 12),
-            detached_node_decay=fp.get('fragment_detached_node_decay', 0.95),
-            persistent_min_fragment_size=fp.get('fragment_persistent_min_size', 8),
-            persistent_min_fragment_size_ratio=fp.get('fragment_persistent_min_size_ratio', 0.0),
-            persistent_min_fragment_reference_nodes=fp.get(
-                'fragment_persistent_reference_nodes', 10000),
-            persistent_min_fragment_resolution_exponent=fp.get(
-                'fragment_persistent_resolution_exponent', 0.5),
-            component_hysteresis=fp.get('fragment_component_hysteresis', 0.35),
-            post_split_threshold_scale=fp.get('fragment_post_split_threshold_scale', 0.92),
-            cut_surface_enable=fp.get('cut_surface_enable', False),
-            cut_vote_strength=fp.get('cut_vote_strength', 0.0),
-            tau_cross=fp.get('tau_cross', 0.60),
-            tau_tangent=fp.get('tau_tangent', 0.45),
-            cut_core_damage_threshold=fp.get('cut_core_damage_threshold', 0.18),
-            cut_core_opening_threshold=fp.get('cut_core_opening_threshold', 0.16),
-            cut_hard_break_threshold=fp.get('cut_hard_break_threshold', 0.42),
-            authoritative_cut_decay=fp.get('authoritative_cut_decay', 0.96),
-            authoritative_cut_threshold=fp.get('authoritative_cut_threshold', 0.20),
-            support_loss_enable=fp.get('support_loss_enable', True),
-            support_anchor_quantile=fp.get('support_anchor_quantile', 0.10),
-            support_release_threshold=fp.get('support_release_threshold', 0.56),
-            support_promote_min_size=fp.get('support_promote_min_size', 6),
-            support_overlap_threshold=fp.get('support_overlap_threshold', 0.10),
-            fragment_boundary_cut_min_ratio=fp.get('fragment_boundary_cut_min_ratio', 0.0),
-            open_crack_release_enable=fp.get('open_crack_release_enable', True),
-            open_crack_release_threshold=fp.get('open_crack_release_threshold', 0.0),
-            open_crack_release_max_patches=fp.get('open_crack_release_max_patches', 2),
-            crack_connected_release_only=self.crack_connected_release_only,
-            strict_closure_max_released_ratio=fp.get('strict_closure_max_released_ratio', 0.54),
-            crack_style=fp.get('sentence_style', fp.get('crack_style', 'material_default')),
-            brittle_release_intensity=fp.get('brittle_release_intensity', 1.0),
-            impact_release_gain=fp.get('impact_release_gain', 1.0),
-            impact_closure_target_ratio=fp.get('impact_closure_target_ratio', -1.0),
-            impact_closure_max_patches=fp.get('impact_closure_max_patches', -1),
-            impact_closure_active_frames=fp.get('impact_closure_active_frames', 2),
-            impact_closure_sector_count=fp.get('impact_closure_sector_count', 0),
-            impact_closure_band_count=fp.get('impact_closure_band_count', 0),
-            impact_closure_layer_count=fp.get('impact_closure_layer_count', 0),
-            impact_closure_min_size_ratio=fp.get('impact_closure_min_size_ratio', 0.0),
-            impact_closure_max_size_ratio=fp.get('impact_closure_max_size_ratio', 0.0),
-            impact_closure_adaptive_extra_frames=fp.get(
-                'impact_closure_adaptive_extra_frames', 6),
-            impact_closure_completion_ratio=fp.get(
-                'impact_closure_completion_ratio', 0.92),
-            phase_approval_enable=fp.get('phase_approval_enable', True),
-            phase_approval_threshold_scale=fp.get('phase_approval_threshold_scale', 1.0),
-            phase_approval_threshold_offset=fp.get('phase_approval_threshold_offset', 0.0),
-            phase_cc_modulation_enable=fp.get('phase_cc_modulation_enable', True),
-            material_family=fp.get('material_family', 'neutral_reference'),
-            device=device_str,
-        ) if frag_enabled else None
+        # Fragmentation is now physical-fragment-only (voronoi cell bond
+        # network).  GraphFragmentManager was removed in the 2026-05-10
+        # refactor — its outputs were already unused under
+        # `use_physical_fragment_authority=True` (the only path).
         self.fragmentation_active = False
-        self.fragment_detect_every = max(int(fp.get('fragment_detect_every', 2)), 1)
         phase_defaults = self._default_phase_y_thresholds(self.material_family)
         self.phase_y_coupling_enabled = bool(
             fp.get('phase_y_coupling_enabled', True))
@@ -286,13 +220,11 @@ class ManifoldSimulator(
         self._last_phase_seed_gate: Optional[Tensor] = None
         self._last_phase_advance_gate: Optional[Tensor] = None
         self._last_phase_cut_gate: Optional[Tensor] = None
-        self.fragment_impulse_strength = float(fp.get('fragment_impulse_strength', 2.8))
-        self.fragment_upward_bias = float(fp.get('fragment_upward_bias', 0.45))
+        # Fragment visual render params (kept — consumed by the
+        # render-fragment mixin / gaussian updater).  All graph-based
+        # impulse / boost params were removed with GraphFragmentManager.
         self.fragment_visual_offset_scale = float(fp.get('fragment_visual_offset_scale', 0.012))
         self.fragment_visual_ramp_frames = max(int(fp.get('fragment_visual_ramp_frames', 6)), 1)
-        self.fragment_impulse_boost_frames = max(int(fp.get('fragment_impulse_boost_frames', 5)), 0)
-        self.fragment_impulse_decay = float(fp.get('fragment_impulse_decay', 0.75))
-        self.fragment_event_boost = float(fp.get('fragment_event_boost', 1.0))
         self._fragment_activation_frame = -1
         self.crack_style = str(fp.get('sentence_style', fp.get('crack_style', 'material_default')))
         self.shard_enable = bool(fp.get('shard_enable', False))
@@ -331,7 +263,6 @@ class ManifoldSimulator(
         self._next_physical_fragment_id = 1
         self._spatial_split_prev_labels = None
         self._spatial_split_next_id = 1
-        self._reset_frame_fragment_event_stats()
 
         # Post-impact damage→stress feedback timing.  Original baseline used
         # 8-frame delay + 6-frame ramp = 14 decoupled frames, leaving
@@ -627,12 +558,10 @@ class ManifoldSimulator(
         self._phase_tick_budget_ticks: int = 1
         self._phase_tick_seen: int = 0
         self._phase_tick_done: int = 0
-        # Pipeline rewrite Step 2 prep: per-fragment birth-time registries.
-        # Populated when manifold.use_physical_fragment_authority is True
-        # (also requires _physical_fragment_labels to be the active
-        # source of truth).  Step 4b consumes birth_physics_step for
-        # substep-counted handoff smoothing; Step 1b consumes birth_time
-        # for time-based c_mech anneal.
+        # Per-fragment birth-time registries (physical voronoi labels).
+        # Step 4b consumes birth_physics_step for substep-counted
+        # handoff smoothing; Step 1b consumes birth_time for time-based
+        # c_mech anneal.
         self._physical_fragment_birth_time: Dict[int, float] = {}
         self._physical_fragment_birth_physics_step: Dict[int, int] = {}
         self._last_surface_volume_damage_proxy_max = 0.0
@@ -680,25 +609,11 @@ class ManifoldSimulator(
             f"  Shards: {'ON' if self.shard_enable else 'OFF'} "
             f"(count_scale={self.shard_count_scale:.2f}, motion={self.debris_motion_gain:.2f})"
         )
-        print(f"  Fragmentation: {'ON' if frag_enabled else 'OFF'}")
-        if frag_enabled:
-            print(
-                f"  Fragment detach: detect_every={self.fragment_detect_every}, "
-                f"impulse={self.fragment_impulse_strength:.2f}, "
-                f"visual_offset={self.fragment_visual_offset_scale:.4f}, "
-                f"memory={fp.get('fragment_edge_memory_decay', 0.97):.2f}, "
-                f"hysteresis={fp.get('fragment_component_hysteresis', 0.35):.2f}"
-            )
-            if fp.get('cut_surface_enable', False):
-                print(
-                    f"  Cut-surface: vote={fp.get('cut_vote_strength', 0.0):.2f}, "
-                    f"tau_cross={fp.get('tau_cross', 0.60):.2f}, "
-                    f"tau_tangent={fp.get('tau_tangent', 0.45):.2f}, "
-                    f"diffusion={fp.get('fragment_cut_diffusion_alpha', 0.0):.2f}x"
-                    f"{int(fp.get('fragment_cut_diffusion_iters', 0))}, "
-                    f"primary={fp.get('fragment_primary_cut_ratio', 0.75):.2f}, "
-                    f"event_boost={self.fragment_event_boost:.2f}"
-                )
+        print(f"  Fragmentation: physical (voronoi cell bond network)")
+        print(
+            f"  Fragment visual: offset={self.fragment_visual_offset_scale:.4f}, "
+            f"ramp_frames={self.fragment_visual_ramp_frames}"
+        )
         if self.seismic_enabled:
             print(f"  Seismic: amp={self.seismic.get('amplitude')}, "
                   f"freq={self.seismic.get('frequency')}Hz")
@@ -787,12 +702,9 @@ class ManifoldSimulator(
         # Reset birth registry (Step 2 prep).
         self._physical_fragment_birth_time = {}
         self._physical_fragment_birth_physics_step = {}
-        self._reset_frame_fragment_event_stats()
         self._last_rigid_angular_speed_max = 0.0
         self._last_rigid_angular_speed_mean = 0.0
         self._impact_release_gain = float(self.fracture_cfg.get('impact_release_gain', 1.0))
-        if self.fragment_manager is not None:
-            self.fragment_manager.impact_release_gain = self._impact_release_gain
         self._surface_indices = torch.where(self.surface_mask)[0]
         self._interior_indices = torch.where(~self.surface_mask)[0]
         self._build_rest_surface_binding()
@@ -830,8 +742,7 @@ class ManifoldSimulator(
             c_mech = c_visual.clone() if isinstance(c_visual, torch.Tensor) else c_visual
 
         # Step 1b — fragment-internal damage anneal.
-        if (bool(self.fracture_cfg.get('use_physical_fragment_authority', True))
-                and bool(self.fracture_cfg.get('c_mech_anneal_after_break', False))
+        if (bool(self.fracture_cfg.get('c_mech_anneal_after_break', False))
                 and self._physical_fragment_labels is not None
                 and isinstance(c_mech, torch.Tensor)
                 and self._physical_fragment_labels.shape[0] == c_mech.shape[0]
@@ -860,41 +771,25 @@ class ManifoldSimulator(
         return c_mech
 
     def _has_physical_fragments(self) -> bool:
-        """Return True iff the voronoi-driven label tensor has any fragment.
-
-        Source of truth for fragment existence once
-        ``manifold.use_physical_fragment_authority`` is enabled.  Until
-        then this is a passive helper that may be called for
-        diagnostics; the legacy gate ``fragment_manager.n_fragments > 1``
-        is still authoritative.
-        """
+        """Return True iff the voronoi-driven label tensor has any fragment."""
         labels = self._physical_fragment_labels
         return labels is not None and bool((labels > 0).any())
 
     def _fragmented_physics_gate(self) -> bool:
         """Decide whether to take the fragmented MPM path.
 
-        When ``manifold.use_physical_fragment_authority`` is enabled,
-        defer to ``_has_physical_fragments()`` (voronoi-driven).
-        Otherwise fall back to the legacy graph-fragment counter on
-        ``fragment_manager``.  Both paths still require
-        ``self.fragmentation_active`` to be True so the upstream
-        impact-detection gating is respected.
+        Requires ``self.fragmentation_active`` (the impact-detection gate)
+        and at least one detached physical fragment.
         """
         if not self.fragmentation_active:
             return False
-        if bool(self.fracture_cfg.get('use_physical_fragment_authority', True)):
-            return self._has_physical_fragments()
-        return (self.fragment_manager is not None
-                and self.fragment_manager.n_fragments > 1)
+        return self._has_physical_fragments()
 
     def _update_physical_fragment_birth_registry(self) -> None:
         """Record (mpm.time, _physics_step) for any new physical fragment label.
 
-        Called from a fracture-tick path once
-        ``manifold.use_physical_fragment_authority`` is enabled.  Labels
-        are insert-only here; eviction (if any) happens elsewhere when a
-        fragment is fully merged or removed.
+        Labels are insert-only here; eviction (if any) happens elsewhere
+        when a fragment is fully merged or removed.
 
         The registry also seeds ``_physical_fragment_states`` for the
         label.  Fragment mechanics and diagnostics read ``birth_com`` /
@@ -1026,11 +921,8 @@ class ManifoldSimulator(
     @torch.no_grad()
     def step_rendering(self) -> bool:
         """Full frame: physics → fracture → rendering."""
-        self._reset_frame_fragment_event_stats()
         phase_per_tick = bool(self.fracture_cfg.get(
             'phase_field_evolve_per_fracture_tick', False))
-        use_physical_authority = bool(self.fracture_cfg.get(
-            'use_physical_fragment_authority', True))
         if bool(self.fracture_cfg.get('voronoi_eval_per_fracture_tick', False)):
             self._last_voronoi_components_state = None
         if phase_per_tick:
@@ -1061,22 +953,13 @@ class ManifoldSimulator(
 
         torch.cuda.empty_cache()
 
-        fragment_detected_in_burst = False
         if not phase_per_tick:
             # --- Fracture update on Gaussian manifold ---
             burst_iters = self._fracture_iterations_this_frame()
             self._fracture_burst_active = burst_iters > 1
             try:
-                for burst_idx in range(burst_iters):
+                for _ in range(burst_iters):
                     self._step_fracture()
-                    if (
-                        burst_iters > 1
-                        and burst_idx >= 1
-                        and self.fragment_manager is not None
-                        and self._gravity_drop_contacted
-                    ):
-                        self._detect_fragments()
-                        fragment_detected_in_burst = True
             finally:
                 self._fracture_burst_active = False
 
@@ -1097,13 +980,11 @@ class ManifoldSimulator(
                     self._voronoi_spatial_split_and_refine(state)
             else:
                 self._step_voronoi_fracture()
-        # --- Fragment detection ---
-        if (((not fragment_detected_in_burst) or use_physical_authority)
-                and self.fragment_manager is not None
-                and self._gravity_drop_contacted
+        # --- Physical fragment activation (voronoi-driven) ---
+        if (self._gravity_drop_contacted
                 and self.frame_count > 0
-                and self.frame_count % self.fragment_detect_every == 0):
-            self._detect_fragments()
+                and self._physical_fragment_labels is not None):
+            self._sync_physical_fragment_field()
 
         # --- Update Gaussians for rendering ---
         self._update_gaussians()
@@ -1224,10 +1105,8 @@ class ManifoldSimulator(
         self._last_stress = stress.detach()
 
         # MPM P2G2P.  Gate selects between the global p2g2p and the
-        # fragmented variant.  Pipeline rewrite Step 2: when
-        # manifold.use_physical_fragment_authority is enabled, the
-        # source of truth is _physical_fragment_labels (voronoi-driven).
-        # Otherwise the legacy graph-fragment counter is consulted.
+        # fragmented variant; source of truth is _physical_fragment_labels
+        # (voronoi-driven).
         if self._fragmented_physics_gate():
             self._step_fragmented_physics(stress, dt)
         else:
@@ -1610,92 +1489,41 @@ class ManifoldSimulator(
                 ),
             )
 
-        # Promote structural crack corridors into a volumetric stiffness loss.
-        if self.fragment_manager is not None:
+        # Promote post-graduation physical-fragment corridors into a
+        # volumetric stiffness loss.  Pre-graduation graph-mask
+        # contributions (authoritative_cut / cut_core / support_lost /
+        # closure_candidate) were removed with GraphFragmentManager —
+        # ``c_vol`` is now phase-field + physical-fragment only.
+        if (self._physical_fragment_labels is not None
+                and self._surface_indices is not None
+                and self._physical_fragment_labels.shape[0] == self.x_mpm.shape[0]):
             structural_floor = torch.zeros_like(c_surf[:n_assign])
-            structural_mask = torch.zeros_like(c_surf[:n_assign], dtype=torch.bool)
-            use_physical_authority = bool(self.fracture_cfg.get(
-                'use_physical_fragment_authority', True))
-
-            if not use_physical_authority:
-                auth_mask = getattr(self.fragment_manager, "last_authoritative_cut_mask", None)
-                if auth_mask is not None:
-                    auth_mask = auth_mask[:n_assign]
-                    structural_mask |= auth_mask
-                    structural_floor = torch.maximum(
-                        structural_floor,
-                        auth_mask.float() * self.volumetric_auth_damage_floor,
-                    )
-
-                cut_core_mask = getattr(self.fragment_manager, "last_cut_core_mask", None)
-                if cut_core_mask is not None:
-                    cut_core_mask = cut_core_mask[:n_assign]
-                    structural_mask |= cut_core_mask
-                    structural_floor = torch.maximum(
-                        structural_floor,
-                        cut_core_mask.float() * (0.78 * self.volumetric_auth_damage_floor),
-                    )
-
-                support_mask = getattr(self.fragment_manager, "last_support_lost_mask", None)
-                if support_mask is not None:
-                    support_mask = support_mask[:n_assign]
-                    structural_mask |= support_mask
-                    structural_floor = torch.maximum(
-                        structural_floor,
-                        support_mask.float() * self.volumetric_detached_damage_floor,
-                    )
-
-                closure_mask = getattr(self.fragment_manager, "last_closure_candidate_mask", None)
-                if closure_mask is not None:
-                    closure_mask = closure_mask[:n_assign]
-                    structural_mask |= closure_mask
-                    structural_floor = torch.maximum(
-                        structural_floor,
-                        closure_mask.float() * (0.86 * self.volumetric_detached_damage_floor),
-                    )
-
-            if use_physical_authority:
-                if (
-                    self._physical_fragment_labels is not None
-                    and self._surface_indices is not None
-                    and self._physical_fragment_labels.shape[0] == self.x_mpm.shape[0]
-                ):
-                    phys_frag_ids = self._physical_fragment_labels[
-                        self._surface_indices[:n_assign]]
-                    detached_mask = phys_frag_ids > 0
-                    structural_mask |= detached_mask
-                    structural_floor = torch.maximum(
-                        structural_floor,
-                        detached_mask.float() * (0.65 * self.volumetric_detached_damage_floor),
-                    )
-            else:
-                frag_ids = getattr(self.fragment_manager, "fragment_ids", None)
-                if frag_ids is not None:
-                    detached_mask = frag_ids[:n_assign] > 0
-                    structural_mask |= detached_mask
-                    structural_floor = torch.maximum(
-                        structural_floor,
-                        detached_mask.float() * (0.65 * self.volumetric_detached_damage_floor),
-                    )
-
-            if self.fracture_field.a is not None and bool(structural_mask.any()):
-                opening = self.fracture_field.a[:n_assign].clamp(min=0.0)
-                opening_scale = torch.quantile(opening.detach(), 0.85).clamp(min=1e-6)
-                opening_norm = (opening / opening_scale).clamp(0.0, 1.0)
+            phys_frag_ids = self._physical_fragment_labels[
+                self._surface_indices[:n_assign]]
+            detached_mask = phys_frag_ids > 0
+            if bool(detached_mask.any()):
                 structural_floor = torch.maximum(
                     structural_floor,
-                    structural_mask.float() * opening_norm * self.volumetric_cut_damage_scale,
+                    detached_mask.float() * (0.65 * self.volumetric_detached_damage_floor),
                 )
+                if self.fracture_field.a is not None:
+                    opening = self.fracture_field.a[:n_assign].clamp(min=0.0)
+                    opening_scale = torch.quantile(opening.detach(), 0.85).clamp(min=1e-6)
+                    opening_norm = (opening / opening_scale).clamp(0.0, 1.0)
+                    structural_floor = torch.maximum(
+                        structural_floor,
+                        detached_mask.float() * opening_norm * self.volumetric_cut_damage_scale,
+                    )
 
-            if bool(structural_floor.max() > 0.0):
-                structural_feedback_scale = max(feedback_scale, immediate_feedback)
-                c_vol = torch.maximum(
-                    c_vol,
-                    self._project_surface_scalar_to_particles(
-                        structural_floor * structural_feedback_scale,
-                        interior_scale=1.0,
-                    ),
-                )
+                if bool(structural_floor.max() > 0.0):
+                    structural_feedback_scale = max(feedback_scale, immediate_feedback)
+                    c_vol = torch.maximum(
+                        c_vol,
+                        self._project_surface_scalar_to_particles(
+                            structural_floor * structural_feedback_scale,
+                            interior_scale=1.0,
+                        ),
+                    )
 
         return c_vol
 
@@ -1747,16 +1575,9 @@ class ManifoldSimulator(
                     ).clamp(0.0, 1.0),
                 )
 
-        if self.fragment_manager is not None:
-            for attr, scale in (
-                ("last_authoritative_cut_mask", self.volumetric_auth_damage_floor),
-                ("last_cut_core_mask", 0.78 * self.volumetric_auth_damage_floor),
-                ("last_closure_candidate_mask", 0.86 * self.volumetric_detached_damage_floor),
-            ):
-                mask = getattr(self.fragment_manager, attr, None)
-                if mask is not None and mask.shape[0] >= n:
-                    proxy = torch.maximum(proxy, mask[:n].float() * float(scale))
-
+        # Pre-graduation graph-mask augmentations (authoritative_cut /
+        # cut_core / closure_candidate) removed with GraphFragmentManager;
+        # proxy is now phase-field + crack-front + opening only.
         proxy = proxy.clamp(0.0, 1.0)
         self._last_surface_volume_damage_proxy_max = float(proxy.max().item()) if proxy.numel() else 0.0
         self._last_surface_volume_damage_proxy_mean = float(proxy.mean().item()) if proxy.numel() else 0.0
@@ -1879,8 +1700,7 @@ class ManifoldSimulator(
         # spreads thinner), so 0.999 would be too strict; 0.40 covers
         # the plateau range observed across 2K-150K runs.
         c_max_threshold = 0.40
-        if (bool(self.fracture_cfg.get('use_physical_fragment_authority', True))
-                and self.fracture_field.c is not None
+        if (self.fracture_field.c is not None
                 and c_max_now >= c_max_threshold
                 and self._physical_fragment_labels is not None
                 and bool((self._physical_fragment_labels > 0).any())):
@@ -1937,204 +1757,51 @@ class ManifoldSimulator(
     # ================================================================
 
     @torch.no_grad()
-    def _detect_fragments(self):
-        """Detect fragments using graph connectivity."""
-        if self.fragment_manager is None:
-            return
+    def _sync_physical_fragment_field(self):
+        """Propagate ``_physical_fragment_labels`` to ``fracture_field.f``.
+
+        Replaces the old ``_detect_fragments`` (graph-CC + impulse path)
+        with a thin write-through.  Voronoi pipeline is the sole owner
+        of fragment lifecycle now; this method just keeps the render
+        pipeline in sync and activates ``fragmentation_active`` on first
+        detached label.
+        """
         if self.fracture_field.c is None:
             return
-        use_physical_authority = bool(self.fracture_cfg.get(
-            'use_physical_fragment_authority', True))
-        if getattr(self.fragment_manager, 'material_family', '') == 'diffuse_damage':
-            N = self.fracture_field.c.shape[0]
-            self.fragment_manager.n_fragments = 1
-            self.fragment_manager.fragment_ids = torch.zeros(
-                N, dtype=torch.long, device=self.fracture_field.c.device
-            )
-            self.fragment_manager.fragment_sizes = [N]
-            self.fragment_manager.fragment_indices = [
-                torch.arange(N, device=self.fracture_field.c.device)
-            ]
-            if use_physical_authority:
-                self.fracture_field.f = torch.zeros(
-                    N, dtype=torch.long, device=self.fracture_field.c.device
+        physical_surface_labels = None
+        has_physical_surface_fragment = False
+        if (self._physical_fragment_labels is not None
+                and self._surface_indices is not None):
+            physical_surface_labels = self._physical_fragment_labels[
+                self._surface_indices]
+            n_field = int(self.fracture_field.c.shape[0])
+            if physical_surface_labels.shape[0] != n_field:
+                f_phys = torch.zeros(
+                    n_field,
+                    dtype=torch.long,
+                    device=self.fracture_field.c.device,
                 )
-            return
-        opening_max = (
-            float(self.fracture_field.a.max().item())
-            if self.fracture_field.a is not None else 0.0
-        )
-        if self.fracture_field.c.max() < 0.3 and opening_max < 1e-4:
-            return
-
-        crack_front = getattr(self.fracture_field, "crack_front", None)
-        self.fragment_manager.impact_release_gain = float(getattr(self, '_impact_release_gain', 1.0))
-        tip_mask = crack_front.tip_mask if crack_front is not None else None
-        recent_front_mask = None
-        family = getattr(self.fragment_manager, 'material_family', 'neutral_reference')
-        crack_tangent = crack_front.growth_dir if crack_front is not None else None
-        if crack_front is not None and crack_front.visited_mask is not None:
-            recent_threshold = 0.22
-            if family == 'sharp_brittle':
-                recent_threshold = 0.08
-            elif family == 'brittle_moderate':
-                recent_threshold = 0.18
-            recent_front_mask = crack_front.visited_mask & (self.fracture_field.c > recent_threshold)
-            if family == 'sharp_brittle' and tip_mask is not None:
-                recent_front_mask = recent_front_mask | tip_mask
-        opening = self.fracture_field.a if self.fracture_field.a is not None else None
-        crack_normal = self.fracture_field.n if self.fracture_field.n is not None else None
-        x_surf_world = self.mapper.mpm_to_world(self.x_mpm[self.surface_mask])
-        N_surf = min(self.fracture_field.c.shape[0], x_surf_world.shape[0])
-        phase_cut_gate = (
-            self._last_phase_cut_gate[:N_surf]
-            if self._last_phase_cut_gate is not None
-            else None
-        )
-        surface_volume_damage = self._get_surface_volume_damage_proxy(N_surf)
-        frames_since_impact = int(getattr(self, "_impact_frame_count", 10**6))
-        default_target = 0.64 if self.crack_style == "radial_shatter" else 0.50
-        configured_target = float(
-            getattr(self.fragment_manager, "configured_impact_closure_target_ratio", -1.0)
-        )
-        target = configured_target if configured_target >= 0.0 else default_target
-        target = min(
-            max(target, 0.0),
-            float(self.fragment_manager._strict_closure_release_cap()),
-        )
-        configured_active_frames = int(
-            getattr(self.fragment_manager, "configured_impact_closure_active_frames", 2)
-        )
-        active_window = configured_active_frames
-        released_ratio = (
-            float(getattr(self.fragment_manager, "last_hard_detached_nodes", 0))
-            / max(float(N_surf), 1.0)
-        )
-        completion_ratio = float(
-            getattr(self.fragment_manager, "impact_closure_completion_ratio", 0.92)
-        )
-        if released_ratio < completion_ratio * max(target, 0.0):
-            active_window += int(
-                getattr(self.fragment_manager, "impact_closure_adaptive_extra_frames", 0)
-            )
-        impact_closure_active = bool(
-            self.crack_connected_release_only
-            and self.material_family == "sharp_brittle"
-            and self.crack_style in {
-                "radial_shatter",
-                "spiderweb",
-                "spiderweb_branching",
-            }
-            and self._gravity_drop_contacted
-            and frames_since_impact <= active_window
-        )
-        self.fragment_manager.impact_closure_active = impact_closure_active
-        if impact_closure_active:
-            default_max_patches = 96 if self.crack_style == "radial_shatter" else 56
-            configured_max_patches = int(
-                getattr(self.fragment_manager, "configured_impact_closure_max_patches", -1)
-            )
-            self.fragment_manager.impact_closure_target_ratio = target
-            self.fragment_manager.impact_closure_max_patches = (
-                configured_max_patches
-                if configured_max_patches >= 0
-                else default_max_patches
-            )
-        else:
-            self.fragment_manager.impact_closure_target_ratio = 0.0
-            self.fragment_manager.impact_closure_max_patches = 0
-        n_frags = self.fragment_manager.detect_fragments(
-            self.graph,
-            self.fracture_field.c,
-            positions=x_surf_world[:N_surf],
-            opening=opening,
-            active_tip_mask=tip_mask,
-            recent_front_mask=recent_front_mask,
-            crack_normal=crack_normal,
-            crack_tangent=crack_tangent,
-            phase_gate=phase_cut_gate,
-            volume_damage=surface_volume_damage,
-        )
-        self._accumulate_frame_fragment_event_stats()
-
-        if use_physical_authority:
-            physical_surface_labels = None
-            has_physical_surface_fragment = False
-            if (self._physical_fragment_labels is not None
-                    and self._surface_indices is not None
-                    and self.fracture_field.c is not None):
-                physical_surface_labels = self._physical_fragment_labels[
-                    self._surface_indices]
-                n_field = int(self.fracture_field.c.shape[0])
-                if physical_surface_labels.shape[0] != n_field:
-                    f_phys = torch.zeros(
-                        n_field,
-                        dtype=torch.long,
-                        device=self.fracture_field.c.device,
-                    )
-                    n_assign = min(n_field, int(physical_surface_labels.shape[0]))
-                    if n_assign > 0:
-                        f_phys[:n_assign] = physical_surface_labels[:n_assign]
-                    physical_surface_labels = f_phys
-                else:
-                    physical_surface_labels = physical_surface_labels.to(
-                        device=self.fracture_field.c.device,
-                        dtype=torch.long,
-                    )
-                has_physical_surface_fragment = bool(
-                    (physical_surface_labels > 0).any())
-
-            if physical_surface_labels is not None:
-                self.fracture_field.f = physical_surface_labels.clone()
+                n_assign = min(n_field, int(physical_surface_labels.shape[0]))
+                if n_assign > 0:
+                    f_phys[:n_assign] = physical_surface_labels[:n_assign]
+                physical_surface_labels = f_phys
             else:
-                self.fracture_field.f = torch.zeros_like(
-                    self.fracture_field.c, dtype=torch.long)
-
-            if has_physical_surface_fragment and not self.fragmentation_active:
-                self.fragmentation_active = True
-                self._fragment_activation_frame = self.frame_count
-            return
-
-        if n_frags > 1:
-            self.fracture_field.f = self.fragment_manager.fragment_ids.clone()
-            apply_impulse = False
-            if not self.fragmentation_active:
-                self.fragmentation_active = True
-                self._fragment_activation_frame = self.frame_count
-                apply_impulse = not self.crack_connected_release_only
-            elif (
-                self._fragment_activation_frame >= 0
-                and (self.frame_count - self._fragment_activation_frame) < self.fragment_impulse_boost_frames
-            ):
-                apply_impulse = not self.crack_connected_release_only
-
-            # Apply separation impulse
-            if apply_impulse and hasattr(self, '_impact_center'):
-                x_surf_mpm = self.x_mpm[self.surface_mask]
-                x_surf_world = self.mapper.mpm_to_world(x_surf_mpm)
-                ic_world = self.mapper.mpm_to_world(
-                    self._impact_center.unsqueeze(0)).squeeze(0)
-
-                # Map fragment impulse back to MPM velocities
-                N_surf = min(self.fracture_field.c.shape[0],
-                             self.surface_mask.sum().item())
-                v_surf = torch.zeros(N_surf, 3, device=x_surf_world.device)
-                v_surf = self.fragment_manager.apply_fragment_impulse(
-                    x_surf_world[:N_surf],
-                    v_surf,
-                    ic_world,
-                    impulse_strength=self._current_fragment_impulse_strength(),
-                    upward_bias=self.fragment_upward_bias,
+                physical_surface_labels = physical_surface_labels.to(
+                    device=self.fracture_field.c.device,
+                    dtype=torch.long,
                 )
+            has_physical_surface_fragment = bool(
+                (physical_surface_labels > 0).any())
 
-                surf_indices = torch.where(self.surface_mask)[0]
-                n_assign = min(N_surf, surf_indices.shape[0])
-                self.v_mpm[surf_indices[:n_assign]] += v_surf[:n_assign]
+        if physical_surface_labels is not None:
+            self.fracture_field.f = physical_surface_labels.clone()
+        else:
+            self.fracture_field.f = torch.zeros_like(
+                self.fracture_field.c, dtype=torch.long)
 
-                print(
-                    f"[ManifoldSim] Fragment separation impulse applied "
-                    f"(n_frags={n_frags}, broken_edges={self.fragment_manager.last_broken_edges})"
-                )
+        if has_physical_surface_fragment and not self.fragmentation_active:
+            self.fragmentation_active = True
+            self._fragment_activation_frame = self.frame_count
 
     # ================================================================
     # Gaussian update for rendering
@@ -2175,23 +1842,16 @@ class ManifoldSimulator(
         # Build persistent fragment render state.
         debris_mask = None
         surf_frag = None
-        if self.fragmentation_active and self.fragment_manager is not None:
-            frag_ids = None
-            use_physical = bool(self.fracture_cfg.get(
-                'use_physical_fragment_authority', True))
-            if (use_physical
-                    and self._physical_fragment_labels is not None
-                    and self._surface_indices is not None
-                    and bool((self._physical_fragment_labels > 0).any())):
-                frag_ids = self._physical_fragment_labels[self._surface_indices]
-            elif (not use_physical) and self.fragment_manager.n_fragments > 1:
-                frag_ids = self.fragment_manager.fragment_ids
-            if frag_ids is not None:
-                if self._ply_direct:
-                    surf_frag = frag_ids[self._ply_to_surface]
-                else:
-                    N_gauss = x_final.shape[0]
-                    surf_frag = frag_ids[:N_gauss]
+        if (self.fragmentation_active
+                and self._physical_fragment_labels is not None
+                and self._surface_indices is not None
+                and bool((self._physical_fragment_labels > 0).any())):
+            frag_ids = self._physical_fragment_labels[self._surface_indices]
+            if self._ply_direct:
+                surf_frag = frag_ids[self._ply_to_surface]
+            else:
+                N_gauss = x_final.shape[0]
+                surf_frag = frag_ids[:N_gauss]
 
         if self.fragmentation_active:
             opening_vis = (
@@ -2235,11 +1895,11 @@ class ManifoldSimulator(
             )
         )
 
-        use_physical_render = bool(self.fracture_cfg.get(
-            'use_physical_fragment_authority', True))
+        # Physical-fragment authority always active: skip interior-face
+        # backfill once any fragment has graduated (otherwise the shell
+        # double-paints the crack gap).
         append_interior_faces = not (
-            use_physical_render
-            and surf_frag is not None
+            surf_frag is not None
             and bool((surf_frag > 0).any())
         )
         apply_crack_opening_offsets = append_interior_faces
@@ -2361,8 +2021,6 @@ class ManifoldSimulator(
             0.75,
             min(2.65, float(self.fracture_cfg.get('impact_release_gain', 1.0)) * (1.0 + 0.18 * impact_speed)),
         )
-        if self.fragment_manager is not None:
-            self.fragment_manager.impact_release_gain = self._impact_release_gain
         print(f"  [IMPACT] Ground contact! v_impact={v_impact:.3f}")
 
         # Unified impact impulse (rigid-body form): convert part of the
@@ -2624,8 +2282,6 @@ class ManifoldSimulator(
             0.75,
             min(2.65, float(self.fracture_cfg.get('impact_release_gain', 1.0)) * (0.85 + 0.18 * abs(float(impact_energy)))),
         )
-        if self.fragment_manager is not None:
-            self.fragment_manager.impact_release_gain = self._impact_release_gain
         dists = (self.x_mpm - impact_center_mpm.unsqueeze(0)).norm(dim=1)
         influence = torch.exp(-dists ** 2 / (2 * impact_radius ** 2))
 
@@ -2710,10 +2366,6 @@ class ManifoldSimulator(
         render_positions = render_state.get("positions", None)
         render_fragment_ids = render_state.get("fragment_ids", None)
         render_n_frags = 0
-        graph_n_frags = (
-            int(self.fragment_manager.n_fragments)
-            if self.fragment_manager is not None else 0
-        )
         if render_fragment_ids is not None and render_fragment_ids.numel() > 0:
             if bool((render_fragment_ids > 0).any()):
                 render_n_frags = int(render_fragment_ids.unique().numel())
@@ -2734,23 +2386,15 @@ class ManifoldSimulator(
                     mean_detached_distance = sum(distances) / max(len(distances), 1)
         # Render offset metrics removed: render position equals MPM
         # position so per-fragment offset distance is always 0.
-        physical_n_frags = 0
+        n_frags = 0
         frag_ids_phys = None
-        use_physical = bool(self.fracture_cfg.get(
-            'use_physical_fragment_authority', True))
-        if (use_physical
-                and self._physical_fragment_labels is not None
+        if (self._physical_fragment_labels is not None
                 and self._surface_indices is not None
                 and bool((self._physical_fragment_labels > 0).any())):
             frag_ids_phys = self._physical_fragment_labels[self._surface_indices]
-            physical_n_frags = int(frag_ids_phys.unique().numel())
-        elif ((not use_physical)
-              and self.fragment_manager is not None
-              and self.fragment_manager.fragment_ids is not None):
-            frag_ids_phys = self.fragment_manager.fragment_ids
-            physical_n_frags = int(frag_ids_phys.unique().numel()) if bool((frag_ids_phys > 0).any()) else 1
+            n_frags = int(frag_ids_phys.unique().numel())
 
-        if frag_ids_phys is not None and physical_n_frags > 1:
+        if frag_ids_phys is not None and n_frags > 1:
             x_surf_world = self.mapper.mpm_to_world(self.x_mpm[self.surface_mask])
             n_assign = min(x_surf_world.shape[0], frag_ids_phys.shape[0])
             if n_assign > 0:
@@ -2809,11 +2453,6 @@ class ManifoldSimulator(
                             sum(lateral_release_distances)
                             / max(len(lateral_release_distances), 1)
                         )
-        if use_physical:
-            n_frags_out = physical_n_frags
-        else:
-            n_frags_out = max(physical_n_frags, render_n_frags)
-
         return {
             "frame": self.frame_count,
             "time": self.mpm.time,
@@ -2844,97 +2483,11 @@ class ManifoldSimulator(
             "surface_volume_damage_proxy_mean": float(self._last_surface_volume_damage_proxy_mean),
             "rigid_angular_speed_max": float(self._last_rigid_angular_speed_max),
             "rigid_angular_speed_mean": float(self._last_rigid_angular_speed_mean),
-            "n_fragments": n_frags_out,
-            "physical_n_fragments": physical_n_frags,
-            "graph_n_fragments": graph_n_frags,
-            "render_n_fragments": render_n_frags,
-            "broken_edges": (self.fragment_manager.last_broken_edges
-                              if self.fragment_manager else 0),
-            "raw_components": (self.fragment_manager.last_raw_components
-                                if self.fragment_manager else 1),
-            "hard_detached_nodes": (self.fragment_manager.last_hard_detached_nodes
-                                     if self.fragment_manager else 0),
-            "new_detached_nodes": int(self._frame_fragment_stat("new_detached_nodes", 0)),
-            "detached_boundary_edges": (self.fragment_manager.last_detached_boundary_edges
-                                        if self.fragment_manager else 0),
-            "promoted_components": (self.fragment_manager.last_promoted_components
-                                     if self.fragment_manager else 0),
-            "primary_promoted_components": (self.fragment_manager.last_primary_promoted_components
-                                             if self.fragment_manager else 0),
-            "fallback_promoted_components": (self.fragment_manager.last_fallback_promoted_components
-                                              if self.fragment_manager else 0),
-            "cut_core_nodes": (self.fragment_manager.last_cut_core_nodes
-                                 if self.fragment_manager else 0),
-            "cut_edges": (self.fragment_manager.last_cut_edges
-                            if self.fragment_manager else 0),
-            "phase_cut_edges": (self.fragment_manager.last_phase_cut_edges
-                                  if self.fragment_manager else 0),
-            "phase_fragment_gate_max": (self.fragment_manager.last_phase_gate_max
-                                         if self.fragment_manager else 0.0),
-            "phase_fragment_gate_mean": (self.fragment_manager.last_phase_gate_mean
-                                          if self.fragment_manager else 0.0),
-            "phase_candidate_patches": int(self._frame_fragment_stat("phase_candidate_patches", 0)),
-            "phase_approved_patches": int(self._frame_fragment_stat("phase_approved_patches", 0)),
-            "phase_rejected_patches": int(self._frame_fragment_stat("phase_rejected_patches", 0)),
-            "phase_approved_nodes": int(self._frame_fragment_stat("phase_approved_nodes", 0)),
-            "phase_approval_score_max": float(self._frame_fragment_stat("phase_approval_score_max", 0.0)),
-            "phase_approval_score_mean": float(
-                self._frame_fragment_stat("phase_approval_score_weighted_sum", 0.0)
-                / max(float(self._frame_fragment_stat("phase_approved_patches", 0)), 1.0)
-            ),
-            "phase_approval_cvol_max": float(self._frame_fragment_stat("phase_approval_cvol_max", 0.0)),
-            "phase_approval_gate_max": float(self._frame_fragment_stat("phase_approval_gate_max", 0.0)),
-            "pseudo_thickness_mass": float(self._frame_fragment_stat("pseudo_thickness_mass", 0.0)),
-            "birth_phase_score": float(self._frame_fragment_stat("birth_phase_score", 0.0)),
-            "birth_cvol_max": float(self._frame_fragment_stat("birth_cvol_max", 0.0)),
-            "birth_phase_gate_max": float(self._frame_fragment_stat("birth_phase_gate_max", 0.0)),
-            "birth_phase_approved": bool(self._frame_fragment_stat("birth_phase_approved", False)),
-            "cut_corridor_edges": (self.fragment_manager.last_cut_corridor_edges
-                                    if self.fragment_manager else 0),
-            "cross_edge_breaks": (self.fragment_manager.last_cross_edge_breaks
-                                    if self.fragment_manager else 0),
-            "authoritative_cut_nodes": (self.fragment_manager.last_authoritative_cut_nodes
-                                          if self.fragment_manager else 0),
-            "authoritative_cut_score_max": (self.fragment_manager.last_authoritative_cut_score_max
-                                             if self.fragment_manager else 0.0),
-            "support_lost_components": (self.fragment_manager.last_support_lost_components
-                                         if self.fragment_manager else 0),
-            "support_loss_score_max": (self.fragment_manager.last_support_loss_score_max
-                                        if self.fragment_manager else 0.0),
-            "release_candidate_count": (self.fragment_manager.last_release_candidate_count
-                                         if self.fragment_manager else 0),
-            "support_anchor_nodes": (self.fragment_manager.last_support_anchor_nodes
-                                       if self.fragment_manager else 0),
-            "boundary_cut_ratio_mean": (self.fragment_manager.last_boundary_cut_ratio_mean
-                                         if self.fragment_manager else 0.0),
-            "boundary_cut_ratio_q50": (self.fragment_manager.last_boundary_cut_ratio_q50
-                                        if self.fragment_manager else 0.0),
-            "boundary_cut_ratio_q90": (self.fragment_manager.last_boundary_cut_ratio_q90
-                                        if self.fragment_manager else 0.0),
-            "boundary_cut_ratio_max": (self.fragment_manager.last_boundary_cut_ratio_max
-                                        if self.fragment_manager else 0.0),
-            "components_above_primary": (self.fragment_manager.last_components_above_primary
-                                          if self.fragment_manager else 0),
-            "components_above_fallback": (self.fragment_manager.last_components_above_fallback
-                                           if self.fragment_manager else 0),
-            "absorbed_components": (self.fragment_manager.last_absorbed_components
-                                     if self.fragment_manager else 0),
-            "closure_candidate_count": (self.fragment_manager.last_closure_candidate_count
-                                         if self.fragment_manager else 0),
-            "closure_candidate_nodes": (self.fragment_manager.last_closure_candidate_nodes
-                                         if self.fragment_manager else 0),
-            "closure_score_max": (self.fragment_manager.last_closure_score_max
-                                   if self.fragment_manager else 0.0),
-            "closure_candidate_sizes": (self.fragment_manager.last_closure_candidate_sizes
-                                         if self.fragment_manager else []),
-            "open_release_patches": int(self._frame_fragment_stat("open_release_patches", 0)),
-            "open_release_nodes": int(self._frame_fragment_stat("open_release_nodes", 0)),
-            "open_release_score_max": float(self._frame_fragment_stat("open_release_score_max", 0.0)),
-            "impact_closure_patches": int(self._frame_fragment_stat("impact_closure_patches", 0)),
-            "impact_closure_nodes": int(self._frame_fragment_stat("impact_closure_nodes", 0)),
-            "impact_closure_score_max": float(self._frame_fragment_stat("impact_closure_score_max", 0.0)),
-            "top_component_sizes": (self.fragment_manager.last_top_component_sizes
-                                       if self.fragment_manager else []),
+            # Single source of truth for fragment count: physical (voronoi
+            # cell bond network).  graph_n_fragments / physical_n_fragments /
+            # render_n_fragments redundancy was removed with
+            # GraphFragmentManager in the 2026-05-10 refactor.
+            "n_fragments": n_frags,
             "detached_distance": detached_distance,
             "mean_detached_distance": mean_detached_distance,
             "render_offset_distance": render_offset_distance,

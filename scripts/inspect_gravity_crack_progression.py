@@ -219,23 +219,16 @@ def _surface_state(
 
 
 def _fragment_ids(simulator, n: int) -> torch.Tensor | None:
-    use_physical = bool(getattr(simulator, "fracture_cfg", {}).get(
-        "use_physical_fragment_authority", False))
-    if use_physical:
-        physical_labels = getattr(simulator, "_physical_fragment_labels", None)
-        surface_indices = getattr(simulator, "_surface_indices", None)
-        if physical_labels is None:
-            return None
-        try:
-            if surface_indices is not None:
-                return physical_labels[surface_indices][:n].detach()
-            return physical_labels[:n].detach()
-        except Exception:
-            return None
-    manager = getattr(simulator, "fragment_manager", None)
-    if manager is None or getattr(manager, "fragment_ids", None) is None:
+    physical_labels = getattr(simulator, "_physical_fragment_labels", None)
+    surface_indices = getattr(simulator, "_surface_indices", None)
+    if physical_labels is None:
         return None
-    return manager.fragment_ids[:n].detach()
+    try:
+        if surface_indices is not None:
+            return physical_labels[surface_indices][:n].detach()
+        return physical_labels[:n].detach()
+    except Exception:
+        return None
 
 
 def _edge_boundary_metrics(
@@ -313,27 +306,16 @@ def _snapshot_metrics(
     event_metrics = _tip_event_metrics(events)
     new_event_metrics = _tip_event_metrics(new_events)
     fragment_metrics = _fragment_label_metrics(fragment_ids, int(c.shape[0]))
-    manager = getattr(simulator, "fragment_manager", None)
     graph = getattr(simulator, "graph", None)
     knn_idx = getattr(graph, "knn_idx", None) if graph is not None else None
-    cut_edge_mask = (
-        getattr(manager, "last_cut_edge_mask", None)
-        if manager is not None else None
-    )
-    closure_boundary_mask = (
-        getattr(manager, "last_closure_boundary_mask", None)
-        if manager is not None else None
-    )
-    detached_boundary_mask = (
-        getattr(manager, "detached_boundary_mask", None)
-        if manager is not None else None
-    )
+    # Graph-CC cut / closure / detached-boundary masks removed with
+    # GraphFragmentManager; boundary metrics are now fragment-edge only.
     boundary_metrics = _edge_boundary_metrics(
         fragment_ids=fragment_ids,
         knn_idx=knn_idx,
-        cut_edge_mask=cut_edge_mask,
-        closure_boundary_mask=closure_boundary_mask,
-        detached_boundary_mask=detached_boundary_mask,
+        cut_edge_mask=None,
+        closure_boundary_mask=None,
+        detached_boundary_mask=None,
         n=int(c.shape[0]),
     )
     crack_frame = int(getattr(front, "_advance_step", 0)) if front is not None else 0
@@ -514,11 +496,8 @@ def _snapshot_metrics(
         "physical_fragment_drop": float(stats.get("physical_fragment_drop", 0.0)),
         "top_component_sizes": list(stats.get("top_component_sizes", [])),
     }
-    if manager is not None:
-        row.update({
-            "strict": bool(getattr(manager, "crack_connected_release_only", False)),
-            "open_release_enabled": bool(getattr(manager, "open_crack_release_enable", False)),
-        })
+    if simulator is not None:
+        row["strict"] = bool(getattr(simulator, "crack_connected_release_only", False))
     return row, len(events)
 
 
@@ -836,13 +815,8 @@ def _run_prompt_progression(
     summary_row.update(_runtime_release_row(result["params"]))
     summary_row.update(_summarize_history(history))
     simulator = getattr(pipeline.engine, "last_simulator", None)
-    manager = getattr(simulator, "fragment_manager", None) if simulator is not None else None
-    if manager is not None:
-        summary_row.update({
-            "runtime_crack_connected_release_only": bool(getattr(manager, "crack_connected_release_only", False)),
-            "runtime_phase_approval_enable": bool(getattr(manager, "phase_approval_enable", True)),
-            "runtime_open_crack_release_enable": bool(getattr(manager, "open_crack_release_enable", True)),
-        })
+    if simulator is not None:
+        summary_row["runtime_crack_connected_release_only"] = bool(getattr(simulator, "crack_connected_release_only", False))
     _write_rows(metric_rows, out_dir, stem="progression_metrics")
     if snapshot_rows:
         _annotate_birth_causality(snapshot_rows)

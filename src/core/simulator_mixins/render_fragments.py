@@ -15,24 +15,6 @@ from torch import Tensor
 
 
 class RenderFragmentMixin:
-    def _current_fragment_impulse_strength(self) -> float:
-        if not self.fragmentation_active or self._fragment_activation_frame < 0:
-            return self.fragment_impulse_strength
-        frames_since = max(self.frame_count - self._fragment_activation_frame, 0)
-        if frames_since >= self.fragment_impulse_boost_frames:
-            return self.fragment_impulse_strength
-        decay = self.fragment_impulse_decay ** frames_since
-        return self.fragment_impulse_strength * self.fragment_event_boost * max(decay, 0.45)
-
-    def _current_fragment_visual_boost(self) -> float:
-        if not self.fragmentation_active or self._fragment_activation_frame < 0:
-            return 1.0
-        frames_since = max(self.frame_count - self._fragment_activation_frame, 0)
-        if frames_since >= self.fragment_impulse_boost_frames:
-            return 1.0
-        decay = self.fragment_impulse_decay ** frames_since
-        return 1.0 + (self.fragment_event_boost - 1.0) * max(decay, 0.50)
-
     def _ensure_render_fragment_registry(self, count: int, device) -> None:
         if (self._render_fragment_labels is not None
                 and self._render_fragment_labels.shape[0] == count

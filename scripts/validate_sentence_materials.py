@@ -34,7 +34,6 @@ from src.ml.material_prior_adapter import MaterialPriorAdapter
 from src.preprocessing.mesh_converter import MeshToPointCloudConverter
 
 from smoke_test import (
-    make_fragment_manager,
     make_surface_fracture_field,
 )
 
@@ -871,11 +870,10 @@ def simulate_prompt_metrics(
         H_multiplier=0.0,
     )
 
-    fragment_manager = make_fragment_manager(fracture_params, device)
-    max_cut_edges = 0
-    max_closure = 0
-    max_open_release_patches = 0
-    max_open_release_nodes = 0
+    # Graph-CC fragment detection removed with GraphFragmentManager.
+    # Surface-only smoke now drives phase-field evolution only;
+    # downstream fragment counts come from voronoi labels via the
+    # full simulator path.
     max_n_frags = 1
 
     for frame in range(int(frames)):
@@ -888,35 +886,6 @@ def simulate_prompt_metrics(
             F_gaussian=None,
             impact_center=drive["impact_center"],
         )
-
-        if fragment_manager is not None and (
-            frame % max(int(fragment_every), 1) == 0 or frame == frames - 1
-        ):
-            crack_front = fracture_field.crack_front
-            recent_front_mask = None
-            if crack_front is not None and crack_front.visited_mask is not None:
-                recent_front_mask = crack_front.visited_mask & (fracture_field.c > 0.12)
-            n_frags = fragment_manager.detect_fragments(
-                graph,
-                fracture_field.c,
-                positions=positions,
-                opening=fracture_field.a,
-                active_tip_mask=crack_front.tip_mask if crack_front is not None else None,
-                recent_front_mask=recent_front_mask,
-                crack_normal=fracture_field.n,
-                crack_tangent=crack_front.growth_dir if crack_front is not None else None,
-            )
-            max_n_frags = max(max_n_frags, int(n_frags))
-            max_cut_edges = max(max_cut_edges, int(fragment_manager.last_cut_edges))
-            max_closure = max(max_closure, int(fragment_manager.last_closure_candidate_count))
-            max_open_release_patches = max(
-                max_open_release_patches,
-                int(getattr(fragment_manager, "last_open_release_patches", 0)),
-            )
-            max_open_release_nodes = max(
-                max_open_release_nodes,
-                int(getattr(fragment_manager, "last_open_release_nodes", 0)),
-            )
 
     c = fracture_field.c
     opening = fracture_field.a if fracture_field.a is not None else torch.zeros_like(c)
@@ -944,10 +913,6 @@ def simulate_prompt_metrics(
         "cracked_count": int(cracked.sum().item()),
         "weak_count": int(weak.sum().item()),
         "max_n_frags": int(max_n_frags),
-        "max_cut_edges": int(max_cut_edges),
-        "max_closure_candidates": int(max_closure),
-        "max_open_release_patches": int(max_open_release_patches),
-        "max_open_release_nodes": int(max_open_release_nodes),
         "branchiness": float(tips.sum().item() / max(int(visited.sum().item()), 1)),
     }
     metrics.update(_front_topology_metrics(crack_front, int(c.shape[0]), positions.device))
@@ -967,12 +932,9 @@ def simulate_prompt_metrics(
     metrics.update(_angular_metrics(positions, cracked, seed_center, "cracked"))
     metrics.update(_angular_metrics(positions, visited, seed_center, "visited"))
 
-    fragment_ids = (
-        fragment_manager.fragment_ids
-        if fragment_manager is not None and fragment_manager.fragment_ids is not None
-        else None
-    )
-    metrics.update(_fragment_label_metrics(fragment_ids, int(c.shape[0])))
+    # Fragment-label metrics now driven by voronoi labels at the
+    # simulator boundary; surface-only smoke leaves them empty.
+    metrics.update(_fragment_label_metrics(None, int(c.shape[0])))
 
     if plot_path is not None:
         _save_final_crack_plot(

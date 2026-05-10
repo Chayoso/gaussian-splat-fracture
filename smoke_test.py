@@ -33,7 +33,6 @@ from src.core.coordinate_mapper import CoordinateMapper
 from src.core.manifold_simulator import ManifoldSimulator
 from src.core.material_presets import resolve_material_preset, validate_l0
 from src.fracture.graph_builder import GaussianGraph
-from src.fracture.graph_fragment_manager import GraphFragmentManager
 from src.fracture.tip_based_fracture_field import GaussianFractureField
 from src.fracture.crack_front import CrackFront
 from src.fracture.surface_crack_driver import SurfaceCrackDriver
@@ -599,68 +598,6 @@ def make_surface_fracture_field(fracture_params, graph, device):
     )
 
 
-def make_fragment_manager(fracture_params, device):
-    if not fracture_params.get('fragmentation_enabled', False):
-        return None
-    return GraphFragmentManager(
-        damage_threshold=fracture_params.get('fragment_damage_threshold', 0.5),
-        min_fragment_size=fracture_params.get('min_fragment_particles', 20),
-        edge_break_rate=fracture_params.get('edge_break_rate', 1.0),
-        opening_weight=fracture_params.get('fragment_opening_weight', 0.35),
-        active_tip_weight=fracture_params.get('fragment_active_tip_weight', 0.18),
-        recent_front_weight=fracture_params.get('fragment_recent_front_weight', 0.12),
-        pair_break_weight=fracture_params.get('fragment_pair_break_weight', 0.10),
-        edge_memory_decay=fracture_params.get('fragment_edge_memory_decay', 0.97),
-        edge_memory_weight=fracture_params.get('fragment_edge_memory_weight', 0.72),
-        cut_diffusion_alpha=fracture_params.get('fragment_cut_diffusion_alpha', 0.0),
-        cut_diffusion_iters=fracture_params.get('fragment_cut_diffusion_iters', 0),
-        cut_cos_gate_tangent=fracture_params.get('fragment_cut_cos_gate_tangent', 0.5),
-        cut_cos_gate_normal=fracture_params.get('fragment_cut_cos_gate_normal', 0.4),
-        primary_cut_ratio=fracture_params.get('fragment_primary_cut_ratio', 0.75),
-        fallback_cut_ratio=fracture_params.get('fragment_fallback_cut_ratio', 0.55),
-        min_boundary_edges=fracture_params.get('fragment_min_boundary_edges', 12),
-        detached_node_decay=fracture_params.get('fragment_detached_node_decay', 0.95),
-        persistent_min_fragment_size=fracture_params.get('fragment_persistent_min_size', 8),
-        persistent_min_fragment_size_ratio=fracture_params.get('fragment_persistent_min_size_ratio', 0.0),
-        component_hysteresis=fracture_params.get('fragment_component_hysteresis', 0.35),
-        post_split_threshold_scale=fracture_params.get('fragment_post_split_threshold_scale', 0.92),
-        cut_surface_enable=fracture_params.get('cut_surface_enable', False),
-        cut_vote_strength=fracture_params.get('cut_vote_strength', 0.0),
-        tau_cross=fracture_params.get('tau_cross', 0.60),
-        tau_tangent=fracture_params.get('tau_tangent', 0.45),
-        cut_core_damage_threshold=fracture_params.get('cut_core_damage_threshold', 0.18),
-        cut_core_opening_threshold=fracture_params.get('cut_core_opening_threshold', 0.16),
-        cut_hard_break_threshold=fracture_params.get('cut_hard_break_threshold', 0.42),
-        authoritative_cut_decay=fracture_params.get('authoritative_cut_decay', 0.96),
-        authoritative_cut_threshold=fracture_params.get('authoritative_cut_threshold', 0.20),
-        support_loss_enable=fracture_params.get('support_loss_enable', True),
-        support_anchor_quantile=fracture_params.get('support_anchor_quantile', 0.10),
-        support_release_threshold=fracture_params.get('support_release_threshold', 0.56),
-        support_promote_min_size=fracture_params.get('support_promote_min_size', 6),
-        support_overlap_threshold=fracture_params.get('support_overlap_threshold', 0.10),
-        open_crack_release_enable=fracture_params.get('open_crack_release_enable', True),
-        open_crack_release_threshold=fracture_params.get('open_crack_release_threshold', 0.0),
-        open_crack_release_max_patches=fracture_params.get('open_crack_release_max_patches', 2),
-        crack_connected_release_only=fracture_params.get('crack_connected_release_only', False),
-        crack_style=fracture_params.get(
-            'sentence_style',
-            fracture_params.get('crack_style', 'material_default'),
-        ),
-        brittle_release_intensity=fracture_params.get('brittle_release_intensity', 1.0),
-        impact_release_gain=fracture_params.get('impact_release_gain', 1.0),
-        impact_closure_target_ratio=fracture_params.get('impact_closure_target_ratio', -1.0),
-        impact_closure_max_patches=fracture_params.get('impact_closure_max_patches', -1),
-        impact_closure_active_frames=fracture_params.get('impact_closure_active_frames', 2),
-        impact_closure_sector_count=fracture_params.get('impact_closure_sector_count', 0),
-        impact_closure_band_count=fracture_params.get('impact_closure_band_count', 0),
-        impact_closure_layer_count=fracture_params.get('impact_closure_layer_count', 0),
-        impact_closure_min_size_ratio=fracture_params.get('impact_closure_min_size_ratio', 0.0),
-        impact_closure_max_size_ratio=fracture_params.get('impact_closure_max_size_ratio', 0.0),
-        material_family=fracture_params.get('material_family', 'neutral_reference'),
-        device=str(device),
-    )
-
-
 def make_fast_collapse_state(num_nodes, device):
     return {
         "labels": torch.zeros(num_nodes, dtype=torch.long, device=device),
@@ -1097,7 +1034,9 @@ def run_surface_only_smoke(
     fracture_field = make_surface_fracture_field(fracture_params, graph, device)
     fracture_field.initialize(positions.shape[0])
     fast_collapse = bool(fracture_params.get('collapse_fast_path', False))
-    fragment_manager = None if fast_collapse else make_fragment_manager(fracture_params, device)
+    # GraphFragmentManager removed in the 2026-05-10 refactor;
+    # surface-only smoke now plots phase-field damage only.  Use
+    # ``--fast-collapse`` to exercise the lightweight CC labeller.
     fast_collapse_state = (
         make_fast_collapse_state(positions.shape[0], device)
         if fast_collapse else None
@@ -1148,11 +1087,7 @@ def run_surface_only_smoke(
             impact_center=drive["impact_center"],
         )
 
-        n_frags = (
-            int(fragment_manager.n_fragments)
-            if fragment_manager is not None and fragment_manager.fragment_ids is not None
-            else 1
-        )
+        n_frags = 1
         fast_fragment_ids = None
         created_fast = 0
         if fast_collapse:
@@ -1169,35 +1104,6 @@ def run_surface_only_smoke(
             )
             if n_frags > 1 and first_split_frame is None:
                 first_split_frame = frame
-        elif fragment_manager is not None:
-            should_detect = (
-                fragment_manager.fragment_ids is None
-                or frame % detect_every == 0
-                or frame == frames - 1
-            )
-            if should_detect:
-                crack_front = fracture_field.crack_front
-                tip_mask = crack_front.tip_mask if crack_front is not None else None
-                recent_front_mask = None
-                if crack_front is not None and crack_front.visited_mask is not None:
-                    recent_front_mask = crack_front.visited_mask & (fracture_field.c > 0.12)
-                n_frags = fragment_manager.detect_fragments(
-                    graph,
-                    fracture_field.c,
-                    positions=positions,
-                    opening=fracture_field.a,
-                    active_tip_mask=tip_mask,
-                    recent_front_mask=recent_front_mask,
-                    crack_normal=fracture_field.n,
-                    crack_tangent=crack_front.growth_dir if crack_front is not None else None,
-                )
-                max_cut_edges = max(max_cut_edges, fragment_manager.last_cut_edges)
-                max_closure_candidate_count = max(
-                    max_closure_candidate_count,
-                    fragment_manager.last_closure_candidate_count,
-                )
-                if n_frags > 1 and first_split_frame is None:
-                    first_split_frame = frame
 
         max_n_frags = max(max_n_frags, n_frags)
 
@@ -1212,11 +1118,7 @@ def run_surface_only_smoke(
                 title_extra=f"  |  n_frags={n_frags}",
                 visited=crack_front.visited_mask if crack_front is not None else None,
                 tips=crack_front.tip_mask if crack_front is not None else None,
-                fragment_ids=(
-                    fast_fragment_ids
-                    if fast_collapse
-                    else fragment_manager.fragment_ids if fragment_manager is not None else None
-                ),
+                fragment_ids=fast_fragment_ids,
                 n_fragments=n_frags,
             )
             plot_opening_frame(
@@ -1238,41 +1140,6 @@ def run_surface_only_smoke(
                     ),
                     file_prefix="surface_fragment",
                 )
-            if (not fast_collapse) and fragment_manager is not None:
-                plot_cut_debug_frame(
-                    positions,
-                    graph,
-                    fragment_manager.last_cut_core_mask,
-                    fragment_manager.last_cut_edge_mask,
-                    frame,
-                    out_dir,
-                    title_extra=(
-                        f"  cut_edges={fragment_manager.last_cut_edges} "
-                        f"cross={fragment_manager.last_cross_edge_breaks}"
-                    ),
-                )
-                if n_frags > 1:
-                    plot_fragment_frame(
-                        positions,
-                        fragment_manager.fragment_ids,
-                        frame,
-                        out_dir,
-                        title_extra=f"  |  family={material_family}",
-                        file_prefix="surface_fragment",
-                    )
-                if fragment_manager.last_closure_candidate_count > 0 or frame == frames - 1:
-                    plot_closure_debug_frame(
-                        positions,
-                        graph,
-                        fragment_manager.last_closure_candidate_mask,
-                        fragment_manager.last_closure_boundary_mask,
-                        frame,
-                        out_dir,
-                        title_extra=(
-                            f"  closure={fragment_manager.last_closure_candidate_count} "
-                            f"score={fragment_manager.last_closure_score_max:.2f}"
-                        ),
-                    )
 
         if frame % plot_every == 0 or frame == frames - 1:
             elapsed = time.time() - t0
@@ -1587,16 +1454,11 @@ def main():
 
     t0 = time.time()
     first_split_frame = None
-    use_physical_authority_for_stats = bool(simulator.fracture_cfg.get(
-        'use_physical_fragment_authority', False))
-    last_n_frags = 0 if use_physical_authority_for_stats else 1
-    max_n_frags = 0 if use_physical_authority_for_stats else 1
+    last_n_frags = 0
+    max_n_frags = 0
     split_frame_count = 0
     current_split_run = 0
     longest_split_run = 0
-    first_cut_frame = None
-    max_cut_edges = 0
-    max_cross_edge_breaks = 0
     max_detached_distance = 0.0
     max_mean_detached_distance = 0.0
     max_physical_detached_distance = 0.0
@@ -1605,44 +1467,11 @@ def main():
     max_visible_shards = 0
     max_split_gap_visibility = 0.0
     max_fragment_shell_contrast = 0.0
-    max_authoritative_cut_nodes = 0
-    max_support_lost_components = 0
-    max_support_loss_score = 0.0
-    first_closure_frame = None
-    max_closure_candidate_count = 0
-    max_closure_candidate_nodes = 0
-    max_closure_score = 0.0
-    last_closure_candidate_count = 0
-    edge_hist_snapshots = {}
     for frame in range(total_frames):
         simulator._render_frame = frame
         simulator.step_rendering()
         stats = simulator.get_statistics()
         n_frags = int(stats.get("n_fragments", 0))
-        broken_edges = int(stats.get("broken_edges", 0))
-        raw_components = int(stats.get("raw_components", 1))
-        promoted_components = int(stats.get("promoted_components", 0))
-        primary_promoted_components = int(stats.get("primary_promoted_components", 0))
-        fallback_promoted_components = int(stats.get("fallback_promoted_components", 0))
-        cut_core_nodes = int(stats.get("cut_core_nodes", 0))
-        cut_edges = int(stats.get("cut_edges", 0))
-        cut_corridor_edges = int(stats.get("cut_corridor_edges", 0))
-        cross_edge_breaks = int(stats.get("cross_edge_breaks", 0))
-        authoritative_cut_nodes = int(stats.get("authoritative_cut_nodes", 0))
-        authoritative_cut_score_max = float(stats.get("authoritative_cut_score_max", 0.0))
-        support_lost_components = int(stats.get("support_lost_components", 0))
-        support_loss_score_max = float(stats.get("support_loss_score_max", 0.0))
-        release_candidate_count = int(stats.get("release_candidate_count", 0))
-        boundary_cut_ratio_q50 = float(stats.get("boundary_cut_ratio_q50", 0.0))
-        boundary_cut_ratio_q90 = float(stats.get("boundary_cut_ratio_q90", 0.0))
-        boundary_cut_ratio_max = float(stats.get("boundary_cut_ratio_max", 0.0))
-        components_above_primary = int(stats.get("components_above_primary", 0))
-        components_above_fallback = int(stats.get("components_above_fallback", 0))
-        absorbed_components = int(stats.get("absorbed_components", 0))
-        closure_candidate_count = int(stats.get("closure_candidate_count", 0))
-        closure_candidate_nodes = int(stats.get("closure_candidate_nodes", 0))
-        closure_score_max = float(stats.get("closure_score_max", 0.0))
-        closure_candidate_sizes = stats.get("closure_candidate_sizes", [])
         detached_distance = float(stats.get("detached_distance", 0.0))
         mean_detached_distance = float(stats.get("mean_detached_distance", 0.0))
         physical_detached_distance = float(stats.get("physical_detached_distance", 0.0))
@@ -1652,14 +1481,8 @@ def main():
         split_gap_visibility = float(stats.get("split_gap_visibility", 0.0))
         fragment_shell_contrast = float(stats.get("fragment_shell_contrast", 0.0))
         shard_persistence = float(stats.get("shard_persistence", 0.0))
-        top_component_sizes = stats.get("top_component_sizes", [])
-        gm = simulator.fragment_manager
         if n_frags > 1 and first_split_frame is None:
             first_split_frame = frame
-        if cut_edges > 0 and first_cut_frame is None:
-            first_cut_frame = frame
-        if closure_candidate_count > 0 and first_closure_frame is None:
-            first_closure_frame = frame
         if n_frags > 1:
             split_frame_count += 1
             current_split_run += 1
@@ -1667,8 +1490,6 @@ def main():
         else:
             current_split_run = 0
         max_n_frags = max(max_n_frags, n_frags)
-        max_cut_edges = max(max_cut_edges, cut_edges)
-        max_cross_edge_breaks = max(max_cross_edge_breaks, cross_edge_breaks)
         max_detached_distance = max(max_detached_distance, detached_distance)
         max_mean_detached_distance = max(max_mean_detached_distance, mean_detached_distance)
         max_physical_detached_distance = max(max_physical_detached_distance, physical_detached_distance)
@@ -1677,74 +1498,27 @@ def main():
         max_visible_shards = max(max_visible_shards, visible_shards)
         max_split_gap_visibility = max(max_split_gap_visibility, split_gap_visibility)
         max_fragment_shell_contrast = max(max_fragment_shell_contrast, fragment_shell_contrast)
-        max_authoritative_cut_nodes = max(max_authoritative_cut_nodes, authoritative_cut_nodes)
-        max_support_lost_components = max(max_support_lost_components, support_lost_components)
-        max_support_loss_score = max(max_support_loss_score, support_loss_score_max)
-        max_closure_candidate_count = max(max_closure_candidate_count, closure_candidate_count)
-        max_closure_candidate_nodes = max(max_closure_candidate_nodes, closure_candidate_nodes)
-        max_closure_score = max(max_closure_score, closure_score_max)
-        if gm is not None and gm.last_effective_edge_damage is not None:
-            if first_cut_frame == frame and "first_cut" not in edge_hist_snapshots:
-                edge_hist_snapshots["first_cut"] = {
-                    "frame": frame,
-                    "edge_damage": gm.last_effective_edge_damage.clone(),
-                    "threshold": gm.last_edge_damage_break_threshold,
-                    "broken_edges": gm.last_broken_edges,
-                    "total_edges": gm.last_total_edges,
-                }
-            if first_split_frame == frame and "first_split" not in edge_hist_snapshots:
-                edge_hist_snapshots["first_split"] = {
-                    "frame": frame,
-                    "edge_damage": gm.last_effective_edge_damage.clone(),
-                    "threshold": gm.last_edge_damage_break_threshold,
-                    "broken_edges": gm.last_broken_edges,
-                    "total_edges": gm.last_total_edges,
-                }
         if n_frags != last_n_frags:
             print(
                 f"[SmokeTest:fragments] frame={frame} "
-                f"n_frags={n_frags} raw_components={raw_components} "
-                f"broken_edges={broken_edges} promoted={promoted_components} "
-                f"primary={primary_promoted_components} fallback={fallback_promoted_components} "
-                f"cut_core={cut_core_nodes} auth_cut={authoritative_cut_nodes} "
-                f"cut_edges={cut_edges} corridor={cut_corridor_edges} cross_breaks={cross_edge_breaks} "
-                f"cut_q90={boundary_cut_ratio_q90:.2f} cut_max={boundary_cut_ratio_max:.2f} "
-                f"aboveP={components_above_primary} aboveF={components_above_fallback} "
-                f"absorbed={absorbed_components} "
-                f"support_lost={support_lost_components} "
-                f"release={release_candidate_count} "
-                f"detach={detached_distance:.4f} phys={physical_detached_distance:.4f} "
-                f"top_sizes={top_component_sizes[:4]}"
+                f"n_frags={n_frags} "
+                f"detach={detached_distance:.4f} phys={physical_detached_distance:.4f}"
             )
             last_n_frags = n_frags
-        if closure_candidate_count != last_closure_candidate_count:
-            print(
-                f"[SmokeTest:closure] frame={frame} "
-                f"closure_count={closure_candidate_count} closure_nodes={closure_candidate_nodes} "
-                f"closure_score={closure_score_max:.2f} sizes={closure_candidate_sizes[:4]}"
-            )
-            last_closure_candidate_count = closure_candidate_count
 
         # Plot every 5 frames or at key moments
         ff = simulator.fracture_field
         if frame % 5 == 0 or frame == total_frames - 1:
             damage = ff.c if ff.c is not None else torch.zeros(N_surf, device=device)
-            use_physical_authority = bool(getattr(simulator, "fracture_cfg", {}).get(
-                "use_physical_fragment_authority", False))
-            frag_ids = None
-            if (simulator.fragment_manager is not None
-                    and simulator.fragment_manager.fragment_ids is not None):
-                frag_ids = simulator.fragment_manager.fragment_ids
             physical_frag_ids = None
             if (getattr(simulator, "_physical_fragment_labels", None) is not None
                     and getattr(simulator, "_surface_indices", None) is not None
                     and bool((simulator._physical_fragment_labels > 0).any())):
                 physical_frag_ids = simulator._physical_fragment_labels[simulator._surface_indices]
-            fallback_frag_ids = physical_frag_ids if use_physical_authority else frag_ids
             render_state = simulator._last_render_state or {}
             render_positions = render_state.get("positions", gaussians._xyz.data.detach())
             render_damage = render_state.get("damage", damage)
-            render_frag = render_state.get("fragment_ids", fallback_frag_ids)
+            render_frag = render_state.get("fragment_ids", physical_frag_ids)
             render_visited = render_state.get(
                 "crack_visited",
                 ff.crack_front.visited_mask if hasattr(ff, 'crack_front') else None,
@@ -1759,11 +1533,11 @@ def main():
                 render_positions, render_damage,
                 frame, out_dir,
                 file_prefix="crack",
-                    title_extra=(
-                        f"  |  H_max={ff.H.max():.2e}  n_frags={n_frags}  broken={broken_edges}"
-                        f"  q90={boundary_cut_ratio_q90:.2f}  shards={visible_shards}  gap={split_gap_visibility:.2f}"
-                        if ff.H is not None else f"  |  n_frags={n_frags}  broken={broken_edges}"
-                    ),
+                title_extra=(
+                    f"  |  H_max={ff.H.max():.2e}  n_frags={n_frags}"
+                    f"  shards={visible_shards}  gap={split_gap_visibility:.2f}"
+                    if ff.H is not None else f"  |  n_frags={n_frags}"
+                ),
                 visited=render_visited,
                 tips=render_tips,
                 fragment_ids=render_frag,
@@ -1777,60 +1551,10 @@ def main():
                     frame,
                     out_dir,
                     title_extra=(
-                        f"  broken={broken_edges}  detach={detached_distance:.4f}"
+                        f"  detach={detached_distance:.4f}"
                         f"  phys={physical_detached_distance:.4f}"
                     ),
                     file_prefix="fragment",
-                )
-            n_physical_frags = (
-                int(physical_frag_ids.max().item()) + 1
-                if physical_frag_ids is not None and bool((physical_frag_ids > 0).any())
-                else 0
-            )
-            if physical_frag_ids is not None and n_physical_frags > 1 and (frame % 10 == 0 or frame == total_frames - 1):
-                physical_positions = simulator.mapper.mpm_to_world(
-                    simulator.x_mpm[simulator.surface_mask]
-                )
-                n_phys = min(
-                    physical_positions.shape[0],
-                    damage.shape[0],
-                    physical_frag_ids.shape[0],
-                )
-                plot_fracture_frame(
-                    physical_positions[:n_phys],
-                    damage[:n_phys],
-                    frame,
-                    out_dir,
-                    file_prefix="physical_crack",
-                    title_extra=(
-                        f"  |  n_frags={n_physical_frags}  cut_edges={cut_edges}"
-                        f"  phys_detach={physical_detached_distance:.4f}"
-                        f"  drop={physical_fragment_drop:.4f}"
-                    ),
-                    visited=(
-                        ff.crack_front.visited_mask[:n_phys]
-                        if hasattr(ff, 'crack_front') and ff.crack_front.visited_mask is not None
-                        else None
-                    ),
-                    tips=(
-                        ff.crack_front.tip_mask[:n_phys]
-                        if hasattr(ff, 'crack_front') and ff.crack_front.tip_mask is not None
-                        else None
-                    ),
-                    fragment_ids=physical_frag_ids[:n_phys],
-                    n_fragments=n_physical_frags,
-                    shard_mask=None,
-                )
-                plot_fragment_frame(
-                    physical_positions[:n_phys],
-                    physical_frag_ids[:n_phys],
-                    frame,
-                    out_dir,
-                    title_extra=(
-                        f"  cut_edges={cut_edges}  phys_detach={physical_detached_distance:.4f}"
-                        f"  drop={physical_fragment_drop:.4f}"
-                    ),
-                    file_prefix="physical_fragment",
                 )
             plot_opening_frame(
                 render_positions,
@@ -1838,44 +1562,16 @@ def main():
                 frame,
                 out_dir,
                 title_extra=(
-                    f"  cut_edges={cut_edges}  shell={fragment_shell_contrast:.3f}"
-                    f"  support={support_loss_score_max:.2f}  persist={shard_persistence:.1f}"
+                    f"  shell={fragment_shell_contrast:.3f}"
+                    f"  persist={shard_persistence:.1f}"
                 ),
             )
-            if simulator.fragment_manager is not None:
-                base_positions = render_positions[:damage.shape[0]]
-                plot_cut_debug_frame(
-                    base_positions,
-                    simulator.graph,
-                    simulator.fragment_manager.last_cut_core_mask,
-                    simulator.fragment_manager.last_cut_edge_mask,
-                    frame,
-                    out_dir,
-                    title_extra=(
-                        f"  cross_breaks={cross_edge_breaks} "
-                        f"detach={detached_distance:.4f}"
-                    ),
-                )
-                if closure_candidate_count > 0 or frame == total_frames - 1:
-                    plot_closure_debug_frame(
-                        base_positions,
-                        simulator.graph,
-                        simulator.fragment_manager.last_closure_candidate_mask,
-                        simulator.fragment_manager.last_closure_boundary_mask,
-                        frame,
-                        out_dir,
-                        title_extra=(
-                            f"  closure_count={closure_candidate_count}"
-                            f"  score={closure_score_max:.2f}"
-                        ),
-                    )
 
         elapsed = time.time() - t0
         c_max = ff.c.max().item() if ff.c is not None else 0
         if frame % 5 == 0 or frame == total_frames - 1:
             print(f"Frame {frame:3d}/{total_frames}  "
-                  f"c_max={c_max:.4f}  n_frags={n_frags}  cut_edges={cut_edges}  "
-                  f"cut_q90={boundary_cut_ratio_q90:.2f}  "
+                  f"c_max={c_max:.4f}  n_frags={n_frags}  "
                   f"elapsed={elapsed:.1f}s")
 
     # --- Summary ---
@@ -1917,61 +1613,13 @@ def main():
     print(f"  max_visible_shards = {max_visible_shards}")
     print(f"  max_split_gap_visibility = {max_split_gap_visibility:.4f}")
     print(f"  max_fragment_shell_contrast = {max_fragment_shell_contrast:.4f}")
-    if simulator.fragment_manager is not None:
-        gm = simulator.fragment_manager
-        if gm.last_effective_edge_damage is not None:
-            edge_hist_snapshots["final"] = {
-                "frame": total_frames - 1,
-                "edge_damage": gm.last_effective_edge_damage.clone(),
-                "threshold": gm.last_edge_damage_break_threshold,
-                "broken_edges": gm.last_broken_edges,
-                "total_edges": gm.last_total_edges,
-            }
-        use_physical_authority = bool(
-            simulator.fracture_cfg.get('use_physical_fragment_authority', False)
-        )
-        final_graph_n_frags = int(simulator.fragment_manager.n_fragments)
-        final_physical_n_frags = None
-        if (getattr(simulator, "_physical_fragment_labels", None) is not None
-                and bool((simulator._physical_fragment_labels > 0).any())):
-            final_physical_n_frags = int(
-                simulator._physical_fragment_labels.max().item()) + 1
-        if use_physical_authority:
-            if final_physical_n_frags is None:
-                final_physical_n_frags = 0
-            print(f"  final_n_frags = {final_physical_n_frags}")
-            print(f"  final_graph_n_frags = {final_graph_n_frags}")
-            print(f"  final_physical_n_frags = {final_physical_n_frags}")
-        else:
-            print(f"  final_n_frags = {final_graph_n_frags}")
-            if final_physical_n_frags is not None:
-                print(f"  final_physical_n_frags = {final_physical_n_frags}")
-        print(f"  broken_edges = {simulator.fragment_manager.last_broken_edges}")
-        print(f"  raw_components = {simulator.fragment_manager.last_raw_components}")
-        print(f"  promoted_components = {simulator.fragment_manager.last_promoted_components}")
-        print(f"  primary_promoted_components = {simulator.fragment_manager.last_primary_promoted_components}")
-        print(f"  fallback_promoted_components = {simulator.fragment_manager.last_fallback_promoted_components}")
-        print(f"  cut_core_nodes = {simulator.fragment_manager.last_cut_core_nodes}")
-        print(f"  cut_edges = {simulator.fragment_manager.last_cut_edges}")
-        print(f"  cut_corridor_edges = {simulator.fragment_manager.last_cut_corridor_edges}")
-        print(f"  cross_edge_breaks = {simulator.fragment_manager.last_cross_edge_breaks}")
-        print(f"  authoritative_cut_nodes = {simulator.fragment_manager.last_authoritative_cut_nodes}")
-        print(f"  authoritative_cut_score_max = {simulator.fragment_manager.last_authoritative_cut_score_max:.4f}")
-        print(f"  support_lost_components = {simulator.fragment_manager.last_support_lost_components}")
-        print(f"  support_loss_score_max = {simulator.fragment_manager.last_support_loss_score_max:.4f}")
-        print(f"  release_candidate_count = {simulator.fragment_manager.last_release_candidate_count}")
-        print(f"  boundary_cut_ratio_q50 = {simulator.fragment_manager.last_boundary_cut_ratio_q50:.4f}")
-        print(f"  boundary_cut_ratio_q90 = {simulator.fragment_manager.last_boundary_cut_ratio_q90:.4f}")
-        print(f"  boundary_cut_ratio_max = {simulator.fragment_manager.last_boundary_cut_ratio_max:.4f}")
-        print(f"  components_above_primary = {simulator.fragment_manager.last_components_above_primary}")
-        print(f"  components_above_fallback = {simulator.fragment_manager.last_components_above_fallback}")
-        print(f"  absorbed_components = {simulator.fragment_manager.last_absorbed_components}")
-        print(f"  closure_candidate_count = {simulator.fragment_manager.last_closure_candidate_count}")
-        print(f"  closure_candidate_nodes = {simulator.fragment_manager.last_closure_candidate_nodes}")
-        print(f"  closure_score_max = {simulator.fragment_manager.last_closure_score_max:.4f}")
-        print(f"  closure_candidate_sizes = {simulator.fragment_manager.last_closure_candidate_sizes[:8]}")
-        print(f"  top_component_sizes = {simulator.fragment_manager.last_top_component_sizes}")
-    for label, snap in edge_hist_snapshots.items():
+    final_physical_n_frags = 0
+    if (getattr(simulator, "_physical_fragment_labels", None) is not None
+            and bool((simulator._physical_fragment_labels > 0).any())):
+        final_physical_n_frags = int(
+            simulator._physical_fragment_labels.max().item()) + 1
+    print(f"  final_n_frags = {final_physical_n_frags}")
+    for label, snap in {}.items():
         summary = summarize_edge_damage(snap["edge_damage"])
         if summary is not None:
             print(
