@@ -333,6 +333,15 @@ SENTENCE_STYLE_RULES = (
             "manifold.brittle_release_intensity": 0.0,
             "gaussian_splatting.crack_gap_fraction": 0.08,
             "gaussian_splatting.crack_opacity_reduction": 0.16,
+            # Paper-frozen voronoi for diffuse_microcrack:
+            # 2 cells, uniform, high break threshold → effectively whole-
+            # body with at most one cosmetic split.  impact_min_factor=1.0
+            # defeats the KE-scaling that would otherwise crush n to 2.
+            "manifold.voronoi_enable": True,
+            "manifold.voronoi_n_cells": 2,
+            "manifold.voronoi_seed_distribution": "uniform",
+            "manifold.voronoi_bond_break_threshold": 0.55,
+            "manifold.voronoi_impact_min_factor": 1.0,
         },
     },
     {
@@ -615,13 +624,17 @@ SENTENCE_STYLE_RULES = (
             "manifold.rigid_handoff_floor_angular_friction": 0.0005,
             "manifold.fragment_physical_max_speed": 50.0,
             "manifold.fragment_release_position_offset": 0.0,
-            # Voronoi pre-fracture: partial pulverization for radial_shatter.
+            # Voronoi pre-fracture: paper-frozen radial_shatter config.
+            # 40 cells, axis_aligned distribution makes shards align with
+            # the anisotropy axis; thr=0.30 keeps mid-impact bonds intact
+            # so the radial pattern reads as sharp shards instead of dust.
             "manifold.voronoi_enable": True,
-            "manifold.voronoi_n_cells": 80,
+            "manifold.voronoi_n_cells": 40,
             "manifold.voronoi_cell_energy_exponent": 1.0,
-            "manifold.voronoi_seed_distribution": "impact_biased",
-            "manifold.voronoi_bond_break_threshold": 0.20,
+            "manifold.voronoi_seed_distribution": "axis_aligned",
+            "manifold.voronoi_bond_break_threshold": 0.30,
             "manifold.voronoi_bond_threshold_energy_blend": 0.25,
+            "manifold.voronoi_impact_min_factor": 1.0,
             # Discard thin surface dust labels: after the 1-frame AT2 burst,
             # Voronoi can create tiny floor/shell slivers that read as
             # floating Gaussians rather than intentional shards.
@@ -768,13 +781,16 @@ SENTENCE_STYLE_RULES = (
             # +v_z from saved pre-step velocity, sending the particle
             # back up; gravity pulls it down again; cycle).
             "manifold.fragment_floor_restitution": 0.0,
-            # Voronoi pre-fracture: full pulverization, no base remnant.
+            # Voronoi pre-fracture: paper-frozen complete_pulverization.
+            # 90 cells, impact_biased so dense near impact; thr=0.20 lets
+            # mid-impact bonds break readily for the "medium fine" look.
             "manifold.voronoi_enable": True,
-            "manifold.voronoi_n_cells": 250,
+            "manifold.voronoi_n_cells": 90,
             "manifold.voronoi_cell_energy_exponent": 0.75,
             "manifold.voronoi_seed_distribution": "impact_biased",
-            "manifold.voronoi_bond_break_threshold": 0.15,
+            "manifold.voronoi_bond_break_threshold": 0.20,
             "manifold.voronoi_bond_threshold_energy_blend": 0.15,
+            "manifold.voronoi_impact_min_factor": 1.0,
             "manifold.voronoi_spatial_split_min_fraction": 0.004,
             # Time-driven bond aging disabled in favor of stress-wave
             # propagation: bonds outside the wave can't break by aging,
@@ -891,16 +907,15 @@ SENTENCE_STYLE_RULES = (
             # pulverization) so the "thousands of fine" prompt produces
             # a visibly finer tessellation than "hundreds of tiny".
             "manifold.voronoi_enable": True,
-            # n_cells=1000 calibrated for 150K particles + grid=256:
-            # ~150 particles/cell ensures stable shape_match SVD,
-            # uniform distribution + damp=0.95 (below) gives the
-            # body-wide tessellation without grid-coupling-driven
-            # oscillation.
-            "manifold.voronoi_n_cells": 1000,
+            # Paper-frozen ultra_pulverization: 200 cells, uniform.
+            # Acts as the upper-bound "fine dust" reference; thr=0.15
+            # keeps the body-wide tessellation breakable.
+            "manifold.voronoi_n_cells": 200,
             "manifold.voronoi_impact_speed_ref": 42.0,
             "manifold.voronoi_impact_cell_exponent": 1.0,
             "manifold.voronoi_seed_distribution": "uniform",
-            "manifold.voronoi_bond_break_threshold": 0.10,
+            "manifold.voronoi_bond_break_threshold": 0.15,
+            "manifold.voronoi_impact_min_factor": 1.0,
             "manifold.voronoi_bond_aging_per_frame": 0.0,
             "manifold.voronoi_impact_shock_radius": 0.12,
             "manifold.voronoi_wave_speed_per_frame": 0.030,
@@ -962,13 +977,15 @@ SENTENCE_STYLE_RULES = (
             "manifold.open_crack_release_threshold": 0.36,
             "manifold.brittle_release_intensity": 1.35,
             "manifold.impact_release_gain": 1.18,
-            # Voronoi pre-fracture: chunky cells, fewer than full
-            # pulverization but more than single_smooth.  Concrete
-            # crumbling into rough fragments under impact lives here.
+            # Paper-frozen chunky_crumble: 30 cells, uniform distribution
+            # gives big irregular chunks across the body (not impact-
+            # concentrated); thr=0.40 keeps most bonds intact so only
+            # the high-stress region breaks → large visible pieces.
             "manifold.voronoi_enable": True,
-            "manifold.voronoi_n_cells": 100,
-            "manifold.voronoi_seed_distribution": "impact_biased",
-            "manifold.voronoi_bond_break_threshold": 0.25,
+            "manifold.voronoi_n_cells": 30,
+            "manifold.voronoi_seed_distribution": "uniform",
+            "manifold.voronoi_bond_break_threshold": 0.40,
+            "manifold.voronoi_impact_min_factor": 1.0,
             "manifold.voronoi_bond_aging_per_frame": 0.0,
             "manifold.voronoi_impact_shock_radius": 0.06,
             "manifold.voronoi_wave_speed_per_frame": 0.020,
